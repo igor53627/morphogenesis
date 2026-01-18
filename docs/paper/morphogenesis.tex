@@ -46,7 +46,7 @@ Private Information Retrieval (PIR) allows a client to retrieve a record from a 
 \subsection{Contributions}
 
 \begin{enumerate}
-  \item \textbf{DPF-PIR at Memory Bandwidth:} AVX-512 + VAES vectorized scan achieving 393~GB/s (2.8$\times$ theoretical AWS baseline).
+  \item \textbf{DPF-PIR at Memory Bandwidth:} AVX-512 + VAES vectorized scan achieving 393~GB/s.
   
   \item \textbf{Epoch-Based Delta-PIR:} Wait-free snapshot isolation eliminating retry-based leakage.
   
@@ -173,7 +173,7 @@ The view consists of the query batch $Q$ and timing metadata $T$.
 Trustless & 2 KB & 175 GB & ${\sim}439$ms & 1 \\
 \bottomrule
 \end{tabular}
-\caption{Query latency by security mode.}
+\caption{Query latency by security mode. (TBD: benchmarks pending on production hardware.)}
 \end{table}
 
 \subsection{Cuckoo Load Factor}
@@ -196,34 +196,9 @@ Trustless & 2 KB & 175 GB & ${\sim}439$ms & 1 \\
 \section{Why ``Morphogenesis''?}
 %------------------------------------------------------------------------------
 
-This name is a homage to \textbf{Alan Turing}, who is both the father of modern computing and the theoretical biologist who proposed the concept of \emph{morphogenesis}---the biological process by which organisms develop their shape.
+This name is a homage to \textbf{Alan Turing}, who proposed the concept of \emph{morphogenesis}---the biological process by which organisms develop their shape~\cite{Turing52}.
 
-The metaphor operates on three levels:
-
-\subsection{The Morphogen Signal}
-
-In biology, a \textbf{morphogen} is a signaling molecule that diffuses from a source cell through tissue. Cells measure morphogen concentration; high concentration triggers differentiation into specific tissue types.
-
-In our protocol, the \textbf{DPF key is the morphogen}. It ``diffuses'' through the entire database during the linear scan. Only the specific row where the DPF evaluates to 1---the ``concentration peak''---differentiates (activates) and contributes its data to the response.
-
-\subsection{Turing Patterns (Reaction-Diffusion)}
-
-Turing's 1952 paper, \emph{``The Chemical Basis of Morphogenesis''}~\cite{Turing52}, described how two interacting chemicals (an activator and an inhibitor) could spontaneously create complex patterns---spots, stripes---from random noise.
-
-Our 2-server protocol exhibits the same structure:
-\begin{itemize}
-  \item \textbf{Server A} sees pure noise (the ``activator'' share)
-  \item \textbf{Server B} sees pure noise (the ``inhibitor'' share)
-  \item \textbf{The Magic:} When these two chaotic ``chemical waves'' interact via XOR at the client, they cancel perfectly everywhere \emph{except} at the target, creating a stable ``spot'' of information from entropy.
-\end{itemize}
-
-\subsection{Genesis: Creation of Form}
-
-\emph{Morpho-} (shape/form) + \emph{-genesis} (creation).
-
-The protocol takes a formless, high-entropy ``soup'' of encrypted bits and extracts a single, structured \textbf{form}---the user's account---without any party observing the extraction.
-
-Since Turing's contributions span both computation theory and biological pattern formation, naming a privacy-preserving protocol after his biological discovery is poetically fitting.
+In biology, a \textbf{morphogen} is a signaling molecule that diffuses through tissue; cells differentiate based on local concentration. In our protocol, the \textbf{DPF key is the morphogen}: it ``diffuses'' through the entire database during the linear scan, and only the row where the DPF evaluates to 1---the ``concentration peak''---activates and contributes its data.
 
 %------------------------------------------------------------------------------
 \section{Conclusion}

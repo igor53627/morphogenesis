@@ -146,9 +146,10 @@ Final hardening pass - edge cases and failure modes:
   - Added MergeError::EpochOverflow variant
   - try_advance() now uses checked_add(1) and returns EpochOverflow on overflow
 
-- [ ] Phase 41: Handle rollback failure in try_advance (HIGH)
-  - If restore_for_epoch fails (e.g., LockPoisoned), entries are silently dropped
-  - Fix: don't ignore rollback result, return MergeError::RollbackFailed
+- [x] Phase 41: Handle rollback failure in try_advance (HIGH)
+  - Added MergeError::RollbackFailed { merge_error, rollback_error }
+  - try_advance now checks rollback result instead of ignoring with `let _ =`
+  - On rollback failure, returns RollbackFailed with both error messages
 
 - [ ] Phase 42: Integer overflow guards in restore_for_epoch (MEDIUM)
   - entries.len() + existing.len() can overflow

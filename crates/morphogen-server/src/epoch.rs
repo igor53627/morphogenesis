@@ -345,7 +345,14 @@ impl EpochManager {
         ) {
             Ok(snapshot) => snapshot,
             Err(e) => {
-                let _ = self.pending.restore_for_epoch(current.epoch_id, entries);
+                if let Err(rollback_err) = self.pending.restore_for_epoch(current.epoch_id, entries)
+                {
+                    // Rollback failed - this is catastrophic, entries may be lost
+                    return Err(MergeError::RollbackFailed {
+                        merge_error: e.to_string(),
+                        rollback_error: rollback_err.to_string(),
+                    });
+                }
                 return Err(e);
             }
         };
@@ -403,6 +410,12 @@ pub enum MergeError {
         chunk_size: usize,
     },
     EpochOverflow,
+    /// Merge failed AND rollback also failed - entries may be lost.
+    /// Contains the original merge error message and the rollback error message.
+    RollbackFailed {
+        merge_error: String,
+        rollback_error: String,
+    },
     LockPoisoned,
 }
 
@@ -439,6 +452,16 @@ impl std::fmt::Display for MergeError {
             }
             MergeError::EpochOverflow => {
                 write!(f, "epoch id overflow: cannot increment past u64::MAX")
+            }
+            MergeError::RollbackFailed {
+                merge_error,
+                rollback_error,
+            } => {
+                write!(
+                    f,
+                    "merge failed and rollback also failed (DATA MAY BE LOST): merge={}, rollback={}",
+                    merge_error, rollback_error
+                )
             }
             MergeError::LockPoisoned => {
                 write!(f, "lock poisoned during merge operation")
@@ -852,6 +875,25 @@ mod tests {
             matches!(result, Err(MergeError::EpochOverflow)),
             "try_advance should return EpochOverflow when epoch_id is u64::MAX, got {:?}",
             result
+        );
+    }
+
+    #[test]
+    fn rollback_failed_error_contains_both_messages() {
+        let err = MergeError::RollbackFailed {
+            merge_error: "merge failed".to_string(),
+            rollback_error: "lock poisoned".to_string(),
+        };
+
+        let msg = err.to_string();
+        assert!(msg.contains("merge failed"), "should contain merge error");
+        assert!(
+            msg.contains("lock poisoned"),
+            "should contain rollback error"
+        );
+        assert!(
+            msg.contains("DATA MAY BE LOST"),
+            "should warn about data loss"
         );
     }
 
