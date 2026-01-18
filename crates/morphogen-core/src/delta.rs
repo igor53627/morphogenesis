@@ -111,6 +111,18 @@ impl DeltaBuffer {
         self.row_size_bytes
     }
 
+    fn validate_entries(&self, entries: &[DeltaEntry]) -> Result<(), DeltaError> {
+        for entry in entries {
+            if entry.diff.len() != self.row_size_bytes {
+                return Err(DeltaError::SizeMismatch {
+                    expected: self.row_size_bytes,
+                    actual: entry.diff.len(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     pub fn push(&self, row_idx: usize, diff: Vec<u8>) -> Result<(), DeltaError> {
         if diff.len() != self.row_size_bytes {
             return Err(DeltaError::SizeMismatch {
@@ -186,6 +198,7 @@ impl DeltaBuffer {
         if entries.is_empty() {
             return Ok(());
         }
+        self.validate_entries(&entries)?;
         let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
         let existing = std::mem::take(&mut *guard);
         *guard = entries;
@@ -199,6 +212,9 @@ impl DeltaBuffer {
     /// and all entries are always restored, even if this would exceed `max_entries`.
     /// If the limit is exceeded, returns `BufferFull` error (but data is preserved).
     ///
+    /// Returns `SizeMismatch` error if any entry has wrong diff size. In this case,
+    /// neither the epoch nor the buffer is modified.
+    ///
     /// # Invariant
     ///
     /// Updates `pending_epoch` while holding the `entries` write lock, ensuring
@@ -208,6 +224,8 @@ impl DeltaBuffer {
         epoch: u64,
         entries: Vec<DeltaEntry>,
     ) -> Result<(), DeltaError> {
+        // Validate before acquiring lock - reject malformed entries without side effects
+        self.validate_entries(&entries)?;
         let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
         // SAFETY: pending_epoch modification while holding write lock - see struct doc
         self.pending_epoch.store(epoch, Ordering::Release);
@@ -522,6 +540,82 @@ mod tests {
             result,
             Err(DeltaError::BufferFull { current: 2, max: 2 })
         ));
+    }
+
+    #[test]
+    fn restore_rejects_wrong_size_entry() {
+        let buf = DeltaBuffer::new(4);
+
+        let bad_entries = vec![DeltaEntry {
+            row_idx: 0,
+            diff: vec![1, 2, 3], // 3 bytes, expected 4
+        }];
+
+        let result = buf.restore(bad_entries);
+        assert!(matches!(
+            result,
+            Err(DeltaError::SizeMismatch {
+                expected: 4,
+                actual: 3
+            })
+        ));
+        assert!(
+            buf.is_empty().unwrap(),
+            "buffer should remain empty on error"
+        );
+    }
+
+    #[test]
+    fn restore_for_epoch_rejects_wrong_size_entry() {
+        let buf = DeltaBuffer::new(4);
+
+        let bad_entries = vec![DeltaEntry {
+            row_idx: 0,
+            diff: vec![1, 2, 3, 4, 5], // 5 bytes, expected 4
+        }];
+
+        let result = buf.restore_for_epoch(10, bad_entries);
+        assert!(matches!(
+            result,
+            Err(DeltaError::SizeMismatch {
+                expected: 4,
+                actual: 5
+            })
+        ));
+        assert!(
+            buf.is_empty().unwrap(),
+            "buffer should remain empty on error"
+        );
+        assert_eq!(buf.pending_epoch(), 0, "epoch should not change on error");
+    }
+
+    #[test]
+    fn restore_rejects_mixed_valid_and_invalid_entries() {
+        let buf = DeltaBuffer::new(4);
+
+        let mixed_entries = vec![
+            DeltaEntry {
+                row_idx: 0,
+                diff: vec![1, 2, 3, 4], // valid
+            },
+            DeltaEntry {
+                row_idx: 1,
+                diff: vec![5, 6], // invalid - 2 bytes
+            },
+        ];
+
+        let result = buf.restore(mixed_entries);
+        assert!(matches!(
+            result,
+            Err(DeltaError::SizeMismatch {
+                expected: 4,
+                actual: 2
+            })
+        ));
+        assert!(
+            buf.is_empty().unwrap(),
+            "buffer should remain empty on error"
+        );
     }
 }
 

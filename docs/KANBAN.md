@@ -111,6 +111,33 @@ Non-critical hardening from post-fix review:
   - Added DeltaBuffer::with_max_entries_and_epoch(row_size, max, epoch)
   - Allows setting both max_entries limit AND initial pending_epoch
 
+### Epoch Management - Oracle Review #7 (Jan 18, 2026)
+Hardening issues found in post-phase-34 review:
+
+- [x] Phase 35: Validate entry sizes in restore paths (MEDIUM)
+  - Added validate_entries() helper to check diff.len() == row_size_bytes
+  - restore() validates before acquiring lock
+  - restore_for_epoch() validates before acquiring lock (no side effects on error)
+
+- [ ] Phase 36: Fix restore_for_epoch BufferFull check on empty entries (LOW)
+  - Early return when entries.is_empty() skips max_entries check
+  - Existing entries alone can exceed max but won't be reported
+  - Fix: compute total even when entries is empty, or check guard.len() in that branch
+
+- [ ] Phase 37: Prevent division-by-zero in try_dirty_chunks (MEDIUM)
+  - chunk_location() divides by chunk_size_bytes without checking for 0
+  - try_build_snapshot_from_entries checks, but try_dirty_chunks does not
+  - Fix: add chunk_size_bytes == 0 guard in try_dirty_chunks and try_dirty_chunks_vec
+
+- [ ] Phase 38: Deprecate panicking wrappers in epoch.rs (LOW)
+  - dirty_chunks(), dirty_chunks_vec(), build_next_snapshot() use .expect()
+  - Mark as #[deprecated] or move behind #[cfg(test)]
+  - Server paths should use try_* variants only
+
+- [ ] Phase 39: Verify EpochManager Drop resets has_manager (LOW)
+  - Phase 32 added has_manager flag, need to confirm Drop impl exists
+  - If missing, GlobalState is bricked after first manager dropped
+
 ### Core Protocol
 - [ ] UBT Merkle proof generation
 

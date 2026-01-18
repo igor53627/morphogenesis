@@ -1,4 +1,4 @@
-# Part 2: Morphogenesis Scientific Paper v3.3
+# Part 2: Morphogenesis Scientific Paper
 
 **Title:** High-Throughput Private Information Retrieval for Ethereum via Epoch-Based Delta-PIR
 
@@ -91,5 +91,31 @@ The scan saturates memory bandwidth. For multiple concurrent clients:
 * **9 concurrent clients:** $9 \times 66 = 594$ms (within 600ms target).
 * **Scaling:** Read replicas for even higher concurrency.
 
-## 5. Conclusion
+## 5. Why "Morphogenesis"?
+
+This name is a homage to **Alan Turing**, who is both the father of modern computing and the theoretical biologist who proposed the concept of *morphogenesis*—the biological process by which organisms develop their shape.
+
+The metaphor operates on three levels:
+
+### 5.1 The Morphogen Signal
+In biology, a **morphogen** is a signaling molecule that diffuses from a source cell through tissue. Cells measure morphogen concentration; high concentration triggers differentiation into specific tissue types.
+
+In our protocol, the **DPF key is the morphogen**. It "diffuses" through the entire database during the linear scan. Only the specific row where the DPF evaluates to 1—the "concentration peak"—differentiates (activates) and contributes its data to the response.
+
+### 5.2 Turing Patterns (Reaction-Diffusion)
+Turing's 1952 paper, *"The Chemical Basis of Morphogenesis,"* described how two interacting chemicals (an activator and an inhibitor) could spontaneously create complex patterns—spots, stripes—from random noise.
+
+Our 2-server protocol exhibits the same structure:
+- **Server A** sees pure noise (the "activator" share)
+- **Server B** sees pure noise (the "inhibitor" share)
+- **The Magic:** When these two chaotic "chemical waves" interact via XOR at the client, they cancel perfectly everywhere *except* at the target, creating a stable "spot" of information from entropy.
+
+### 5.3 Genesis: Creation of Form
+*Morpho-* (shape/form) + *-genesis* (creation).
+
+The protocol takes a formless, high-entropy "soup" of encrypted bits and extracts a single, structured **form**—the user's account—without any party observing the extraction.
+
+Since Turing's contributions span both computation theory and biological pattern formation, naming a privacy-preserving protocol after his biological discovery is poetically fitting.
+
+## 6. Conclusion
 Morphogenesis v3.3 bridges the gap between theoretical PIR and systems reality. By combining **Parallel Cuckoo Retrieval** (for privacy) with **Epoch-Based Delta-PIR** (for consistency) and **dual query modes** (Privacy-Only for performance, Trustless for full verification), we demonstrate a viable path to sub-second, private state access for Ethereum with ~9 concurrent clients.
