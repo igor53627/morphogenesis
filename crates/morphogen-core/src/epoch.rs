@@ -4,12 +4,9 @@ use arc_swap::ArcSwap;
 
 use morphogen_storage::ChunkedMatrix;
 
-use crate::DeltaBuffer;
-
 pub struct EpochSnapshot {
     pub epoch_id: u64,
     pub matrix: Arc<ChunkedMatrix>,
-    pub delta: Arc<DeltaBuffer>,
 }
 
 pub struct GlobalState {

@@ -6,9 +6,9 @@ use morphogen_storage::ChunkedMatrix;
 
 use crate::config::ServerConfig;
 use crate::epoch::build_next_snapshot;
-use crate::scan::scan;
 #[cfg(feature = "parallel")]
-use crate::scan::scan_main_matrix_parallel;
+use crate::scan::scan_consistent_parallel;
+use crate::scan::{scan_consistent, ScanError};
 
 pub struct MorphogenServer {
     config: ServerConfig,
@@ -28,11 +28,9 @@ impl MorphogenServer {
                 .expect("matrix must be uniquely owned during initialization");
             matrix_mut.fill_with_pattern(seed);
         }
-        let delta = Arc::new(DeltaBuffer::new(config.row_size_bytes));
         let snapshot = Arc::new(EpochSnapshot {
             epoch_id: 0,
             matrix,
-            delta,
         });
 
         Self {
@@ -42,23 +40,26 @@ impl MorphogenServer {
         }
     }
 
-    pub fn scan<K: DpfKey>(&self, keys: &[K; 3]) -> [Vec<u8>; 3] {
-        let snapshot = self.state.load();
-        scan(
-            snapshot.matrix.as_ref(),
-            snapshot.delta.as_ref(),
+    pub fn scan<K: DpfKey>(&self, keys: &[K; 3]) -> Result<([Vec<u8>; 3], u64), ScanError> {
+        scan_consistent(
+            &self.state,
+            self.pending.as_ref(),
             keys,
             self.config.row_size_bytes,
         )
     }
 
     #[cfg(feature = "parallel")]
-    pub fn scan_parallel<K: DpfKey + Sync>(&self, keys: &[K; 3]) -> [Vec<u8>; 3] {
-        let snapshot = self.state.load();
-        let mut results =
-            scan_main_matrix_parallel(snapshot.matrix.as_ref(), keys, self.config.row_size_bytes);
-        crate::scan::scan_delta(snapshot.delta.as_ref(), keys, &mut results);
-        results
+    pub fn scan_parallel<K: DpfKey + Sync>(
+        &self,
+        keys: &[K; 3],
+    ) -> Result<([Vec<u8>; 3], u64), ScanError> {
+        scan_consistent_parallel(
+            &self.state,
+            self.pending.as_ref(),
+            keys,
+            self.config.row_size_bytes,
+        )
     }
 
     pub fn warmup_matrix(&self) -> u64 {
@@ -78,8 +79,12 @@ impl MorphogenServer {
         acc
     }
 
-    pub fn submit_update(&self, row_idx: usize, diff: Vec<u8>) {
-        self.pending.push(row_idx, diff);
+    pub fn submit_update(
+        &self,
+        row_idx: usize,
+        diff: Vec<u8>,
+    ) -> Result<(), morphogen_core::DeltaError> {
+        self.pending.push(row_idx, diff)
     }
 
     pub fn merge_epoch(&mut self) {

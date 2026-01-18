@@ -29,11 +29,11 @@ impl CuckooAddresser {
 
     pub fn hash_indices(&self, key: &[u8]) -> [usize; NUM_HASH_FUNCTIONS] {
         let mut indices = [0usize; NUM_HASH_FUNCTIONS];
-        for i in 0..NUM_HASH_FUNCTIONS {
+        for (i, idx) in indices.iter_mut().enumerate() {
             let mut hasher = DefaultHasher::new();
             hasher.write_u64(self.seeds[i]);
             hasher.write(key);
-            indices[i] = (hasher.finish() as usize) % self.num_rows;
+            *idx = (hasher.finish() as usize) % self.num_rows;
         }
         indices
     }

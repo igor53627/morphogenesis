@@ -36,7 +36,7 @@ impl ServerConfig {
             Environment::Prod => Self {
                 environment,
                 row_size_bytes: ROW_SIZE_BYTES,
-                chunk_size_bytes: 1 * 1024 * 1024 * 1024,
+                chunk_size_bytes: 1024 * 1024 * 1024,
                 matrix_size_bytes: 300 * 1024 * 1024 * 1024,
                 bench_fill_seed: None,
             },

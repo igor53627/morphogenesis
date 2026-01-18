@@ -1,5 +1,5 @@
 mod config;
-mod epoch;
+pub mod epoch;
 #[cfg(feature = "network")]
 pub mod network;
 #[cfg(feature = "profiling")]
@@ -8,5 +8,7 @@ mod scan;
 mod server;
 
 pub use config::{Environment, ServerConfig};
-pub use scan::{scan, scan_delta, scan_main_matrix};
+#[cfg(feature = "parallel")]
+pub use scan::scan_consistent_parallel;
+pub use scan::{scan, scan_consistent, scan_delta, scan_main_matrix, ScanError};
 pub use server::MorphogenServer;

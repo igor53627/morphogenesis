@@ -45,37 +45,64 @@
 - [x] WebSocket epoch streaming (GET /ws/epoch - push EpochMetadata)
 - [x] WebSocket query endpoint (GET /ws/query - DPF keys in, responses out)
 
+### Epoch Management (Jan 18, 2026)
+- [x] Phase 0-6: Core implementation (dirty_chunks, COW merge, atomic switch, EpochHandle, background worker)
+- [x] Phase 7-13: Post-impl review fixes (atomic drain, merge mutex, skip empty, spawn_blocking, error logging, Vec<bool>, chunk validation)
+
+Key types: GlobalState, EpochManager, EpochHandle, MergeError
+
+### Epoch Management - Oracle Review #2 (Jan 18, 2026)
+Critical fixes for production readiness:
+
+- [x] Phase 14: Restore drained entries on merge error (prevent data loss)
+- [x] Phase 15: Remove/hide EpochSnapshot.delta (clarify single source of truth)
+- [x] Phase 16: Replace panics with Result in DeltaBuffer::push
+- [x] Phase 17: Validate row_size_bytes > 0 at EpochManager construction
+- [x] Phase 18: Handle lock poisoning gracefully (return error, don't panic)
+
 ---
 
 ## [IN PROGRESS]
 
-### Epoch Management (Jan 18, 2026)
-Phase 0: Refactor AppState to read from GlobalState (not stale fields)
-Phase 1: dirty_chunks() function with unit tests
-Phase 2: COW merge worker core with Result error handling
-Phase 3: Atomic epoch switch with ArcSwap<EpochSnapshot>
-Phase 4: EpochHandle wrapper for explicit refcounting
-Phase 5: Memory reclamation tests (drop counters)
-Phase 6: Background merge worker task
-
-Key types:
-- GlobalState { current: ArcSwap<EpochSnapshot> }
-- EpochManager { global, pending, epoch_tx }
-- EpochHandle(Arc<EpochSnapshot>)
+(none)
 
 ---
 
 ## [TODO]
 
+### Epoch Management - Oracle Review #3 (Jan 18, 2026)
+Critical correctness and production hardening:
+
+- [x] Phase 19: Scan consistency fix (CRITICAL)
+  - Race: scan reads GlobalState then pending independently
+  - During try_advance: pending drained -> new snapshot stored
+  - Concurrent scan sees old snapshot + empty pending = missing merged deltas
+  - Fix: Double-check epoch_id loop in scan_consistent() and scan_consistent_parallel()
+
+- [ ] Phase 20: Stop swallowing lock poison errors
+  - `unwrap_or_default()` in scan_delta, dirty_chunks, dirty_chunks_vec
+  - Converts corruption into silent data loss (empty pending)
+  - Fix: Return Result, bubble errors up
+
+- [ ] Phase 21: Validate row bounds on push
+  - Out-of-bounds row_idx only detected at merge time
+  - Causes repeated merge failures (livelock-ish)
+  - Fix: Validate row_idx < num_rows at submit_update time
+
+- [ ] Phase 22: Early error in dirty_chunks for OOB
+  - Currently silently ignores out-of-range chunks
+  - But merge loop errors for same condition (inconsistent)
+  - Fix: Return MergeError::DeltaOutOfBounds early
+
+- [ ] Phase 23: Remove remaining expect()/panic paths
+  - `build_next_snapshot().expect(...)` 
+  - `dirty_chunks_vec().expect(...)`
+  - Fix: Use try_* variants, handle errors in callers
+
 ### Core Protocol
 - [ ] UBT Merkle proof generation
 
-### Epoch Management
-- [ ] Copy-on-Write merge worker (Phase 2+6)
-- [ ] Dirty chunk detection from delta buffer (Phase 1)
-- [ ] Atomic epoch switch with arc-swap (Phase 3)
-- [ ] Reference counting for old epochs (Phase 4)
-- [ ] Memory reclamation after epoch transition (Phase 5)
+
 
 ### Delta-PIR
 - [ ] Integrate delta scan with main matrix scan

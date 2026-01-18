@@ -1,6 +1,21 @@
-use morphogen_core::DeltaBuffer;
+use morphogen_core::{DeltaBuffer, GlobalState};
 use morphogen_dpf::DpfKey;
 use morphogen_storage::ChunkedMatrix;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ScanError {
+    LockPoisoned,
+}
+
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ScanError::LockPoisoned => write!(f, "lock poisoned during scan"),
+        }
+    }
+}
+
+impl std::error::Error for ScanError {}
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -45,8 +60,8 @@ pub fn scan_main_matrix<K: DpfKey>(
 }
 
 pub fn scan_delta<K: DpfKey>(delta: &DeltaBuffer, keys: &[K; 3], results: &mut [Vec<u8>; 3]) {
-    let entries = delta.snapshot();
-    for entry in entries {
+    let entries = delta.snapshot().unwrap_or_default();
+    for entry in &entries {
         for (k, key) in keys.iter().enumerate() {
             if key.eval_bit(entry.row_idx) {
                 xor_into(&mut results[k], &entry.diff);
@@ -83,9 +98,65 @@ pub fn scan<K: DpfKey>(
     results
 }
 
+pub fn scan_consistent<K: DpfKey>(
+    global: &GlobalState,
+    pending: &DeltaBuffer,
+    keys: &[K; 3],
+    row_size_bytes: usize,
+) -> Result<([Vec<u8>; 3], u64), ScanError> {
+    loop {
+        let snapshot1 = global.load();
+        let epoch1 = snapshot1.epoch_id;
+
+        let entries = pending.snapshot().map_err(|_| ScanError::LockPoisoned)?;
+
+        let snapshot2 = global.load();
+        if snapshot2.epoch_id == epoch1 {
+            let mut results = scan_main_matrix(snapshot1.matrix.as_ref(), keys, row_size_bytes);
+            for entry in &entries {
+                for (k, key) in keys.iter().enumerate() {
+                    if key.eval_bit(entry.row_idx) {
+                        xor_into(&mut results[k], &entry.diff);
+                    }
+                }
+            }
+            return Ok((results, epoch1));
+        }
+    }
+}
+
 fn xor_into(dest: &mut [u8], src: &[u8]) {
     for (d, s) in dest.iter_mut().zip(src.iter()) {
         *d ^= s;
+    }
+}
+
+#[cfg(feature = "parallel")]
+pub fn scan_consistent_parallel<K: DpfKey + Sync>(
+    global: &GlobalState,
+    pending: &DeltaBuffer,
+    keys: &[K; 3],
+    row_size_bytes: usize,
+) -> Result<([Vec<u8>; 3], u64), ScanError> {
+    loop {
+        let snapshot1 = global.load();
+        let epoch1 = snapshot1.epoch_id;
+
+        let entries = pending.snapshot().map_err(|_| ScanError::LockPoisoned)?;
+
+        let snapshot2 = global.load();
+        if snapshot2.epoch_id == epoch1 {
+            let mut results =
+                scan_main_matrix_parallel(snapshot1.matrix.as_ref(), keys, row_size_bytes);
+            for entry in &entries {
+                for (k, key) in keys.iter().enumerate() {
+                    if key.eval_bit(entry.row_idx) {
+                        xor_into(&mut results[k], &entry.diff);
+                    }
+                }
+            }
+            return Ok((results, epoch1));
+        }
     }
 }
 
@@ -767,9 +838,11 @@ fn xor_masked(dest: &mut [u8], src: &[u8], offset: usize, mask: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{empty_result, scan_delta};
-    use morphogen_core::DeltaBuffer;
+    use super::{empty_result, scan_consistent, scan_delta};
+    use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
     use morphogen_dpf::AesDpfKey;
+    use morphogen_storage::ChunkedMatrix;
+    use std::sync::Arc;
 
     #[test]
     fn scan_delta_applies_matching_rows_with_dpf_pair() {
@@ -801,5 +874,55 @@ mod tests {
         assert_eq!(xor_results[0], vec![0xAA; row_size]);
         assert_eq!(xor_results[1], vec![0xBB; row_size]);
         assert_eq!(xor_results[2], vec![0x00; row_size]);
+    }
+
+    fn make_global_state(epoch_id: u64, total_size: usize, chunk_size: usize) -> Arc<GlobalState> {
+        let matrix = Arc::new(ChunkedMatrix::new(total_size, chunk_size));
+        let snapshot = EpochSnapshot { epoch_id, matrix };
+        Arc::new(GlobalState::new(Arc::new(snapshot)))
+    }
+
+    #[test]
+    fn scan_consistent_returns_result() {
+        let row_size = 4;
+        let global = make_global_state(0, 64, 32);
+        let pending = DeltaBuffer::new(row_size);
+
+        let mut rng = rand::thread_rng();
+        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+        let keys = [key0, key1, key2];
+
+        let result = scan_consistent(&global, &pending, &keys, row_size);
+        assert!(result.is_ok());
+        let (results, epoch_id) = result.unwrap();
+        assert_eq!(epoch_id, 0);
+        assert_eq!(results[0].len(), row_size);
+    }
+
+    #[test]
+    fn scan_consistent_includes_pending_deltas() {
+        let row_size = 4;
+        let global = make_global_state(0, 64, 32);
+        let pending = DeltaBuffer::new(row_size);
+        pending.push(0, vec![0xAB, 0xCD, 0xEF, 0x12]).unwrap();
+
+        let mut rng = rand::thread_rng();
+        let (key0_a, key0_b) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (key1_a, key1_b) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (key2_a, key2_b) = AesDpfKey::generate_pair(&mut rng, 2);
+
+        let keys_a = [key0_a, key1_a, key2_a];
+        let keys_b = [key0_b, key1_b, key2_b];
+
+        let (results_a, _) = scan_consistent(&global, &pending, &keys_a, row_size).unwrap();
+        let (results_b, _) = scan_consistent(&global, &pending, &keys_b, row_size).unwrap();
+
+        let mut xor = vec![0u8; row_size];
+        for i in 0..row_size {
+            xor[i] = results_a[0][i] ^ results_b[0][i];
+        }
+        assert_eq!(xor, vec![0xAB, 0xCD, 0xEF, 0x12]);
     }
 }

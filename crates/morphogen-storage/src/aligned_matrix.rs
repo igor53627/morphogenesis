@@ -30,6 +30,10 @@ impl AlignedMatrix {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn as_ptr(&self) -> *const u8 {
         self.ptr.as_ptr()
     }

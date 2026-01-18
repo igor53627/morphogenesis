@@ -10,6 +10,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use morphogen_core::GlobalState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -26,7 +27,7 @@ pub struct EpochMetadata {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub epoch_id: u64,
+    pub global: Arc<GlobalState>,
     pub num_rows: usize,
     pub seeds: [u64; 3],
     pub block_number: u64,
@@ -64,6 +65,7 @@ pub struct QueryResponse {
     pub payloads: Vec<Vec<u8>>,
 }
 
+#[allow(dead_code)]
 mod hex_bytes {
     use serde::{self, Deserialize, Deserializer, Serializer};
 
@@ -118,16 +120,18 @@ mod hex_bytes_vec {
 }
 
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
+    let snapshot = state.global.load();
     Json(HealthResponse {
         status: "ok".to_string(),
-        epoch_id: state.epoch_id,
+        epoch_id: snapshot.epoch_id,
         block_number: state.block_number,
     })
 }
 
 pub async fn epoch_handler(State(state): State<Arc<AppState>>) -> Json<EpochMetadataResponse> {
+    let snapshot = state.global.load();
     Json(EpochMetadataResponse {
-        epoch_id: state.epoch_id,
+        epoch_id: snapshot.epoch_id,
         num_rows: state.num_rows,
         seeds: state.seeds,
         block_number: state.block_number,
@@ -143,10 +147,11 @@ pub async fn query_handler(
         return Err(StatusCode::BAD_REQUEST);
     }
 
+    let snapshot = state.global.load();
     let payloads = vec![vec![0u8; 256]; 3];
 
     Ok(Json(QueryResponse {
-        epoch_id: state.epoch_id,
+        epoch_id: snapshot.epoch_id,
         payloads,
     }))
 }
@@ -194,9 +199,10 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
         if let Message::Text(text) = msg {
             let response = match serde_json::from_str::<QueryRequest>(&text) {
                 Ok(request) if request.keys.len() == 3 => {
+                    let snapshot = state.global.load();
                     let payloads = vec![vec![0u8; 256]; 3];
                     serde_json::to_string(&QueryResponse {
-                        epoch_id: state.epoch_id,
+                        epoch_id: snapshot.epoch_id,
                         payloads,
                     })
                     .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e))
@@ -231,8 +237,17 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use morphogen_core::EpochSnapshot;
+    use morphogen_storage::ChunkedMatrix;
 
     fn test_state() -> Arc<AppState> {
+        let matrix = Arc::new(ChunkedMatrix::new(1024, 512));
+        let snapshot = EpochSnapshot {
+            epoch_id: 42,
+            matrix,
+        };
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+
         let initial = EpochMetadata {
             epoch_id: 42,
             num_rows: 100_000,
@@ -242,7 +257,7 @@ mod tests {
         };
         let (_tx, rx) = watch::channel(initial);
         Arc::new(AppState {
-            epoch_id: 42,
+            global,
             num_rows: 100_000,
             seeds: [0x1234, 0x5678, 0x9ABC],
             block_number: 12345678,

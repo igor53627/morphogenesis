@@ -6,16 +6,18 @@ use morphogen_server::{Environment, MorphogenServer, ServerConfig};
 
 #[cfg(feature = "parallel")]
 fn do_scan(server: &MorphogenServer, keys: &[AesDpfKey; 3], use_parallel: bool) -> [Vec<u8>; 3] {
-    if use_parallel {
-        server.scan_parallel(keys)
+    let (results, _epoch_id) = if use_parallel {
+        server.scan_parallel(keys).expect("scan failed")
     } else {
-        server.scan(keys)
-    }
+        server.scan(keys).expect("scan failed")
+    };
+    results
 }
 
 #[cfg(not(feature = "parallel"))]
 fn do_scan(server: &MorphogenServer, keys: &[AesDpfKey; 3], _use_parallel: bool) -> [Vec<u8>; 3] {
-    server.scan(keys)
+    let (results, _epoch_id) = server.scan(keys).expect("scan failed");
+    results
 }
 
 fn main() {

@@ -4,10 +4,19 @@
 
 use std::sync::Arc;
 
+use morphogen_core::{EpochSnapshot, GlobalState};
 use morphogen_server::network::{create_router, AppState, EpochMetadata};
+use morphogen_storage::ChunkedMatrix;
 use tokio::sync::watch;
 
 fn test_state() -> Arc<AppState> {
+    let matrix = Arc::new(ChunkedMatrix::new(1024, 512));
+    let snapshot = EpochSnapshot {
+        epoch_id: 42,
+        matrix,
+    };
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+
     let initial = EpochMetadata {
         epoch_id: 42,
         num_rows: 100_000,
@@ -17,7 +26,7 @@ fn test_state() -> Arc<AppState> {
     };
     let (_tx, rx) = watch::channel(initial);
     Arc::new(AppState {
-        epoch_id: 42,
+        global,
         num_rows: 100_000,
         seeds: [0x1234, 0x5678, 0x9ABC],
         block_number: 12345678,
@@ -212,6 +221,13 @@ mod query {
 
     #[tokio::test]
     async fn query_returns_epoch_id_matching_state() {
+        let matrix = Arc::new(ChunkedMatrix::new(1024, 512));
+        let snapshot = EpochSnapshot {
+            epoch_id: 999,
+            matrix,
+        };
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+
         let initial = EpochMetadata {
             epoch_id: 999,
             num_rows: 1000,
@@ -221,7 +237,7 @@ mod query {
         };
         let (_tx, rx) = watch::channel(initial);
         let state = Arc::new(AppState {
-            epoch_id: 999,
+            global,
             num_rows: 1000,
             seeds: [1, 2, 3],
             block_number: 100,
@@ -261,6 +277,13 @@ mod websocket_epoch {
     use tokio_tungstenite::tungstenite;
 
     fn test_state_with_watch() -> (Arc<AppState>, watch::Sender<EpochMetadata>) {
+        let matrix = Arc::new(ChunkedMatrix::new(1024, 512));
+        let snapshot = EpochSnapshot {
+            epoch_id: 42,
+            matrix,
+        };
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+
         let initial = EpochMetadata {
             epoch_id: 42,
             num_rows: 100_000,
@@ -270,7 +293,7 @@ mod websocket_epoch {
         };
         let (tx, rx) = watch::channel(initial);
         let state = Arc::new(AppState {
-            epoch_id: 42,
+            global,
             num_rows: 100_000,
             seeds: [0x1234, 0x5678, 0x9ABC],
             block_number: 12345678,
