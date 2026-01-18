@@ -122,9 +122,10 @@ Critical correctness and production hardening:
   - Backoff: spin_loop for first 10 attempts, yield_now after
   - Default max retries: 1000
 
-- [ ] Phase 27: Max pending buffer size limit
+- [x] Phase 27: Max pending buffer size limit
   - Unbounded pending growth causes latency spikes / memory blowup
-  - Fix: Add max pending length or byte budget, reject updates when full
+  - Fix: Added DeltaError::BufferFull, DeltaBuffer::with_max_entries()
+  - Updated UpdateError to propagate BufferFull from DeltaError
 
 ### Core Protocol
 - [ ] UBT Merkle proof generation

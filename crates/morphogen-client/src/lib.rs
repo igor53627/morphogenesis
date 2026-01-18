@@ -33,8 +33,15 @@ pub struct AggregatedResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AggregationError {
-    EpochMismatch { server_a: u64, server_b: u64 },
-    PayloadLengthMismatch { index: usize, len_a: usize, len_b: usize },
+    EpochMismatch {
+        server_a: u64,
+        server_b: u64,
+    },
+    PayloadLengthMismatch {
+        index: usize,
+        len_a: usize,
+        len_b: usize,
+    },
 }
 
 pub fn aggregate_responses(
@@ -226,8 +233,14 @@ mod tests {
             query.keys_b[i].eval_range_masks(0, &mut masks_b[i]);
         }
 
-        assert_ne!(masks_a[0], masks_a[1], "key_a[0] should differ from key_a[1]");
-        assert_ne!(masks_a[1], masks_a[2], "key_a[1] should differ from key_a[2]");
+        assert_ne!(
+            masks_a[0], masks_a[1],
+            "key_a[0] should differ from key_a[1]"
+        );
+        assert_ne!(
+            masks_a[1], masks_a[2],
+            "key_a[1] should differ from key_a[2]"
+        );
     }
 
     #[test]
@@ -252,7 +265,10 @@ mod tests {
         let result = aggregate_responses(&response_a, &response_b).unwrap();
 
         assert_eq!(result.epoch_id, 1);
-        assert_eq!(result.payloads[0], vec![0xAA ^ 0x55, 0xBB ^ 0x44, 0xCC ^ 0x33]);
+        assert_eq!(
+            result.payloads[0],
+            vec![0xAA ^ 0x55, 0xBB ^ 0x44, 0xCC ^ 0x33]
+        );
         assert_eq!(result.payloads[1], vec![0x00, 0x00, 0x00]);
         assert_eq!(result.payloads[2], vec![0xFF, 0xFF, 0xFF]);
     }
@@ -339,7 +355,11 @@ mod tests {
         let size = 2048;
         let payload_a: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
         let payload_b: Vec<u8> = (0..size).map(|i| ((i * 7) % 256) as u8).collect();
-        let expected: Vec<u8> = payload_a.iter().zip(&payload_b).map(|(&a, &b)| a ^ b).collect();
+        let expected: Vec<u8> = payload_a
+            .iter()
+            .zip(&payload_b)
+            .map(|(&a, &b)| a ^ b)
+            .collect();
 
         let response_a = ServerResponse {
             epoch_id: 99,

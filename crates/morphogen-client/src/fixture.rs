@@ -218,7 +218,9 @@ mod tests {
 
         assert_eq!(entries.len(), 10);
         for entry in &entries {
-            assert!(entry.address.iter().any(|&b| b != 0) || entry.tree_index.iter().any(|&b| b != 0));
+            assert!(
+                entry.address.iter().any(|&b| b != 0) || entry.tree_index.iter().any(|&b| b != 0)
+            );
         }
     }
 

@@ -194,6 +194,7 @@ pub enum UpdateError {
     RowIndexOutOfBounds { row_idx: usize, num_rows: usize },
     SizeMismatch { expected: usize, actual: usize },
     LockPoisoned,
+    BufferFull { current: usize, max: usize },
 }
 
 impl std::fmt::Display for UpdateError {
@@ -216,6 +217,9 @@ impl std::fmt::Display for UpdateError {
             UpdateError::LockPoisoned => {
                 write!(f, "lock poisoned during update")
             }
+            UpdateError::BufferFull { current, max } => {
+                write!(f, "pending buffer full: {} entries (max {})", current, max)
+            }
         }
     }
 }
@@ -229,6 +233,9 @@ impl From<morphogen_core::DeltaError> for UpdateError {
                 UpdateError::SizeMismatch { expected, actual }
             }
             morphogen_core::DeltaError::LockPoisoned => UpdateError::LockPoisoned,
+            morphogen_core::DeltaError::BufferFull { current, max } => {
+                UpdateError::BufferFull { current, max }
+            }
         }
     }
 }

@@ -10,6 +10,7 @@ pub struct DeltaEntry {
 pub enum DeltaError {
     SizeMismatch { expected: usize, actual: usize },
     LockPoisoned,
+    BufferFull { current: usize, max: usize },
 }
 
 impl std::fmt::Display for DeltaError {
@@ -25,6 +26,9 @@ impl std::fmt::Display for DeltaError {
             DeltaError::LockPoisoned => {
                 write!(f, "delta buffer lock poisoned")
             }
+            DeltaError::BufferFull { current, max } => {
+                write!(f, "delta buffer full: {} entries (max {})", current, max)
+            }
         }
     }
 }
@@ -36,6 +40,7 @@ pub type DeltaPushError = DeltaError;
 
 pub struct DeltaBuffer {
     row_size_bytes: usize,
+    max_entries: Option<usize>,
     entries: RwLock<Vec<DeltaEntry>>,
 }
 
@@ -43,8 +48,21 @@ impl DeltaBuffer {
     pub fn new(row_size_bytes: usize) -> Self {
         Self {
             row_size_bytes,
+            max_entries: None,
             entries: RwLock::new(Vec::new()),
         }
+    }
+
+    pub fn with_max_entries(row_size_bytes: usize, max_entries: usize) -> Self {
+        Self {
+            row_size_bytes,
+            max_entries: Some(max_entries),
+            entries: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub fn max_entries(&self) -> Option<usize> {
+        self.max_entries
     }
 
     pub fn row_size_bytes(&self) -> usize {
@@ -59,6 +77,14 @@ impl DeltaBuffer {
             });
         }
         let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
+        if let Some(max) = self.max_entries {
+            if guard.len() >= max {
+                return Err(DeltaError::BufferFull {
+                    current: guard.len(),
+                    max,
+                });
+            }
+        }
         guard.push(DeltaEntry { row_idx, diff });
         Ok(())
     }
@@ -229,5 +255,42 @@ mod tests {
         }];
         let result = buf.restore(entries);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn with_max_entries_enforces_limit() {
+        let buf = DeltaBuffer::with_max_entries(4, 2);
+        assert_eq!(buf.max_entries(), Some(2));
+
+        buf.push(0, vec![1, 2, 3, 4]).unwrap();
+        buf.push(1, vec![5, 6, 7, 8]).unwrap();
+
+        let result = buf.push(2, vec![9, 10, 11, 12]);
+        assert!(matches!(
+            result,
+            Err(DeltaError::BufferFull { current: 2, max: 2 })
+        ));
+    }
+
+    #[test]
+    fn with_max_entries_allows_push_after_drain() {
+        let buf = DeltaBuffer::with_max_entries(4, 1);
+        buf.push(0, vec![1, 2, 3, 4]).unwrap();
+
+        assert!(buf.push(1, vec![5, 6, 7, 8]).is_err());
+
+        buf.drain().unwrap();
+        assert!(buf.push(2, vec![9, 10, 11, 12]).is_ok());
+    }
+
+    #[test]
+    fn unbounded_buffer_has_no_limit() {
+        let buf = DeltaBuffer::new(4);
+        assert_eq!(buf.max_entries(), None);
+
+        for i in 0..1000 {
+            buf.push(i, vec![1, 2, 3, 4]).unwrap();
+        }
+        assert_eq!(buf.len().unwrap(), 1000);
     }
 }
