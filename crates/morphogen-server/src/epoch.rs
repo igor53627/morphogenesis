@@ -42,6 +42,10 @@ pub fn try_dirty_chunks(
     Ok(result)
 }
 
+#[deprecated(
+    since = "0.2.0",
+    note = "Use try_dirty_chunks instead to handle errors"
+)]
 pub fn dirty_chunks(
     pending: &DeltaBuffer,
     row_size_bytes: usize,
@@ -83,6 +87,10 @@ pub fn try_dirty_chunks_vec(
     collect_dirty_chunks_from_entries(&snapshot, row_size_bytes, chunk_size_bytes, num_chunks)
 }
 
+#[deprecated(
+    since = "0.2.0",
+    note = "Use try_dirty_chunks_vec instead to handle errors"
+)]
 pub fn dirty_chunks_vec(
     pending: &DeltaBuffer,
     row_size_bytes: usize,
@@ -174,6 +182,10 @@ pub fn try_build_next_snapshot(
     try_build_snapshot_from_entries(current, &entries, pending.row_size_bytes(), next_epoch_id)
 }
 
+#[deprecated(
+    since = "0.2.0",
+    note = "Use try_build_next_snapshot instead to handle errors"
+)]
 pub fn build_next_snapshot(
     current: &EpochSnapshot,
     pending: &DeltaBuffer,
@@ -475,6 +487,7 @@ pub async fn spawn_merge_worker_with_callback<F>(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::{
         build_next_snapshot, dirty_chunks, dirty_chunks_vec, try_build_next_snapshot,

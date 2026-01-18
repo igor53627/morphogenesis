@@ -129,10 +129,10 @@ Hardening issues found in post-phase-34 review:
   - Added chunk_size_bytes == 0 guard in collect_dirty_chunks_from_entries()
   - Both now return MergeError::InvalidChunkSize instead of panicking
 
-- [ ] Phase 38: Deprecate panicking wrappers in epoch.rs (LOW)
-  - dirty_chunks(), dirty_chunks_vec(), build_next_snapshot() use .expect()
-  - Mark as #[deprecated] or move behind #[cfg(test)]
-  - Server paths should use try_* variants only
+- [x] Phase 38: Deprecate panicking wrappers in epoch.rs (LOW)
+  - Added #[deprecated] to dirty_chunks(), dirty_chunks_vec(), build_next_snapshot()
+  - All recommend using try_* variants instead
+  - Added #[allow(deprecated)] to test module to suppress warnings in tests
 
 - [ ] Phase 39: Verify EpochManager Drop resets has_manager (LOW)
   - Phase 32 added has_manager flag, need to confirm Drop impl exists
