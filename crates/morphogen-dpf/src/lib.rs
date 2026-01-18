@@ -245,9 +245,92 @@ impl AesDpfKey {
     }
 }
 
+/// Key serialization size: 16 (AES key) + 8 (target) + 1 (correction_word) = 25 bytes
+pub const AES_DPF_KEY_SIZE: usize = 25;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum DpfKeyError {
+    InvalidLength { expected: usize, actual: usize },
+}
+
+impl std::fmt::Display for DpfKeyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DpfKeyError::InvalidLength { expected, actual } => {
+                write!(
+                    f,
+                    "invalid DPF key length: expected {} bytes, got {}",
+                    expected, actual
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DpfKeyError {}
+
+impl AesDpfKey {
+    /// Serializes the key to a 25-byte array.
+    pub fn to_bytes(&self) -> [u8; AES_DPF_KEY_SIZE] {
+        let mut out = [0u8; AES_DPF_KEY_SIZE];
+        out[0..16].copy_from_slice(&self.key);
+        out[16..24].copy_from_slice(&(self.target as u64).to_le_bytes());
+        out[24] = self.correction_word;
+        out
+    }
+
+    /// Deserializes a key from a 25-byte slice.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DpfKeyError> {
+        if bytes.len() != AES_DPF_KEY_SIZE {
+            return Err(DpfKeyError::InvalidLength {
+                expected: AES_DPF_KEY_SIZE,
+                actual: bytes.len(),
+            });
+        }
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&bytes[0..16]);
+        let target = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        let correction_word = bytes[24];
+        Ok(Self {
+            key,
+            target,
+            correction_word,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aes_dpf_key_roundtrip_serialization() {
+        let mut rng = rand::thread_rng();
+        let target = 12345;
+        let (key0, _key1) = AesDpfKey::generate_pair(&mut rng, target);
+
+        let bytes = key0.to_bytes();
+        assert_eq!(bytes.len(), AES_DPF_KEY_SIZE);
+
+        let restored = AesDpfKey::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.target, target);
+        // Verify they evaluate the same
+        for i in 0..100 {
+            assert_eq!(key0.eval_bit(i), restored.eval_bit(i));
+        }
+    }
+
+    #[test]
+    fn aes_dpf_key_from_bytes_rejects_wrong_length() {
+        let result = AesDpfKey::from_bytes(&[0u8; 10]);
+        assert!(matches!(
+            result,
+            Err(DpfKeyError::InvalidLength {
+                expected: 25,
+                actual: 10
+            })
+        ));
+    }
 
     #[test]
     fn aes_dpf_key_pair_xor_to_point_function() {

@@ -189,10 +189,21 @@ Final hardening from post-phase-45 review:
 
 
 
-### Delta-PIR
-- [ ] Integrate delta scan with main matrix scan
-- [ ] Pending buffer for live updates
-- [ ] Epoch ID in query response metadata
+### Delta-PIR Integration (Jan 18, 2026)
+Wire up query handler to use scan_consistent with real DPF evaluation:
+
+- [x] Phase 48: Add from_bytes/to_bytes to AesDpfKey
+  - Key format: 16 bytes AES key + 8 bytes target + 1 byte correction_word = 25 bytes
+  - Added DpfKeyError::InvalidLength, AES_DPF_KEY_SIZE constant
+
+- [ ] Phase 49: Add pending buffer and row_size to AppState
+  - Add pending: Arc<DeltaBuffer> to AppState
+  - Add row_size_bytes: usize to AppState
+
+- [ ] Phase 50: Wire query_handler to use scan_consistent
+  - Parse 3 hex keys into [AesDpfKey; 3]
+  - Call scan_consistent(global, pending, keys, row_size_bytes)
+  - Return real payloads (not dummy vec![0u8; 256])
 
 ### Network Layer
 - [ ] Query batch endpoint
