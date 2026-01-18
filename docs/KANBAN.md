@@ -101,10 +101,11 @@ Non-critical hardening from post-fix review:
   - EpochManager::new() uses try_acquire_manager(), returns ManagerAlreadyExists error
   - EpochManager::drop() calls release_manager() to allow new manager
 
-- [ ] Phase 33: Document pending_epoch invariants (LOW)
-  - pending_epoch must only be modified while holding entries write lock
-  - Add comments at field and in each method that modifies it
-  - Optionally add private set_pending_epoch_locked() helper
+- [x] Phase 33: Document pending_epoch invariants (LOW)
+  - Added struct-level doc comment explaining concurrency invariant
+  - Added field-level doc comment on pending_epoch explaining the invariant
+  - Added doc comments + inline SAFETY comments to drain_for_epoch() and restore_for_epoch()
+  - Added doc comment to snapshot_with_epoch() explaining atomicity guarantee
 
 - [ ] Phase 34: Add with_max_entries_and_epoch constructor (LOW)
   - Currently no way to set both max_entries AND initial_epoch

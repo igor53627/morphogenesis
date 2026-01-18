@@ -39,10 +39,26 @@ impl std::error::Error for DeltaError {}
 #[deprecated(since = "0.2.0", note = "Use DeltaError instead")]
 pub type DeltaPushError = DeltaError;
 
+/// Thread-safe buffer for accumulating delta entries before epoch merge.
+///
+/// # Concurrency Invariant
+///
+/// The `pending_epoch` field must only be modified while holding the `entries` write lock.
+/// This ensures that `snapshot_with_epoch()` returns a consistent (epoch, entries) pair:
+/// readers holding the read lock will see both the entries AND the epoch that corresponds
+/// to those entries, preventing torn reads where we see an old epoch with empty entries
+/// (or vice versa).
 pub struct DeltaBuffer {
     row_size_bytes: usize,
     max_entries: Option<usize>,
     entries: RwLock<Vec<DeltaEntry>>,
+    /// The epoch that pending entries will be merged into.
+    ///
+    /// # Invariant
+    ///
+    /// This field must only be modified while holding the `entries` write lock.
+    /// This is critical for `snapshot_with_epoch()` correctness - it reads this field
+    /// while holding the read lock to ensure atomicity with the entries snapshot.
     pending_epoch: AtomicU64,
 }
 
@@ -107,8 +123,17 @@ impl DeltaBuffer {
         Ok(guard.clone())
     }
 
+    /// Returns the current pending epoch and a snapshot of all entries atomically.
+    ///
+    /// # Atomicity
+    ///
+    /// Reads `pending_epoch` while holding the `entries` read lock. This ensures
+    /// we never see a "torn read" where the epoch is updated but entries are
+    /// already drained (or vice versa). The invariant that `pending_epoch` is only
+    /// modified while holding the write lock guarantees consistency.
     pub fn snapshot_with_epoch(&self) -> Result<(u64, Vec<DeltaEntry>), DeltaError> {
         let guard = self.entries.read().map_err(|_| DeltaError::LockPoisoned)?;
+        // Read epoch while holding lock - see struct doc for invariant
         let epoch = self.pending_epoch.load(Ordering::Acquire);
         Ok((epoch, guard.clone()))
     }
@@ -131,8 +156,15 @@ impl DeltaBuffer {
         Ok(std::mem::take(&mut *guard))
     }
 
+    /// Atomically drains all entries and updates the pending epoch.
+    ///
+    /// # Invariant
+    ///
+    /// Updates `pending_epoch` while holding the `entries` write lock, ensuring
+    /// `snapshot_with_epoch()` always sees a consistent (epoch, entries) pair.
     pub fn drain_for_epoch(&self, new_epoch: u64) -> Result<Vec<DeltaEntry>, DeltaError> {
         let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
+        // SAFETY: pending_epoch modification while holding write lock - see struct doc
         self.pending_epoch.store(new_epoch, Ordering::Release);
         Ok(std::mem::take(&mut *guard))
     }
@@ -148,12 +180,23 @@ impl DeltaBuffer {
         Ok(())
     }
 
+    /// Atomically restores entries (prepending them) and resets pending epoch.
+    ///
+    /// Used to roll back after a failed epoch merge. The epoch is always updated,
+    /// and all entries are always restored, even if this would exceed `max_entries`.
+    /// If the limit is exceeded, returns `BufferFull` error (but data is preserved).
+    ///
+    /// # Invariant
+    ///
+    /// Updates `pending_epoch` while holding the `entries` write lock, ensuring
+    /// `snapshot_with_epoch()` always sees a consistent (epoch, entries) pair.
     pub fn restore_for_epoch(
         &self,
         epoch: u64,
         entries: Vec<DeltaEntry>,
     ) -> Result<(), DeltaError> {
         let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
+        // SAFETY: pending_epoch modification while holding write lock - see struct doc
         self.pending_epoch.store(epoch, Ordering::Release);
         if entries.is_empty() {
             return Ok(());
