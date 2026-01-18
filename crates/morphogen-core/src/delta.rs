@@ -99,8 +99,8 @@ impl DeltaBuffer {
     }
 
     pub fn snapshot_with_epoch(&self) -> Result<(u64, Vec<DeltaEntry>), DeltaError> {
-        let epoch = self.pending_epoch.load(Ordering::Acquire);
         let guard = self.entries.read().map_err(|_| DeltaError::LockPoisoned)?;
+        let epoch = self.pending_epoch.load(Ordering::Acquire);
         Ok((epoch, guard.clone()))
     }
 
@@ -349,5 +349,131 @@ mod tests {
             buf.push(i, vec![1, 2, 3, 4]).unwrap();
         }
         assert_eq!(buf.len().unwrap(), 1000);
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    #[test]
+    fn snapshot_with_epoch_is_atomic_with_drain() {
+        let buf = Arc::new(DeltaBuffer::new(4));
+        let iterations = 1000;
+        let torn_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        for _ in 0..iterations {
+            buf.push(0, vec![0xAA; 4]).unwrap();
+
+            let buf_clone = buf.clone();
+            let torn_clone = torn_reads.clone();
+            let barrier = Arc::new(Barrier::new(2));
+            let barrier_clone = barrier.clone();
+
+            let drainer = thread::spawn(move || {
+                barrier_clone.wait();
+                let _ = buf_clone.drain_for_epoch(buf_clone.pending_epoch() + 1);
+            });
+
+            barrier.wait();
+            let (epoch, entries) = buf.snapshot_with_epoch().unwrap();
+
+            drainer.join().unwrap();
+
+            let current_epoch = buf.pending_epoch();
+            if epoch < current_epoch && entries.is_empty() {
+                torn_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let torn = torn_reads.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            torn, 0,
+            "snapshot_with_epoch had {} torn reads out of {} iterations - \
+             saw old epoch with empty entries (race condition!)",
+            torn, iterations
+        );
+    }
+
+    #[test]
+    fn snapshot_with_epoch_never_returns_old_epoch_with_empty_entries_after_drain() {
+        let buf = Arc::new(DeltaBuffer::new(4));
+
+        let step1 = Arc::new(Barrier::new(2));
+        let step2 = Arc::new(Barrier::new(2));
+
+        buf.push(0, vec![0xFF; 4]).unwrap();
+        let initial_epoch = buf.pending_epoch();
+
+        let buf_clone = buf.clone();
+        let step1_clone = step1.clone();
+        let step2_clone = step2.clone();
+
+        let drainer = thread::spawn(move || {
+            step1_clone.wait();
+            let _ = buf_clone.drain_for_epoch(initial_epoch + 1);
+            step2_clone.wait();
+        });
+
+        step1.wait();
+        step2.wait();
+
+        let (epoch, entries) = buf.snapshot_with_epoch().unwrap();
+
+        drainer.join().unwrap();
+
+        if entries.is_empty() {
+            assert_eq!(
+                epoch,
+                initial_epoch + 1,
+                "if entries are empty after drain, epoch must be the new epoch, not old"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_with_epoch_lock_ordering_prevents_torn_read() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        let old_epoch = Arc::new(AtomicU64::new(0));
+        let entries_empty = Arc::new(AtomicBool::new(false));
+        let new_epoch_set = Arc::new(AtomicBool::new(false));
+
+        let buf = Arc::new(DeltaBuffer::new(4));
+        buf.push(0, vec![0xAA; 4]).unwrap();
+
+        let buf_clone = buf.clone();
+        let old_epoch_clone = old_epoch.clone();
+        let entries_empty_clone = entries_empty.clone();
+        let new_epoch_clone = new_epoch_set.clone();
+
+        let reader = thread::spawn(move || {
+            while !new_epoch_clone.load(Ordering::Acquire) {
+                let (epoch, entries) = buf_clone.snapshot_with_epoch().unwrap();
+
+                if entries.is_empty() && epoch == old_epoch_clone.load(Ordering::Acquire) {
+                    entries_empty_clone.store(true, Ordering::Release);
+                    return true;
+                }
+            }
+            false
+        });
+
+        old_epoch.store(buf.pending_epoch(), Ordering::Release);
+
+        for _ in 0..100 {
+            std::thread::yield_now();
+        }
+
+        let _ = buf.drain_for_epoch(buf.pending_epoch() + 1);
+        new_epoch_set.store(true, Ordering::Release);
+
+        let saw_torn = reader.join().unwrap();
+        assert!(
+            !saw_torn,
+            "Reader saw torn read: old epoch with empty entries"
+        );
     }
 }
