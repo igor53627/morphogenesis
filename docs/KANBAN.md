@@ -196,9 +196,10 @@ Wire up query handler to use scan_consistent with real DPF evaluation:
   - Key format: 16 bytes AES key + 8 bytes target + 1 byte correction_word = 25 bytes
   - Added DpfKeyError::InvalidLength, AES_DPF_KEY_SIZE constant
 
-- [ ] Phase 49: Add pending buffer and row_size to AppState
-  - Add pending: Arc<DeltaBuffer> to AppState
-  - Add row_size_bytes: usize to AppState
+- [x] Phase 49: Add pending buffer and row_size to AppState
+  - Added pending: Arc<DeltaBuffer> to AppState
+  - Added row_size_bytes: usize to AppState
+  - Updated all test fixtures to include new fields
 
 - [ ] Phase 50: Wire query_handler to use scan_consistent
   - Parse 3 hex keys into [AesDpfKey; 3]

@@ -28,6 +28,8 @@ pub struct EpochMetadata {
 #[derive(Clone)]
 pub struct AppState {
     pub global: Arc<GlobalState>,
+    pub pending: Arc<morphogen_core::DeltaBuffer>,
+    pub row_size_bytes: usize,
     pub num_rows: usize,
     pub seeds: [u64; 3],
     pub block_number: u64,
@@ -237,16 +239,19 @@ pub fn create_router(state: Arc<AppState>) -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use morphogen_core::EpochSnapshot;
+    use morphogen_core::{DeltaBuffer, EpochSnapshot};
     use morphogen_storage::ChunkedMatrix;
 
     fn test_state() -> Arc<AppState> {
-        let matrix = Arc::new(ChunkedMatrix::new(1024, 512));
+        let row_size_bytes = 256;
+        let num_rows = 4;
+        let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 512));
         let snapshot = EpochSnapshot {
             epoch_id: 42,
             matrix,
         };
         let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
 
         let initial = EpochMetadata {
             epoch_id: 42,
@@ -258,12 +263,21 @@ mod tests {
         let (_tx, rx) = watch::channel(initial);
         Arc::new(AppState {
             global,
+            pending,
+            row_size_bytes,
             num_rows: 100_000,
             seeds: [0x1234, 0x5678, 0x9ABC],
             block_number: 12345678,
             state_root: [0xAB; 32],
             epoch_rx: rx,
         })
+    }
+
+    #[test]
+    fn app_state_has_pending_buffer() {
+        let state = test_state();
+        assert!(state.pending.is_empty().unwrap());
+        assert_eq!(state.row_size_bytes, 256);
     }
 
     #[test]

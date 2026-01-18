@@ -4,18 +4,21 @@
 
 use std::sync::Arc;
 
-use morphogen_core::{EpochSnapshot, GlobalState};
+use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
 use morphogen_server::network::{create_router, AppState, EpochMetadata};
 use morphogen_storage::ChunkedMatrix;
 use tokio::sync::watch;
 
 fn test_state() -> Arc<AppState> {
-    let matrix = Arc::new(ChunkedMatrix::new(1024, 512));
+    let row_size_bytes = 256;
+    let num_rows = 4;
+    let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 512));
     let snapshot = EpochSnapshot {
         epoch_id: 42,
         matrix,
     };
     let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
 
     let initial = EpochMetadata {
         epoch_id: 42,
@@ -27,6 +30,8 @@ fn test_state() -> Arc<AppState> {
     let (_tx, rx) = watch::channel(initial);
     Arc::new(AppState {
         global,
+        pending,
+        row_size_bytes,
         num_rows: 100_000,
         seeds: [0x1234, 0x5678, 0x9ABC],
         block_number: 12345678,
@@ -221,12 +226,14 @@ mod query {
 
     #[tokio::test]
     async fn query_returns_epoch_id_matching_state() {
-        let matrix = Arc::new(ChunkedMatrix::new(1024, 512));
+        let row_size_bytes = 256;
+        let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * 4, 512));
         let snapshot = EpochSnapshot {
             epoch_id: 999,
             matrix,
         };
         let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 999));
 
         let initial = EpochMetadata {
             epoch_id: 999,
@@ -238,6 +245,8 @@ mod query {
         let (_tx, rx) = watch::channel(initial);
         let state = Arc::new(AppState {
             global,
+            pending,
+            row_size_bytes,
             num_rows: 1000,
             seeds: [1, 2, 3],
             block_number: 100,
@@ -277,12 +286,14 @@ mod websocket_epoch {
     use tokio_tungstenite::tungstenite;
 
     fn test_state_with_watch() -> (Arc<AppState>, watch::Sender<EpochMetadata>) {
-        let matrix = Arc::new(ChunkedMatrix::new(1024, 512));
+        let row_size_bytes = 256;
+        let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * 4, 512));
         let snapshot = EpochSnapshot {
             epoch_id: 42,
             matrix,
         };
         let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
 
         let initial = EpochMetadata {
             epoch_id: 42,
@@ -294,6 +305,8 @@ mod websocket_epoch {
         let (tx, rx) = watch::channel(initial);
         let state = Arc::new(AppState {
             global,
+            pending,
+            row_size_bytes,
             num_rows: 100_000,
             seeds: [0x1234, 0x5678, 0x9ABC],
             block_number: 12345678,
