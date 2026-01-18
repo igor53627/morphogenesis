@@ -161,9 +161,10 @@ Final hardening pass - edge cases and failure modes:
   - try_build_snapshot_from_entries uses checked_add for end calculation
   - Returns OffsetOverflow instead of panicking on usize overflow
 
-- [ ] Phase 44: Document pending_epoch() as non-linearizable (LOW)
-  - pending_epoch() reads without lock, can show torn view
-  - Fix: add doc warning, recommend snapshot_with_epoch() instead
+- [x] Phase 44: Document pending_epoch() as non-linearizable (LOW)
+  - Added "Warning: Not Linearizable" doc section to pending_epoch()
+  - Explains the method reads without lock and may show torn view
+  - Recommends snapshot_with_epoch() for consistent (epoch, entries) pair
 
 - [ ] Phase 45: Move deprecated wrappers behind #[cfg(test)] (LOW)
   - dirty_chunks(), dirty_chunks_vec(), build_next_snapshot() still callable in prod

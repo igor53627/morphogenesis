@@ -167,6 +167,19 @@ impl DeltaBuffer {
         Ok((epoch, guard.clone()))
     }
 
+    /// Returns the current pending epoch.
+    ///
+    /// # Warning: Not Linearizable
+    ///
+    /// This method reads `pending_epoch` WITHOUT holding the entries lock.
+    /// The returned epoch may not be consistent with the buffer contents:
+    /// - You might see a new epoch while entries still reflect the old state
+    /// - You might see an old epoch right after entries were drained
+    ///
+    /// For a consistent (epoch, entries) pair, use [`snapshot_with_epoch()`] instead.
+    ///
+    /// This method is useful only for logging, metrics, or approximate progress
+    /// tracking where consistency with entries is not required.
     pub fn pending_epoch(&self) -> u64 {
         self.pending_epoch.load(Ordering::Acquire)
     }
