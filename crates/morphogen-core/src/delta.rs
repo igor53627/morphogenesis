@@ -65,6 +65,15 @@ impl DeltaBuffer {
         }
     }
 
+    pub fn new_with_epoch(row_size_bytes: usize, initial_epoch: u64) -> Self {
+        Self {
+            row_size_bytes,
+            max_entries: None,
+            entries: RwLock::new(Vec::new()),
+            pending_epoch: AtomicU64::new(initial_epoch),
+        }
+    }
+
     pub fn max_entries(&self) -> Option<usize> {
         self.max_entries
     }

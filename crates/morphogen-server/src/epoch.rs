@@ -253,9 +253,10 @@ impl EpochManager {
                 row_size: row_size_bytes,
             });
         }
+        let initial_epoch = global.load().epoch_id;
         Ok(Self {
             global,
-            pending: Arc::new(DeltaBuffer::new(row_size_bytes)),
+            pending: Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, initial_epoch)),
             merge_lock: Mutex::new(()),
         })
     }
@@ -1082,6 +1083,45 @@ mod tests {
             "scan_consistent should succeed after merge failure, but got: {:?}",
             scan_result
         );
+    }
+
+    #[test]
+    fn epoch_manager_initializes_pending_epoch_from_global() {
+        let global = make_global_state(42, 4);
+        let manager = EpochManager::new(global, 4).unwrap();
+
+        assert_eq!(
+            manager.pending().pending_epoch(),
+            42,
+            "pending_epoch should be initialized to global epoch"
+        );
+    }
+
+    #[test]
+    fn scan_consistent_succeeds_with_nonzero_initial_epoch() {
+        use crate::scan::scan_consistent_with_max_retries;
+        use morphogen_dpf::AesDpfKey;
+
+        let global = make_global_state(100, 4);
+        let manager = EpochManager::new(global.clone(), 4).unwrap();
+
+        let mut rng = rand::thread_rng();
+        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+        let keys = [key0, key1, key2];
+
+        let scan_result =
+            scan_consistent_with_max_retries(&global, manager.pending(), &keys, 4, 10);
+
+        assert!(
+            scan_result.is_ok(),
+            "scan_consistent should succeed with nonzero initial epoch, but got: {:?}",
+            scan_result
+        );
+
+        let (_, epoch) = scan_result.unwrap();
+        assert_eq!(epoch, 100);
     }
 }
 

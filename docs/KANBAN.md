@@ -71,6 +71,9 @@ Critical fixes for production readiness:
 - [x] Phase 25: Row/chunk alignment invariant (ConfigError, ServerConfig::validate())
 - [x] Phase 26: Backoff in scan_consistent() retry loop (TooManyRetries, max_retries)
 - [x] Phase 27: Max pending buffer size limit (DeltaError::BufferFull)
+- [x] Phase 28: Fix snapshot_with_epoch() lock ordering (acquire lock first)
+- [x] Phase 29: Reset pending_epoch on merge failure (restore_for_epoch)
+- [x] Phase 30: Initialize pending_epoch from global epoch (new_with_epoch)
 
 ---
 
@@ -81,28 +84,6 @@ Critical fixes for production readiness:
 ---
 
 ## [TODO]
-
-### Epoch Management - Oracle Review #5 (Jan 18, 2026)
-Critical bugs found in Phase 24 implementation:
-
-- [x] Phase 28: Fix snapshot_with_epoch() lock ordering (CRITICAL)
-  - Current: reads pending_epoch BEFORE taking entries read-lock
-  - Race: scan reads old epoch, merge drains + advances epoch, scan gets empty entries
-  - Result: scan sees (old_epoch, empty) = same race Phase 24 tried to fix
-  - Fix: Acquire read lock FIRST, then read pending_epoch while holding it
-  - Added concurrency test that triggers torn read with old code
-
-- [x] Phase 29: Reset pending_epoch on merge failure (CRITICAL)
-  - On merge error, pending_epoch stays advanced but global epoch unchanged
-  - scan_consistent() requires pending_epoch == matrix_epoch to succeed
-  - Result: scan livelocks until TooManyRetries after any merge failure
-  - Fix: Added restore_for_epoch(epoch, entries) to DeltaBuffer
-  - Updated try_advance() error path to call restore_for_epoch(current.epoch_id, entries)
-
-- [ ] Phase 30: Initialize pending_epoch from global epoch
-  - DeltaBuffer::new() sets pending_epoch = 0
-  - If system boots with persisted global epoch > 0, scan spins forever
-  - Fix: Add DeltaBuffer::new_with_epoch() or set_pending_epoch() in EpochManager::new()
 
 ### Core Protocol
 - [ ] UBT Merkle proof generation
