@@ -5,9 +5,27 @@
 use std::sync::Arc;
 
 use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
+use morphogen_dpf::AesDpfKey;
 use morphogen_server::network::{create_router, AppState, EpochMetadata};
 use morphogen_storage::ChunkedMatrix;
 use tokio::sync::watch;
+
+/// Create 3 valid DPF keys for testing, targeting row 0
+fn test_dpf_keys() -> ([AesDpfKey; 3], String) {
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
+    let target = 0;
+    let key0 = AesDpfKey::new_single(&mut rng, target);
+    let key1 = AesDpfKey::new_single(&mut rng, target);
+    let key2 = AesDpfKey::new_single(&mut rng, target);
+
+    let hex0 = format!("0x{}", hex::encode(key0.to_bytes()));
+    let hex1 = format!("0x{}", hex::encode(key1.to_bytes()));
+    let hex2 = format!("0x{}", hex::encode(key2.to_bytes()));
+
+    let json = format!(r#"{{"keys":["{hex0}","{hex1}","{hex2}"]}}"#);
+    ([key0, key1, key2], json)
+}
 
 fn test_state() -> Arc<AppState> {
     let row_size_bytes = 256;
@@ -157,8 +175,7 @@ mod query {
     #[tokio::test]
     async fn query_accepts_three_keys() {
         let app = create_router(test_state());
-
-        let body = r#"{"keys":["0xaabbccdd","0x11223344","0x55667788"]}"#;
+        let (_keys, body) = test_dpf_keys();
 
         let response = app
             .oneshot(
@@ -199,8 +216,7 @@ mod query {
     #[tokio::test]
     async fn query_returns_three_payloads() {
         let app = create_router(test_state());
-
-        let body = r#"{"keys":["0xaabbccdd","0x11223344","0x55667788"]}"#;
+        let (_keys, body) = test_dpf_keys();
 
         let response = app
             .oneshot(
@@ -254,8 +270,7 @@ mod query {
             epoch_rx: rx,
         });
         let app = create_router(state);
-
-        let body = r#"{"keys":["0xaa","0xbb","0xcc"]}"#;
+        let (_keys, body) = test_dpf_keys();
 
         let response = app
             .oneshot(
@@ -274,6 +289,8 @@ mod query {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
+        // The scan returns epoch from scan_consistent, which matches pending buffer epoch
+        // Since we created pending with epoch 999, that should match
         assert_eq!(json["epoch_id"], 999);
     }
 }
@@ -533,7 +550,7 @@ mod websocket_query {
             .await
             .unwrap();
 
-        let request = r#"{"keys":["0xaabbccdd","0x11223344","0x55667788"]}"#;
+        let (_keys, request) = test_dpf_keys();
         socket
             .send(tungstenite::Message::text(request))
             .await
@@ -570,10 +587,10 @@ mod websocket_query {
             .await
             .unwrap();
 
+        let (_keys, request) = test_dpf_keys();
         for i in 0..3 {
-            let request = r#"{"keys":["0xaa","0xbb","0xcc"]}"#;
             socket
-                .send(tungstenite::Message::text(request))
+                .send(tungstenite::Message::text(request.clone()))
                 .await
                 .unwrap();
 

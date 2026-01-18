@@ -201,10 +201,11 @@ Wire up query handler to use scan_consistent with real DPF evaluation:
   - Added row_size_bytes: usize to AppState
   - Updated all test fixtures to include new fields
 
-- [ ] Phase 50: Wire query_handler to use scan_consistent
-  - Parse 3 hex keys into [AesDpfKey; 3]
+- [x] Phase 50: Wire query_handler to use scan_consistent
+  - Parse 3 hex keys into [AesDpfKey; 3] (rejects invalid 25-byte keys)
   - Call scan_consistent(global, pending, keys, row_size_bytes)
-  - Return real payloads (not dummy vec![0u8; 256])
+  - Returns real DPF-evaluated payloads
+  - Also updated WebSocket query handler (handle_ws_query)
 
 ### Network Layer
 - [ ] Query batch endpoint

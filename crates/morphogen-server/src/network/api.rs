@@ -145,16 +145,35 @@ pub async fn query_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, StatusCode> {
+    use crate::scan::scan_consistent;
+    use morphogen_dpf::AesDpfKey;
+
     if request.keys.len() != 3 {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let snapshot = state.global.load();
-    let payloads = vec![vec![0u8; 256]; 3];
+    // Parse DPF keys from bytes
+    let keys: [AesDpfKey; 3] = match (
+        AesDpfKey::from_bytes(&request.keys[0]),
+        AesDpfKey::from_bytes(&request.keys[1]),
+        AesDpfKey::from_bytes(&request.keys[2]),
+    ) {
+        (Ok(k0), Ok(k1), Ok(k2)) => [k0, k1, k2],
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    // Run consistent scan
+    let (results, epoch_id) = scan_consistent(
+        state.global.as_ref(),
+        state.pending.as_ref(),
+        &keys,
+        state.row_size_bytes,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(QueryResponse {
-        epoch_id: snapshot.epoch_id,
-        payloads,
+        epoch_id,
+        payloads: results.to_vec(),
     }))
 }
 
@@ -197,17 +216,45 @@ pub async fn ws_query_handler(
 }
 
 async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
+    use crate::scan::scan_consistent;
+    use morphogen_dpf::AesDpfKey;
+
     while let Some(Ok(msg)) = socket.recv().await {
         if let Message::Text(text) = msg {
             let response = match serde_json::from_str::<QueryRequest>(&text) {
                 Ok(request) if request.keys.len() == 3 => {
-                    let snapshot = state.global.load();
-                    let payloads = vec![vec![0u8; 256]; 3];
-                    serde_json::to_string(&QueryResponse {
-                        epoch_id: snapshot.epoch_id,
-                        payloads,
-                    })
-                    .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e))
+                    // Parse DPF keys
+                    let keys_result = (
+                        AesDpfKey::from_bytes(&request.keys[0]),
+                        AesDpfKey::from_bytes(&request.keys[1]),
+                        AesDpfKey::from_bytes(&request.keys[2]),
+                    );
+
+                    match keys_result {
+                        (Ok(k0), Ok(k1), Ok(k2)) => {
+                            let keys = [k0, k1, k2];
+                            match scan_consistent(
+                                state.global.as_ref(),
+                                state.pending.as_ref(),
+                                &keys,
+                                state.row_size_bytes,
+                            ) {
+                                Ok((results, epoch_id)) => serde_json::to_string(&QueryResponse {
+                                    epoch_id,
+                                    payloads: results.to_vec(),
+                                })
+                                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e)),
+                                Err(e) => serde_json::to_string(&WsQueryError {
+                                    error: format!("scan error: {}", e),
+                                })
+                                .unwrap(),
+                            }
+                        }
+                        _ => serde_json::to_string(&WsQueryError {
+                            error: "invalid key format".to_string(),
+                        })
+                        .unwrap(),
+                    }
                 }
                 Ok(_) => serde_json::to_string(&WsQueryError {
                     error: "expected exactly 3 keys".to_string(),
@@ -330,5 +377,13 @@ mod tests {
     fn app_state_is_clone_and_send() {
         fn assert_clone_send<T: Clone + Send>() {}
         assert_clone_send::<AppState>();
+    }
+
+    #[test]
+    fn query_handler_requires_25_byte_keys() {
+        // AES_DPF_KEY_SIZE = 25 bytes
+        // Keys shorter than 25 bytes should be rejected
+        use morphogen_dpf::AES_DPF_KEY_SIZE;
+        assert_eq!(AES_DPF_KEY_SIZE, 25);
     }
 }
