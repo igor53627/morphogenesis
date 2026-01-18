@@ -85,6 +85,28 @@ Critical fixes for production readiness:
 
 ## [TODO]
 
+### Epoch Management - Oracle Review #6 (Jan 18, 2026)
+Non-critical hardening from post-fix review:
+
+- [ ] Phase 31: max_entries overflow on restore (MEDIUM)
+  - After merge failure, restore_for_epoch can exceed max_entries limit
+  - Scenario: buffer at max, drain, push max more, fail, restore = 2x max
+  - Fix: Either enforce cap in restore_for_epoch() or document as best-effort
+
+- [ ] Phase 32: Multiple EpochManager risk (MEDIUM)
+  - If 2+ EpochManagers share same GlobalState, per-manager merge_lock doesn't serialize
+  - Can break pending_epoch == global_epoch invariant
+  - Fix: Either enforce single manager per GlobalState or move merge_lock into GlobalState
+
+- [ ] Phase 33: Document pending_epoch invariants (LOW)
+  - pending_epoch must only be modified while holding entries write lock
+  - Add comments at field and in each method that modifies it
+  - Optionally add private set_pending_epoch_locked() helper
+
+- [ ] Phase 34: Add with_max_entries_and_epoch constructor (LOW)
+  - Currently no way to set both max_entries AND initial_epoch
+  - Add DeltaBuffer::with_max_entries_and_epoch(row_size, max, epoch)
+
 ### Core Protocol
 - [ ] UBT Merkle proof generation
 
