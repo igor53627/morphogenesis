@@ -1,0 +1,237 @@
+\documentclass[11pt]{article}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{hyperref}
+
+\geometry{margin=1in}
+
+\input{macros}
+
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{proposition}[theorem]{Proposition}
+\newtheorem{lemma}[theorem]{Lemma}
+
+\theoremstyle{definition}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+\title{\morph{}:\\2-Server DPF-PIR at Memory Bandwidth\\--- $O(N)$ Queries, $O(1)$ Updates ---}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present \morph{}, a 2-Server Private Information Retrieval (PIR) protocol based on Distributed Point Functions (DPF). We formalize a DPF-PIR scheme over a linearized Cuckoo-mapped database, proving privacy in the semi-honest model. To solve the ``Live Update'' problem without leakage, we introduce \textbf{Epoch-Based Delta-PIR}, a concurrency control mechanism providing wait-free snapshot isolation with $O(1)$ amortized update cost. The protocol supports two security modes: \textbf{Privacy-Only} (256-byte rows, ${\sim}66$ms latency) for honest-but-curious servers, and \textbf{Trustless} (2KB rows with Merkle proofs, ${\sim}439$ms latency) for full adversarial verification. Evaluating on an AMD EPYC 9375F server, we achieve 393~GB/s scan throughput---saturating memory bandwidth---enabling ${\sim}9$ concurrent clients under 600ms in Privacy-Only mode.
+\end{abstract}
+
+%------------------------------------------------------------------------------
+\section{Introduction}
+%------------------------------------------------------------------------------
+
+Private Information Retrieval (PIR) allows a client to retrieve a record from a database without revealing which record was accessed. While theoretically elegant, practical PIR deployments face two fundamental challenges:
+
+\begin{enumerate}
+  \item \textbf{Bandwidth:} The server must touch every record to hide the access pattern, making PIR inherently $O(N)$.
+  \item \textbf{Live Updates:} Real databases change; naive update handling leaks information through retry patterns.
+\end{enumerate}
+
+\morph{} addresses both challenges. For bandwidth, we push scan throughput to the memory bandwidth limit (393~GB/s on AMD EPYC 9375F). For updates, we introduce \emph{Epoch-Based Delta-PIR}, achieving wait-free consistency with $O(1)$ amortized update cost.
+
+\subsection{Contributions}
+
+\begin{enumerate}
+  \item \textbf{DPF-PIR at Memory Bandwidth:} AVX-512 + VAES vectorized scan achieving 393~GB/s (2.8$\times$ theoretical AWS baseline).
+  
+  \item \textbf{Epoch-Based Delta-PIR:} Wait-free snapshot isolation eliminating retry-based leakage.
+  
+  \item \textbf{Parallel Cuckoo Addressing:} 3-way Cuckoo hashing with 85\% load factor, queried in a single pass.
+  
+  \item \textbf{Dual Security Modes:} Privacy-Only (${\sim}66$ms) and Trustless (${\sim}439$ms) for different threat models.
+\end{enumerate}
+
+%------------------------------------------------------------------------------
+\section{Mathematical Formulation}
+%------------------------------------------------------------------------------
+
+We view the database as a matrix $D \in \mathbb{F}_{2^{8192}}^{N}$. Each row $D[i]$ is an 8192-bit vector (1~KB).
+
+\subsection{DPF Algebra}
+
+We use a Function Secret Sharing (FSS) scheme for the point function $f_{\alpha, 1}(x)$.
+
+\begin{definition}[Distributed Point Function~\cite{GI14}]
+A \dpf{} scheme consists of:
+\begin{itemize}
+  \item $\gen(1^\lambda, \alpha) \to (k_A, k_B)$: Generate key shares for target index $\alpha$
+  \item $\eval(k_S, x) \to \{0, 1\}$: Evaluate key share at index $x$
+\end{itemize}
+satisfying \textbf{Correctness:} $\eval(k_A, x) \oplus \eval(k_B, x) = \delta_{x, \alpha}$.
+\end{definition}
+
+\subsection{Server Accumulation}
+
+Each server $S \in \{A, B\}$ computes the inner product of the database vector $D$ and the evaluation vector:
+\[
+R_S = \xorsum_{x=0}^{N-1} \big(D[x] \wedge \eval(k_S, x)\big)
+\]
+
+The client reconstructs the result: $D[\alpha] = R_A \oplus R_B$.
+
+%------------------------------------------------------------------------------
+\section{The Protocol}
+%------------------------------------------------------------------------------
+
+\subsection{Parallel Cuckoo Addressing}
+
+To mitigate adaptive leakage, we employ a \textbf{Parallel Retrieval} strategy. For target account $A$ with candidate indices $h_1, h_2, h_3$:
+
+\begin{enumerate}
+  \item Client generates query batch $Q = \{k^{(1)}, k^{(2)}, k^{(3)}\}$.
+  \item Server executes all 3 queries in a single linear pass.
+  \item Client receives 3 payloads and extracts the valid one.
+\end{enumerate}
+
+\subsubsection{Random-Walk Cuckoo Insertion}
+
+We use 3-way Cuckoo hashing with random-walk insertion to achieve \textbf{85\% load factor}:
+\begin{itemize}
+  \item Each key hashes to 3 candidate positions using independent keyed hash functions.
+  \item On collision, a random candidate (excluding the just-evicted position) is selected.
+  \item \textbf{Result:} 78M accounts require only 92M rows (1.18$\times$ overhead) vs 156M rows (2$\times$) with naive Cuckoo.
+\end{itemize}
+
+\subsection{Epoch-Based Delta-PIR}
+
+To avoid ``Retry Oracle'' leakage, we adopt a \textbf{Wait-Free} model using Epochs.
+
+\subsubsection{The Epoch Lifecycle}
+
+The system operates on a cyclic buffer of states:
+
+\begin{enumerate}
+  \item \textbf{Active Phase:} Queries execute against Snapshot $S_e = M_e \cup \Delta_e$. New updates accumulate in a pending buffer.
+  
+  \item \textbf{Background Merge:} A worker thread constructs $M_{e+1}$. We use \textbf{Striped Copy-on-Write}: only affected memory stripes are duplicated; unmodified stripes are shared by reference (zero-copy).
+  
+  \item \textbf{Atomic Switch:} The global epoch pointer advances. New queries see $S_{e+1}$.
+  
+  \item \textbf{Reclamation:} Once readers of $S_e$ drain, unique pages are returned to the pool.
+\end{enumerate}
+
+%------------------------------------------------------------------------------
+\section{Security Analysis}
+%------------------------------------------------------------------------------
+
+\subsection{Privacy Proof}
+
+\begin{theorem}[Query Privacy]
+The view of Server $S$ is computationally indistinguishable for any two targets $\alpha, \beta$.
+\end{theorem}
+
+\begin{proof}
+The view consists of the query batch $Q$ and timing metadata $T$.
+\begin{itemize}
+  \item \textbf{Transcript:} By DPF pseudorandomness~\cite{BGI15}, each $k^{(j)}$ is indistinguishable from random.
+  \item \textbf{Timing:} The scan executes a fixed number of operations $N_{ops} = |M| + |\Delta_{max}|$ regardless of target. Thus $T(\alpha) \approx T(\beta)$.
+  \item \textbf{Access Pattern:} The client \emph{always} queries $\{h_1, h_2, h_3\}$; the pattern is deterministic given the account.
+\end{itemize}
+\end{proof}
+
+\subsection{Leakage Assessment}
+
+\begin{itemize}
+  \item \textbf{Retry Oracle:} Eliminated. Clients never retry on consistency failures; they verify proofs against the Epoch $e$ header.
+  \item \textbf{Metadata Leakage:} The server knows the Epoch $e$ requested. This leaks only that the client is ``live'' (tracking the chain tip).
+\end{itemize}
+
+%------------------------------------------------------------------------------
+\section{Performance}
+%------------------------------------------------------------------------------
+
+\subsection{Memory Bandwidth}
+
+\begin{itemize}
+  \item \textbf{Theoretical Baseline:} AWS \texttt{r6i} instances provide ${\approx}140$~GB/s.
+  \item \textbf{Achieved (EPYC 9375F):} 393~GB/s with 8-row unrolled AVX-512 + VAES + rayon parallelism.
+\end{itemize}
+
+\subsection{Query Mode Performance}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+\textbf{Mode} & \textbf{Row Size} & \textbf{Matrix (78M @ 85\%)} & \textbf{Scan Time} & \textbf{Concurrent} \\
+\midrule
+\textbf{Privacy-Only} & 256 bytes & 22 GB & ${\sim}66$ms & ${\sim}9$ \\
+Trustless & 2 KB & 175 GB & ${\sim}439$ms & 1 \\
+\bottomrule
+\end{tabular}
+\caption{Query latency by security mode.}
+\end{table}
+
+\subsection{Cuckoo Load Factor}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Load Factor} & \textbf{Table Size (78M accounts)} & \textbf{Status} \\
+\midrule
+50\% (naive deterministic) & 156M rows & Suboptimal \\
+\textbf{85\% (random-walk)} & \textbf{92M rows} & Production \\
+91.8\% (theoretical) & 85M rows & Stash overflow \\
+\bottomrule
+\end{tabular}
+\caption{Cuckoo hashing efficiency.}
+\end{table}
+
+%------------------------------------------------------------------------------
+\section{Why ``Morphogenesis''?}
+%------------------------------------------------------------------------------
+
+This name is a homage to \textbf{Alan Turing}, who is both the father of modern computing and the theoretical biologist who proposed the concept of \emph{morphogenesis}---the biological process by which organisms develop their shape.
+
+The metaphor operates on three levels:
+
+\subsection{The Morphogen Signal}
+
+In biology, a \textbf{morphogen} is a signaling molecule that diffuses from a source cell through tissue. Cells measure morphogen concentration; high concentration triggers differentiation into specific tissue types.
+
+In our protocol, the \textbf{DPF key is the morphogen}. It ``diffuses'' through the entire database during the linear scan. Only the specific row where the DPF evaluates to 1---the ``concentration peak''---differentiates (activates) and contributes its data to the response.
+
+\subsection{Turing Patterns (Reaction-Diffusion)}
+
+Turing's 1952 paper, \emph{``The Chemical Basis of Morphogenesis''}~\cite{Turing52}, described how two interacting chemicals (an activator and an inhibitor) could spontaneously create complex patterns---spots, stripes---from random noise.
+
+Our 2-server protocol exhibits the same structure:
+\begin{itemize}
+  \item \textbf{Server A} sees pure noise (the ``activator'' share)
+  \item \textbf{Server B} sees pure noise (the ``inhibitor'' share)
+  \item \textbf{The Magic:} When these two chaotic ``chemical waves'' interact via XOR at the client, they cancel perfectly everywhere \emph{except} at the target, creating a stable ``spot'' of information from entropy.
+\end{itemize}
+
+\subsection{Genesis: Creation of Form}
+
+\emph{Morpho-} (shape/form) + \emph{-genesis} (creation).
+
+The protocol takes a formless, high-entropy ``soup'' of encrypted bits and extracts a single, structured \textbf{form}---the user's account---without any party observing the extraction.
+
+Since Turing's contributions span both computation theory and biological pattern formation, naming a privacy-preserving protocol after his biological discovery is poetically fitting.
+
+%------------------------------------------------------------------------------
+\section{Conclusion}
+%------------------------------------------------------------------------------
+
+\morph{} bridges the gap between theoretical PIR and systems reality. By combining \textbf{Parallel Cuckoo Retrieval} (for privacy) with \textbf{Epoch-Based Delta-PIR} (for consistency) and \textbf{dual query modes} (Privacy-Only for performance, Trustless for full verification), we demonstrate a viable path to sub-second, private state access with ${\sim}9$ concurrent clients.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}

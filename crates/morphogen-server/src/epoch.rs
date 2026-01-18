@@ -326,7 +326,10 @@ impl EpochManager {
             .lock()
             .map_err(|_| MergeError::LockPoisoned)?;
         let current = self.global.load();
-        let next_epoch_id = current.epoch_id + 1;
+        let next_epoch_id = current
+            .epoch_id
+            .checked_add(1)
+            .ok_or(MergeError::EpochOverflow)?;
         let entries = self
             .pending
             .drain_for_epoch(next_epoch_id)
@@ -399,6 +402,7 @@ pub enum MergeError {
     InvalidChunkSize {
         chunk_size: usize,
     },
+    EpochOverflow,
     LockPoisoned,
 }
 
@@ -432,6 +436,9 @@ impl std::fmt::Display for MergeError {
             }
             MergeError::InvalidChunkSize { chunk_size } => {
                 write!(f, "invalid chunk size: {} (must be > 0)", chunk_size)
+            }
+            MergeError::EpochOverflow => {
+                write!(f, "epoch id overflow: cannot increment past u64::MAX")
             }
             MergeError::LockPoisoned => {
                 write!(f, "lock poisoned during merge operation")
@@ -830,6 +837,21 @@ mod tests {
         assert!(
             manager2.is_ok(),
             "new manager should succeed after previous one is dropped"
+        );
+    }
+
+    #[test]
+    fn epoch_manager_try_advance_returns_error_on_epoch_overflow() {
+        let global = make_global_state(u64::MAX, 4);
+        let manager = EpochManager::new(global, 4).unwrap();
+
+        manager.pending().push(0, vec![1, 2, 3, 4]).unwrap();
+
+        let result = manager.try_advance();
+        assert!(
+            matches!(result, Err(MergeError::EpochOverflow)),
+            "try_advance should return EpochOverflow when epoch_id is u64::MAX, got {:?}",
+            result
         );
     }
 

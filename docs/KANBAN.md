@@ -139,6 +139,33 @@ Hardening issues found in post-phase-34 review:
   - Confirmed: test epoch_manager_allows_new_manager_after_drop covers this
   - GlobalState correctly allows new manager after previous one is dropped
 
+### Epoch Management - Oracle Review #8 (Jan 18, 2026)
+Final hardening pass - edge cases and failure modes:
+
+- [x] Phase 40: Prevent epoch-id wraparound (HIGH)
+  - Added MergeError::EpochOverflow variant
+  - try_advance() now uses checked_add(1) and returns EpochOverflow on overflow
+
+- [ ] Phase 41: Handle rollback failure in try_advance (HIGH)
+  - If restore_for_epoch fails (e.g., LockPoisoned), entries are silently dropped
+  - Fix: don't ignore rollback result, return MergeError::RollbackFailed
+
+- [ ] Phase 42: Integer overflow guards in restore_for_epoch (MEDIUM)
+  - entries.len() + existing.len() can overflow
+  - Fix: use checked_add, return error on overflow
+
+- [ ] Phase 43: Integer overflow guard in try_build_snapshot_from_entries (MEDIUM)
+  - chunk_offset + entry.diff.len() can overflow
+  - Fix: use checked_add, return MergeError on overflow
+
+- [ ] Phase 44: Document pending_epoch() as non-linearizable (LOW)
+  - pending_epoch() reads without lock, can show torn view
+  - Fix: add doc warning, recommend snapshot_with_epoch() instead
+
+- [ ] Phase 45: Move deprecated wrappers behind #[cfg(test)] (LOW)
+  - dirty_chunks(), dirty_chunks_vec(), build_next_snapshot() still callable in prod
+  - Fix: gate behind #[cfg(test)] or feature flag
+
 ### Core Protocol
 - [ ] UBT Merkle proof generation
 
