@@ -134,9 +134,10 @@ Hardening issues found in post-phase-34 review:
   - All recommend using try_* variants instead
   - Added #[allow(deprecated)] to test module to suppress warnings in tests
 
-- [ ] Phase 39: Verify EpochManager Drop resets has_manager (LOW)
-  - Phase 32 added has_manager flag, need to confirm Drop impl exists
-  - If missing, GlobalState is bricked after first manager dropped
+- [x] Phase 39: Verify EpochManager Drop resets has_manager (LOW)
+  - Confirmed: Drop impl exists and calls release_manager()
+  - Confirmed: test epoch_manager_allows_new_manager_after_drop covers this
+  - GlobalState correctly allows new manager after previous one is dropped
 
 ### Core Protocol
 - [ ] UBT Merkle proof generation

@@ -1,9 +1,9 @@
 # Morphogenesis
 
-**High-Throughput Private Information Retrieval for Ethereum via Epoch-Based Delta-PIR**
+**2-Server DPF-PIR at Memory Bandwidth — O(N) Queries, O(1) Updates**
 
 **Abstract:**
-We present *Morphogenesis*, a 2-Server Private Information Retrieval (PIR) protocol for Ethereum light clients. We formalize a DPF-PIR scheme over a linearized Cuckoo-mapped state, proving privacy in the semi-honest model. To solve the "Live Update" problem without leakage, we introduce **Epoch-Based Delta-PIR**, a concurrency control mechanism providing wait-free snapshot isolation. The protocol supports two security modes: **Privacy-Only** (256-byte rows, ~66ms latency) for honest-but-curious servers, and **Trustless** (2KB rows with UBT proofs, ~439ms latency) for full adversarial security. Evaluating on an AMD EPYC 9375F server, we achieve 393 GB/s scan throughput, enabling ~9 concurrent clients under 600ms in Privacy-Only mode.
+We present *Morphogenesis*, a 2-Server Private Information Retrieval (PIR) protocol based on Distributed Point Functions (DPF). We formalize a DPF-PIR scheme over a linearized Cuckoo-mapped database, proving privacy in the semi-honest model. To solve the "Live Update" problem without leakage, we introduce **Epoch-Based Delta-PIR**, a concurrency control mechanism providing wait-free snapshot isolation with O(1) amortized update cost. The protocol supports two security modes: **Privacy-Only** (256-byte rows, ~66ms latency) for honest-but-curious servers, and **Trustless** (2KB rows with Merkle proofs, ~439ms latency) for full adversarial verification. Evaluating on an AMD EPYC 9375F server, we achieve 393 GB/s scan throughput—saturating memory bandwidth—enabling ~9 concurrent clients under 600ms in Privacy-Only mode.
 
 ## 1. Mathematical Formulation
 
