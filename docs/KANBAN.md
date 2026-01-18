@@ -171,6 +171,18 @@ Final hardening pass - edge cases and failure modes:
   - These panicking wrappers are now only available in test builds
   - Production code cannot accidentally use them
 
+### Epoch Management - Oracle Review #9 (Jan 18, 2026)
+Final hardening from post-phase-45 review:
+
+- [x] Phase 46: Treat BufferFull rollback as successful (HIGH)
+  - restore_for_epoch returns BufferFull but data IS preserved
+  - try_advance now distinguishes BufferFull (data safe) from true failures
+  - Only LockPoisoned/EntryCountOverflow/SizeMismatch trigger RollbackFailed
+
+- [ ] Phase 47: Add overflow guards to restore() (MEDIUM)
+  - restore() bypasses the checked_add overflow guard in restore_for_epoch
+  - Either add same EntryCountOverflow check, or document as internal-only
+
 ### Core Protocol
 - [ ] UBT Merkle proof generation
 
