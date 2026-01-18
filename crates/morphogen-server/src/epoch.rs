@@ -221,6 +221,7 @@ pub enum UpdateError {
     SizeMismatch { expected: usize, actual: usize },
     LockPoisoned,
     BufferFull { current: usize, max: usize },
+    EntryCountOverflow,
 }
 
 impl std::fmt::Display for UpdateError {
@@ -246,6 +247,9 @@ impl std::fmt::Display for UpdateError {
             UpdateError::BufferFull { current, max } => {
                 write!(f, "pending buffer full: {} entries (max {})", current, max)
             }
+            UpdateError::EntryCountOverflow => {
+                write!(f, "entry count overflow: total entries exceeds usize::MAX")
+            }
         }
     }
 }
@@ -262,6 +266,7 @@ impl From<morphogen_core::DeltaError> for UpdateError {
             morphogen_core::DeltaError::BufferFull { current, max } => {
                 UpdateError::BufferFull { current, max }
             }
+            morphogen_core::DeltaError::EntryCountOverflow => UpdateError::EntryCountOverflow,
         }
     }
 }

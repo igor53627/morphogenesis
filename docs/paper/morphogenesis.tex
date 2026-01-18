@@ -19,7 +19,7 @@
 \newtheorem{definition}[theorem]{Definition}
 \newtheorem{remark}[theorem]{Remark}
 
-\title{\morph{}:\\2-Server DPF-PIR at Memory Bandwidth\\--- $O(N)$ Queries, $O(1)$ Updates ---}
+\title{\morph{}:\\2-Server DPF-PIR at Memory Bandwidth\\{$O(N)$ Queries, $O(1)$ Updates}}
 \author{}
 \date{}
 
@@ -27,7 +27,7 @@
 \maketitle
 
 \begin{abstract}
-We present \morph{}, a 2-Server Private Information Retrieval (PIR) protocol based on Distributed Point Functions (DPF). We formalize a DPF-PIR scheme over a linearized Cuckoo-mapped database, proving privacy in the semi-honest model. To solve the ``Live Update'' problem without leakage, we introduce \textbf{Epoch-Based Delta-PIR}, a concurrency control mechanism providing wait-free snapshot isolation with $O(1)$ amortized update cost. The protocol supports two security modes: \textbf{Privacy-Only} (256-byte rows, ${\sim}66$ms latency) for honest-but-curious servers, and \textbf{Trustless} (2KB rows with Merkle proofs, ${\sim}439$ms latency) for full adversarial verification. Evaluating on an AMD EPYC 9375F server, we achieve 393~GB/s scan throughput---saturating memory bandwidth---enabling ${\sim}9$ concurrent clients under 600ms in Privacy-Only mode.
+We present \morph{}, a 2-Server Private Information Retrieval (PIR) protocol based on Distributed Point Functions (DPF). We formalize a DPF-PIR scheme over a linearized Cuckoo-mapped database, proving privacy in the semi-honest model. To solve the ``Live Update'' problem without leakage, we introduce \textbf{Epoch-Based Delta-PIR}, a concurrency control mechanism providing wait-free snapshot isolation with $O(1)$ amortized update cost. The protocol supports two security modes: \textbf{Privacy-Only} (256-byte rows, ${\sim}66$ms latency) for honest-but-curious servers, and \textbf{Trustless} (2KB rows with Merkle proofs, ${\sim}439$ms latency) for full adversarial verification. Evaluating on an AMD EPYC 9375F server, we achieve 393~GB/s scan throughput (saturating memory bandwidth), enabling ${\sim}9$ concurrent clients under 600ms in Privacy-Only mode.
 \end{abstract}
 
 %------------------------------------------------------------------------------
@@ -196,9 +196,9 @@ Trustless & 2 KB & 175 GB & ${\sim}439$ms & 1 \\
 \section{Why ``Morphogenesis''?}
 %------------------------------------------------------------------------------
 
-This name is a homage to \textbf{Alan Turing}, who proposed the concept of \emph{morphogenesis}---the biological process by which organisms develop their shape~\cite{Turing52}.
+This name is a homage to \textbf{Alan Turing}, who proposed the concept of \emph{morphogenesis}: the biological process by which organisms develop their shape~\cite{Turing52}.
 
-In biology, a \textbf{morphogen} is a signaling molecule that diffuses through tissue; cells differentiate based on local concentration. In our protocol, the \textbf{DPF key is the morphogen}: it ``diffuses'' through the entire database during the linear scan, and only the row where the DPF evaluates to 1---the ``concentration peak''---activates and contributes its data.
+In biology, a \textbf{morphogen} is a signaling molecule that diffuses through tissue; cells differentiate based on local concentration. In our protocol, the \textbf{DPF key is the morphogen}: it ``diffuses'' through the entire database during the linear scan, and only the row where the DPF evaluates to 1 (the ``concentration peak'') activates and contributes its data.
 
 %------------------------------------------------------------------------------
 \section{Conclusion}

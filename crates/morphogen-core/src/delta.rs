@@ -12,6 +12,7 @@ pub enum DeltaError {
     SizeMismatch { expected: usize, actual: usize },
     LockPoisoned,
     BufferFull { current: usize, max: usize },
+    EntryCountOverflow,
 }
 
 impl std::fmt::Display for DeltaError {
@@ -29,6 +30,9 @@ impl std::fmt::Display for DeltaError {
             }
             DeltaError::BufferFull { current, max } => {
                 write!(f, "delta buffer full: {} entries (max {})", current, max)
+            }
+            DeltaError::EntryCountOverflow => {
+                write!(f, "entry count overflow: total entries exceeds usize::MAX")
             }
         }
     }
@@ -227,12 +231,18 @@ impl DeltaBuffer {
         // Validate before acquiring lock - reject malformed entries without side effects
         self.validate_entries(&entries)?;
         let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
+
+        // Check for overflow BEFORE modifying any state
+        let total = entries
+            .len()
+            .checked_add(guard.len())
+            .ok_or(DeltaError::EntryCountOverflow)?;
+
         // SAFETY: pending_epoch modification while holding write lock - see struct doc
         self.pending_epoch.store(epoch, Ordering::Release);
 
-        // Compute total and merge entries (even if entries is empty, we still check overflow)
+        // Merge entries (even if entries is empty, we still checked overflow above)
         let existing = std::mem::take(&mut *guard);
-        let total = entries.len() + existing.len();
         if entries.is_empty() {
             *guard = existing;
         } else {
@@ -240,7 +250,7 @@ impl DeltaBuffer {
             guard.extend(existing);
         }
 
-        // Check overflow after merge - report but preserve data
+        // Check max_entries after merge - report but preserve data
         if let Some(max) = self.max_entries {
             if total > max {
                 return Err(DeltaError::BufferFull {
@@ -665,6 +675,17 @@ mod tests {
         );
         // Epoch should still be updated
         assert_eq!(buf.pending_epoch(), 5);
+    }
+
+    #[test]
+    fn entry_count_overflow_error_exists_and_formats() {
+        let err = DeltaError::EntryCountOverflow;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("overflow"),
+            "error message should mention overflow: {}",
+            msg
+        );
     }
 }
 

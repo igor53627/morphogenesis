@@ -151,9 +151,10 @@ Final hardening pass - edge cases and failure modes:
   - try_advance now checks rollback result instead of ignoring with `let _ =`
   - On rollback failure, returns RollbackFailed with both error messages
 
-- [ ] Phase 42: Integer overflow guards in restore_for_epoch (MEDIUM)
-  - entries.len() + existing.len() can overflow
-  - Fix: use checked_add, return error on overflow
+- [x] Phase 42: Integer overflow guards in restore_for_epoch (MEDIUM)
+  - Added DeltaError::EntryCountOverflow and UpdateError::EntryCountOverflow
+  - restore_for_epoch uses checked_add BEFORE modifying any state
+  - Returns EntryCountOverflow if total would exceed usize::MAX
 
 - [ ] Phase 43: Integer overflow guard in try_build_snapshot_from_entries (MEDIUM)
   - chunk_offset + entry.diff.len() can overflow
