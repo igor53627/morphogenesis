@@ -207,6 +207,33 @@ Wire up query handler to use scan_consistent with real DPF evaluation:
   - Returns real DPF-evaluated payloads
   - Also updated WebSocket query handler (handle_ws_query)
 
+### Delta-PIR Hardening - Oracle Review #10 (Jan 18, 2026)
+Post-integration review findings:
+
+- [ ] Phase 51: Fix u64->usize truncation in from_bytes (HIGH)
+  - On 32-bit targets, u64 as usize silently truncates
+  - Add DpfKeyError::TargetTooLarge and use usize::try_from()
+
+- [ ] Phase 52: Remove unwrap() in from_bytes parsing (MEDIUM)
+  - bytes[16..24].try_into().unwrap() can panic in theory
+  - Use fallible conversion with proper error
+
+- [ ] Phase 53: Fix WebSocket JSON injection (MEDIUM)
+  - format!(r#"{{"error":"{}"}}"#, e) not JSON-escaped
+  - Use proper WsQueryResponse enum with serde serialization
+
+- [ ] Phase 54: Remove panicking unwrap() in WS error paths (MEDIUM)
+  - Several serde_json::to_string(...).unwrap() can panic
+  - Use unwrap_or_else with static fallback string
+
+- [ ] Phase 55: Add request size limits (LOW)
+  - Unbounded hex key decoding allows memory DoS
+  - Add Axum body size limit, WS message length check
+
+- [ ] Phase 56: Return 503 for TooManyRetries (LOW)
+  - Currently maps all scan errors to 500
+  - TooManyRetries should be 503 (retryable)
+
 ### Network Layer
 - [ ] Query batch endpoint
 - [ ] TLS configuration
@@ -250,6 +277,32 @@ Wire up query handler to use scan_consistent with real DPF evaluation:
 - [ ] B200: 8.0 TB/s bandwidth - potential 20x speedup
 - [ ] Challenge: 75GB shard won't fit in single GPU (141GB H200, but need 2 for 2-party PIR)
 - [ ] Explore multi-GPU sharding within single node
+
+### Real DPF Implementation (Privacy Blocker)
+Current AesDpfKey stores target in plaintext - servers can read queried index.
+Need proper 2-server FSS/DPF where keys are computationally indistinguishable.
+
+**Option A: fss-rs library (recommended)**
+- Crate: https://crates.io/crates/fss-rs (v0.6.0)
+- Implements Boyle-Gilboa-Ishai DPF with correction words
+- Uses AES-NI PRG (Matyas-Meyer-Oseas construction)
+- Key size: ~16 + 17*depth bytes (e.g., 305B for 100K rows, 492B for 250M rows)
+- Full-domain eval via `full_eval()` method
+- Supports AVX2/AVX-512 and ARM crypto extensions
+- Overhead estimate: ~log(n) AES rounds per row evaluation
+
+**Option B: Page/Bucket PIR (privacy tradeoff)**
+- Leak which 4KB page, hide which row within page
+- 16 rows/page at 256B/row -> 16x smaller domain
+- DPF depth: log2(250M/16) = 24 instead of 28
+- Client downloads page, extracts target row locally
+- Acceptable if "which page" leakage is tolerable
+
+**Tasks:**
+- [ ] Evaluate fss-rs full_eval performance on 250M domain
+- [ ] Benchmark fss-rs vs current dummy DPF
+- [ ] Design page/bucket fallback if fss-rs too slow
+- [ ] Integration plan for replacing AesDpfKey
 
 ---
 
