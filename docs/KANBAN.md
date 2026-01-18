@@ -85,10 +85,11 @@ Critical correctness and production hardening:
   - Fix: Added try_dirty_chunks, try_dirty_chunks_vec, try_scan_delta
   - Kept infallible versions as wrappers with expect() for convenience
 
-- [ ] Phase 21: Validate row bounds on push
+- [x] Phase 21: Validate row bounds on push
   - Out-of-bounds row_idx only detected at merge time
   - Causes repeated merge failures (livelock-ish)
-  - Fix: Validate row_idx < num_rows at submit_update time
+  - Fix: Added UpdateError enum and EpochManager::submit_update() with row bounds check
+  - Added EpochManager::num_rows() helper
 
 - [ ] Phase 22: Early error in dirty_chunks for OOB
   - Currently silently ignores out-of-range chunks

@@ -190,6 +190,50 @@ impl std::fmt::Display for EpochManagerError {
 
 impl std::error::Error for EpochManagerError {}
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateError {
+    RowIndexOutOfBounds { row_idx: usize, num_rows: usize },
+    SizeMismatch { expected: usize, actual: usize },
+    LockPoisoned,
+}
+
+impl std::fmt::Display for UpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateError::RowIndexOutOfBounds { row_idx, num_rows } => {
+                write!(
+                    f,
+                    "row index {} out of bounds (num_rows = {})",
+                    row_idx, num_rows
+                )
+            }
+            UpdateError::SizeMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "delta diff size mismatch: expected {} bytes, got {}",
+                    expected, actual
+                )
+            }
+            UpdateError::LockPoisoned => {
+                write!(f, "lock poisoned during update")
+            }
+        }
+    }
+}
+
+impl std::error::Error for UpdateError {}
+
+impl From<morphogen_core::DeltaError> for UpdateError {
+    fn from(err: morphogen_core::DeltaError) -> Self {
+        match err {
+            morphogen_core::DeltaError::SizeMismatch { expected, actual } => {
+                UpdateError::SizeMismatch { expected, actual }
+            }
+            morphogen_core::DeltaError::LockPoisoned => UpdateError::LockPoisoned,
+        }
+    }
+}
+
 pub struct EpochManager {
     global: Arc<GlobalState>,
     pending: Arc<DeltaBuffer>,
@@ -220,6 +264,24 @@ impl EpochManager {
 
     pub fn row_size_bytes(&self) -> usize {
         self.pending.row_size_bytes()
+    }
+
+    pub fn num_rows(&self) -> usize {
+        let snapshot = self.global.load();
+        let row_size = self.pending.row_size_bytes();
+        if row_size == 0 {
+            return 0;
+        }
+        snapshot.matrix.total_size_bytes() / row_size
+    }
+
+    pub fn submit_update(&self, row_idx: usize, diff: Vec<u8>) -> Result<(), UpdateError> {
+        let num_rows = self.num_rows();
+        if row_idx >= num_rows {
+            return Err(UpdateError::RowIndexOutOfBounds { row_idx, num_rows });
+        }
+        self.pending.push(row_idx, diff)?;
+        Ok(())
     }
 
     pub fn try_advance(&self) -> Result<u64, MergeError> {
@@ -524,8 +586,8 @@ mod tests {
         };
 
         let pending = DeltaBuffer::new(row_size);
-        pending.push(1, vec![1, 1, 1, 1]);
-        pending.push(3, vec![2, 2, 2, 2]);
+        pending.push(1, vec![1, 1, 1, 1]).unwrap();
+        pending.push(3, vec![2, 2, 2, 2]).unwrap();
 
         let next = build_next_snapshot(&snapshot, &pending, 1);
         let chunk0 = next.matrix.chunk(0).as_ref().as_slice();
@@ -553,7 +615,7 @@ mod tests {
         };
 
         let pending = DeltaBuffer::new(row_size);
-        pending.push(1, vec![1, 1, 1, 1]);
+        pending.push(1, vec![1, 1, 1, 1]).unwrap();
 
         let result = try_build_next_snapshot(&snapshot, &pending, 1);
         assert!(result.is_ok());
@@ -570,7 +632,7 @@ mod tests {
         };
 
         let pending = DeltaBuffer::new(row_size);
-        pending.push(10, vec![1, 1, 1, 1]);
+        pending.push(10, vec![1, 1, 1, 1]).unwrap();
 
         let result = try_build_next_snapshot(&snapshot, &pending, 1);
         assert!(result.is_err());
@@ -635,6 +697,61 @@ mod tests {
         let global = make_global_state(0, 4);
         let manager = EpochManager::new(global, 4).unwrap();
         assert_eq!(manager.current().epoch_id, 0);
+    }
+
+    #[test]
+    fn epoch_manager_num_rows_returns_correct_count() {
+        let global = make_global_state(0, 4);
+        let manager = EpochManager::new(global, 4).unwrap();
+        assert_eq!(manager.num_rows(), 16);
+    }
+
+    #[test]
+    fn epoch_manager_submit_update_accepts_valid_row() {
+        let global = make_global_state(0, 4);
+        let manager = EpochManager::new(global, 4).unwrap();
+        let result = manager.submit_update(0, vec![1, 2, 3, 4]);
+        assert!(result.is_ok());
+        assert_eq!(manager.pending().len().unwrap(), 1);
+    }
+
+    #[test]
+    fn epoch_manager_submit_update_accepts_last_valid_row() {
+        let global = make_global_state(0, 4);
+        let manager = EpochManager::new(global, 4).unwrap();
+        let result = manager.submit_update(15, vec![1, 2, 3, 4]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn epoch_manager_submit_update_rejects_out_of_bounds_row() {
+        use super::UpdateError;
+        let global = make_global_state(0, 4);
+        let manager = EpochManager::new(global, 4).unwrap();
+        let result = manager.submit_update(16, vec![1, 2, 3, 4]);
+        assert!(result.is_err());
+        match result {
+            Err(UpdateError::RowIndexOutOfBounds { row_idx, num_rows }) => {
+                assert_eq!(row_idx, 16);
+                assert_eq!(num_rows, 16);
+            }
+            _ => panic!("expected RowIndexOutOfBounds"),
+        }
+    }
+
+    #[test]
+    fn epoch_manager_submit_update_rejects_wrong_size_diff() {
+        use super::UpdateError;
+        let global = make_global_state(0, 4);
+        let manager = EpochManager::new(global, 4).unwrap();
+        let result = manager.submit_update(0, vec![1, 2, 3]);
+        match result {
+            Err(UpdateError::SizeMismatch { expected, actual }) => {
+                assert_eq!(expected, 4);
+                assert_eq!(actual, 3);
+            }
+            _ => panic!("expected SizeMismatch"),
+        }
     }
 
     #[test]
