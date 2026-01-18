@@ -27,6 +27,11 @@ pub fn try_dirty_chunks(
     row_size_bytes: usize,
     chunk_size_bytes: usize,
 ) -> Result<HashSet<usize>, MergeError> {
+    if chunk_size_bytes == 0 {
+        return Err(MergeError::InvalidChunkSize {
+            chunk_size: chunk_size_bytes,
+        });
+    }
     let snapshot = pending.snapshot().map_err(|_| MergeError::LockPoisoned)?;
     let mut result = HashSet::new();
     for entry in &snapshot {
@@ -52,6 +57,11 @@ fn collect_dirty_chunks_from_entries(
     chunk_size_bytes: usize,
     num_chunks: usize,
 ) -> Result<Vec<bool>, MergeError> {
+    if chunk_size_bytes == 0 {
+        return Err(MergeError::InvalidChunkSize {
+            chunk_size: chunk_size_bytes,
+        });
+    }
     let mut dirty = vec![false; num_chunks];
     for entry in entries {
         let offset = row_offset(entry, row_size_bytes)?;
@@ -575,6 +585,32 @@ mod tests {
         assert!(
             matches!(result, Err(MergeError::RowIndexOverflow { .. })),
             "expected RowIndexOverflow, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn try_dirty_chunks_errors_on_zero_chunk_size() {
+        let pending = DeltaBuffer::new(4);
+        pending.push(0, vec![1, 2, 3, 4]).unwrap();
+
+        let result = try_dirty_chunks(&pending, 4, 0);
+        assert!(
+            matches!(result, Err(MergeError::InvalidChunkSize { chunk_size: 0 })),
+            "expected InvalidChunkSize, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn try_dirty_chunks_vec_errors_on_zero_chunk_size() {
+        let pending = DeltaBuffer::new(4);
+        pending.push(0, vec![1, 2, 3, 4]).unwrap();
+
+        let result = try_dirty_chunks_vec(&pending, 4, 0, 2);
+        assert!(
+            matches!(result, Err(MergeError::InvalidChunkSize { chunk_size: 0 })),
+            "expected InvalidChunkSize, got {:?}",
             result
         );
     }

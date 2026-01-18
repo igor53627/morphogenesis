@@ -124,10 +124,10 @@ Hardening issues found in post-phase-34 review:
   - Now computes total and checks overflow even with empty entries
   - Existing entries that exceed max are now properly reported
 
-- [ ] Phase 37: Prevent division-by-zero in try_dirty_chunks (MEDIUM)
-  - chunk_location() divides by chunk_size_bytes without checking for 0
-  - try_build_snapshot_from_entries checks, but try_dirty_chunks does not
-  - Fix: add chunk_size_bytes == 0 guard in try_dirty_chunks and try_dirty_chunks_vec
+- [x] Phase 37: Prevent division-by-zero in try_dirty_chunks (MEDIUM)
+  - Added chunk_size_bytes == 0 guard in try_dirty_chunks()
+  - Added chunk_size_bytes == 0 guard in collect_dirty_chunks_from_entries()
+  - Both now return MergeError::InvalidChunkSize instead of panicking
 
 - [ ] Phase 38: Deprecate panicking wrappers in epoch.rs (LOW)
   - dirty_chunks(), dirty_chunks_vec(), build_next_snapshot() use .expect()
