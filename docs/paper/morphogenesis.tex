@@ -59,29 +59,40 @@ Private Information Retrieval (PIR) allows a client to retrieve a record from a 
 \section{Mathematical Formulation}
 %------------------------------------------------------------------------------
 
-We view the database as a matrix $D \in \mathbb{F}_{2^{8192}}^{N}$. Each row $D[i]$ is an 8192-bit vector (1~KB).
+\subsection{Database Model}
+
+Let $N$ denote the number of rows in the database. Each row is an $\ell$-bit vector. We model the database as:
+\[
+D : [N] \to \{0,1\}^\ell
+\]
+where $[N] = \{0, 1, \ldots, N-1\}$. In Privacy-Only mode, $\ell = 2048$ (256 bytes); in Trustless mode, $\ell = 16384$ (2 KB, including Merkle proof material).
 
 \subsection{DPF Algebra}
 
-We use a Function Secret Sharing (FSS) scheme for the point function $f_{\alpha, 1}(x)$.
+We use a Distributed Point Function (DPF)~\cite{GI14} for the unit point function $f_{\alpha}(x) = \mathbf{1}_{x = \alpha}$.
 
-\begin{definition}[Distributed Point Function~\cite{GI14}]
-A \dpf{} scheme consists of:
+\begin{definition}[Distributed Point Function]
+A \dpf{} scheme with domain $[N]$ consists of:
 \begin{itemize}
-  \item $\gen(1^\lambda, \alpha) \to (k_A, k_B)$: Generate key shares for target index $\alpha$
-  \item $\eval(k_S, x) \to \{0, 1\}$: Evaluate key share at index $x$
+  \item $\gen(1^\lambda, \alpha) \to (k_0, k_1)$: Generate key shares for target index $\alpha \in [N]$
+  \item $\eval(k_b, x) \to \{0, 1\}$: Evaluate key share $b \in \{0,1\}$ at index $x \in [N]$
 \end{itemize}
-satisfying \textbf{Correctness:} $\eval(k_A, x) \oplus \eval(k_B, x) = \delta_{x, \alpha}$.
+satisfying:
+\begin{itemize}
+  \item \textbf{Correctness:} $\forall x \in [N]: \eval(k_0, x) \oplus \eval(k_1, x) = \mathbf{1}_{x = \alpha}$
+  \item \textbf{Security:} Each $k_b$ is computationally indistinguishable from random, given only that share.
+\end{itemize}
 \end{definition}
 
 \subsection{Server Accumulation}
 
-Each server $S \in \{A, B\}$ computes the inner product of the database vector $D$ and the evaluation vector:
+Each server $b \in \{0, 1\}$ computes the XOR-accumulation over all rows, masked by the DPF evaluation:
 \[
-R_S = \xorsum_{x=0}^{N-1} \big(D[x] \wedge \eval(k_S, x)\big)
+R_b = \bigoplus_{x=0}^{N-1} \Big( D(x) \cdot \eval(k_b, x) \Big)
 \]
+where $D(x) \cdot \eval(k_b, x)$ denotes the $\ell$-bit row $D(x)$ if $\eval(k_b, x) = 1$, and the zero vector otherwise.
 
-The client reconstructs the result: $D[\alpha] = R_A \oplus R_B$.
+The client reconstructs: $D(\alpha) = R_0 \oplus R_1$.
 
 %------------------------------------------------------------------------------
 \section{The Protocol}
@@ -124,31 +135,91 @@ The system operates on a cyclic buffer of states:
   \item \textbf{Reclamation:} Once readers of $S_e$ drain, unique pages are returned to the pool.
 \end{enumerate}
 
+\subsection{Trustless Mode: Authenticated Retrieval}
+
+In Trustless mode, each row contains both account data and a Merkle proof enabling client-side verification against a known state root.
+
+\subsubsection{Row Structure}
+
+Each 2KB row in Trustless mode contains:
+\[
+\mathsf{Row}(\alpha) = \big( \mathsf{AccountData}, \mathsf{MerkleProof}, \mathsf{StateRoot}_e \big)
+\]
+where $\mathsf{MerkleProof}$ is the authentication path from the account leaf to $\mathsf{StateRoot}_e$.
+
+\subsubsection{Verification Without Target Revelation}
+
+The client receives three payloads $\{P_1, P_2, P_3\}$ corresponding to Cuckoo candidates. For each $P_j$:
+\begin{enumerate}
+  \item Parse $(D_j, \pi_j, r_j)$ from $P_j$.
+  \item Verify $\mathsf{MerkleVerify}(r_j, \mathsf{addr}, D_j, \pi_j) = 1$.
+  \item Check $r_j = \mathsf{StateRoot}_e$ (the epoch's committed root).
+\end{enumerate}
+Exactly one payload passes verification (the occupied Cuckoo slot). The server learns nothing beyond what it already knows from the DPF keys.
+
+\subsubsection{Update Cost}
+
+Merkle proofs are regenerated during epoch transitions. The background merge recomputes proofs only for rows in $\Delta_e$:
+\begin{itemize}
+  \item \textbf{Per-update cost:} $O(\log N)$ for proof regeneration.
+  \item \textbf{Amortized cost:} $O(1)$ per update when batched across an epoch (12s window).
+\end{itemize}
+The $O(1)$ amortized claim holds because proof updates are batched and parallelized during the merge phase, not performed inline with writes.
+
+\textbf{Open Problem:} Proving amortized $O(1)$ under adversarial update patterns (worst-case clustering in Cuckoo table) requires further analysis.
+
 %------------------------------------------------------------------------------
 \section{Security Analysis}
 %------------------------------------------------------------------------------
 
-\subsection{Privacy Proof}
+\subsection{Threat Model and Leakage Function}
+
+We consider the \textbf{semi-honest (honest-but-curious)} model: each server follows the protocol but attempts to learn which account the client queries.
+
+\begin{definition}[Server View]
+For a query targeting account $\alpha$, server $b$'s view is:
+\[
+\mathsf{View}_b(\alpha) = \big( k_b^{(1)}, k_b^{(2)}, k_b^{(3)}, e, T \big)
+\]
+where $k_b^{(j)}$ are the three DPF key shares (for Cuckoo candidates), $e$ is the requested epoch, and $T$ is timing metadata.
+\end{definition}
+
+\begin{definition}[Leakage Function]
+We explicitly leak:
+\begin{itemize}
+  \item \textbf{Epoch $e$:} The client's requested snapshot version.
+  \item \textbf{Query count:} The server observes that a query occurred.
+  \item \textbf{$\Delta_{\max}$:} The maximum delta buffer size (public system parameter).
+\end{itemize}
+We do \emph{not} leak the target index $\alpha$ or which of the three Cuckoo candidates contains the actual data.
+\end{definition}
+
+\subsection{Privacy Theorem}
 
 \begin{theorem}[Query Privacy]
-The view of Server $S$ is computationally indistinguishable for any two targets $\alpha, \beta$.
+Under the DPF security assumption~\cite{BGI15}, for any two targets $\alpha, \beta \in [N]$:
+\[
+\mathsf{View}_b(\alpha) \approx_c \mathsf{View}_b(\beta)
+\]
+where $\approx_c$ denotes computational indistinguishability.
 \end{theorem}
 
 \begin{proof}
-The view consists of the query batch $Q$ and timing metadata $T$.
-\begin{itemize}
-  \item \textbf{Transcript:} By DPF pseudorandomness~\cite{BGI15}, each $k^{(j)}$ is indistinguishable from random.
-  \item \textbf{Timing:} The scan executes a fixed number of operations $N_{ops} = |M| + |\Delta_{max}|$ regardless of target. Thus $T(\alpha) \approx T(\beta)$.
-  \item \textbf{Access Pattern:} The client \emph{always} queries $\{h_1, h_2, h_3\}$; the pattern is deterministic given the account.
-\end{itemize}
+We show each component is indistinguishable:
+\begin{enumerate}
+  \item \textbf{DPF Keys:} By DPF security, each $k_b^{(j)}$ is computationally indistinguishable from a uniformly random string of equal length.
+  \item \textbf{Timing $T$:} The scan executes exactly $N + \Delta_{\max}$ iterations regardless of $\alpha$. Memory access is sequential; no target-dependent branching occurs.
+  \item \textbf{Cuckoo Pattern:} The client always sends exactly 3 keys. The server cannot distinguish which (if any) corresponds to the occupied slot.
+\end{enumerate}
 \end{proof}
 
-\subsection{Leakage Assessment}
+\subsection{Leakage Discussion}
 
-\begin{itemize}
-  \item \textbf{Retry Oracle:} Eliminated. Clients never retry on consistency failures; they verify proofs against the Epoch $e$ header.
-  \item \textbf{Metadata Leakage:} The server knows the Epoch $e$ requested. This leaks only that the client is ``live'' (tracking the chain tip).
-\end{itemize}
+\textbf{Timing Side Channels.} Our constant-time claim assumes: (1) no NUMA effects cause target-dependent latency, (2) cache behavior is uniform across the sequential scan, (3) $\Delta_{\max}$ is fixed and publicly known. Implementations must pad delta scans to $\Delta_{\max}$ even when $|\Delta_e| < \Delta_{\max}$.
+
+\textbf{Repeated Queries.} If a client queries the same account multiple times, the server sees identical Cuckoo candidate positions $\{h_1, h_2, h_3\}$ (derived deterministically from the account address). This enables \emph{linkability} of repeated queries for the same account. Mitigation requires client-side blinding or mixing, which is out of scope.
+
+\textbf{Collusion.} If both servers collude, they can XOR their DPF shares to recover the target: $\eval(k_0, x) \oplus \eval(k_1, x) = \mathbf{1}_{x=\alpha}$. The 2-server model assumes non-collusion.
 
 %------------------------------------------------------------------------------
 \section{Performance}

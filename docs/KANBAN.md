@@ -156,9 +156,10 @@ Final hardening pass - edge cases and failure modes:
   - restore_for_epoch uses checked_add BEFORE modifying any state
   - Returns EntryCountOverflow if total would exceed usize::MAX
 
-- [ ] Phase 43: Integer overflow guard in try_build_snapshot_from_entries (MEDIUM)
-  - chunk_offset + entry.diff.len() can overflow
-  - Fix: use checked_add, return MergeError on overflow
+- [x] Phase 43: Integer overflow guard in try_build_snapshot_from_entries (MEDIUM)
+  - Added MergeError::OffsetOverflow { chunk_offset, len }
+  - try_build_snapshot_from_entries uses checked_add for end calculation
+  - Returns OffsetOverflow instead of panicking on usize overflow
 
 - [ ] Phase 44: Document pending_epoch() as non-linearizable (LOW)
   - pending_epoch() reads without lock, can show torn view

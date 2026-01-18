@@ -148,7 +148,12 @@ pub fn try_build_snapshot_from_entries(
         let chunk = Arc::get_mut(&mut new_chunks[chunk_index])
             .ok_or(MergeError::ChunkNotUnique { chunk_index })?;
 
-        let end = chunk_offset + entry.diff.len();
+        let end = chunk_offset
+            .checked_add(entry.diff.len())
+            .ok_or(MergeError::OffsetOverflow {
+                chunk_offset,
+                len: entry.diff.len(),
+            })?;
         if end > chunk.len() {
             return Err(MergeError::DeltaOutOfBounds {
                 offset: chunk_offset,
@@ -415,6 +420,10 @@ pub enum MergeError {
         chunk_size: usize,
     },
     EpochOverflow,
+    OffsetOverflow {
+        chunk_offset: usize,
+        len: usize,
+    },
     /// Merge failed AND rollback also failed - entries may be lost.
     /// Contains the original merge error message and the rollback error message.
     RollbackFailed {
@@ -457,6 +466,13 @@ impl std::fmt::Display for MergeError {
             }
             MergeError::EpochOverflow => {
                 write!(f, "epoch id overflow: cannot increment past u64::MAX")
+            }
+            MergeError::OffsetOverflow { chunk_offset, len } => {
+                write!(
+                    f,
+                    "offset overflow: chunk_offset {} + len {} exceeds usize::MAX",
+                    chunk_offset, len
+                )
             }
             MergeError::RollbackFailed {
                 merge_error,
@@ -707,6 +723,16 @@ mod tests {
             Err(other) => panic!("expected InvalidChunkSize, got {:?}", other),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    #[test]
+    fn offset_overflow_error_exists_and_formats() {
+        let err = MergeError::OffsetOverflow {
+            chunk_offset: usize::MAX - 10,
+            len: 100,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("overflow"), "should mention overflow: {}", msg);
     }
 
     #[test]
