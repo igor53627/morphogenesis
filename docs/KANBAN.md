@@ -88,10 +88,11 @@ Critical fixes for production readiness:
 ### Epoch Management - Oracle Review #6 (Jan 18, 2026)
 Non-critical hardening from post-fix review:
 
-- [ ] Phase 31: max_entries overflow on restore (MEDIUM)
+- [x] Phase 31: max_entries overflow on restore (MEDIUM)
   - After merge failure, restore_for_epoch can exceed max_entries limit
   - Scenario: buffer at max, drain, push max more, fail, restore = 2x max
-  - Fix: Either enforce cap in restore_for_epoch() or document as best-effort
+  - Fix: restore_for_epoch now restores ALL data (no data loss) but returns BufferFull error
+  - Epoch is always reset, entries always preserved, error signals overflow for logging
 
 - [ ] Phase 32: Multiple EpochManager risk (MEDIUM)
   - If 2+ EpochManagers share same GlobalState, per-manager merge_lock doesn't serialize

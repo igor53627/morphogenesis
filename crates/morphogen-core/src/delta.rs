@@ -159,8 +159,17 @@ impl DeltaBuffer {
             return Ok(());
         }
         let existing = std::mem::take(&mut *guard);
+        let total = entries.len() + existing.len();
         *guard = entries;
         guard.extend(existing);
+        if let Some(max) = self.max_entries {
+            if total > max {
+                return Err(DeltaError::BufferFull {
+                    current: total,
+                    max,
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -363,6 +372,65 @@ mod tests {
 
         buf.drain().unwrap();
         assert!(buf.push(2, vec![9, 10, 11, 12]).is_ok());
+    }
+
+    #[test]
+    fn restore_for_epoch_warns_on_overflow_but_restores_data() {
+        let buf = DeltaBuffer::with_max_entries(4, 2);
+
+        buf.push(0, vec![1, 2, 3, 4]).unwrap();
+        buf.push(1, vec![5, 6, 7, 8]).unwrap();
+
+        let drained = buf.drain_for_epoch(1).unwrap();
+        assert_eq!(drained.len(), 2);
+
+        buf.push(2, vec![9, 10, 11, 12]).unwrap();
+        buf.push(3, vec![13, 14, 15, 16]).unwrap();
+
+        let result = buf.restore_for_epoch(0, drained);
+
+        assert!(
+            result.is_err(),
+            "restore_for_epoch should return error when exceeding max_entries"
+        );
+        match result {
+            Err(DeltaError::BufferFull { current, max }) => {
+                assert_eq!(max, 2);
+                assert_eq!(current, 4);
+            }
+            _ => panic!("expected BufferFull error"),
+        }
+
+        assert_eq!(
+            buf.pending_epoch(),
+            0,
+            "pending_epoch must be reset even on overflow"
+        );
+        assert_eq!(
+            buf.len().unwrap(),
+            4,
+            "all entries must be preserved (restored + existing)"
+        );
+
+        let snap = buf.snapshot().unwrap();
+        assert_eq!(snap[0].row_idx, 0, "restored entries come first");
+        assert_eq!(snap[1].row_idx, 1);
+        assert_eq!(snap[2].row_idx, 2, "existing entries come after");
+        assert_eq!(snap[3].row_idx, 3);
+    }
+
+    #[test]
+    fn restore_for_epoch_succeeds_when_within_limit() {
+        let buf = DeltaBuffer::with_max_entries(4, 4);
+
+        buf.push(0, vec![1, 2, 3, 4]).unwrap();
+        let drained = buf.drain_for_epoch(1).unwrap();
+
+        buf.push(1, vec![5, 6, 7, 8]).unwrap();
+
+        let result = buf.restore_for_epoch(0, drained);
+        assert!(result.is_ok());
+        assert_eq!(buf.len().unwrap(), 2);
     }
 
     #[test]
