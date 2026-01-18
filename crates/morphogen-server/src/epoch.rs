@@ -30,10 +30,9 @@ pub fn try_dirty_chunks(
     let snapshot = pending.snapshot().map_err(|_| MergeError::LockPoisoned)?;
     let mut result = HashSet::new();
     for entry in &snapshot {
-        if let Ok(offset) = row_offset(entry, row_size_bytes) {
-            let (chunk_index, _) = chunk_location(offset, chunk_size_bytes);
-            result.insert(chunk_index);
-        }
+        let offset = row_offset(entry, row_size_bytes)?;
+        let (chunk_index, _) = chunk_location(offset, chunk_size_bytes);
+        result.insert(chunk_index);
     }
     Ok(result)
 }
@@ -528,6 +527,32 @@ mod tests {
         let chunks = result.unwrap();
         assert_eq!(chunks.len(), 1);
         assert!(chunks.contains(&0));
+    }
+
+    #[test]
+    fn try_dirty_chunks_errors_on_row_overflow() {
+        let pending = DeltaBuffer::new(4);
+        pending.push(usize::MAX, vec![1, 2, 3, 4]).unwrap();
+
+        let result = try_dirty_chunks(&pending, 4, 8);
+        assert!(
+            matches!(result, Err(MergeError::RowIndexOverflow { .. })),
+            "expected RowIndexOverflow, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn try_dirty_chunks_vec_errors_on_row_overflow() {
+        let pending = DeltaBuffer::new(4);
+        pending.push(usize::MAX, vec![1, 2, 3, 4]).unwrap();
+
+        let result = try_dirty_chunks_vec(&pending, 4, 8, 2);
+        assert!(
+            matches!(result, Err(MergeError::RowIndexOverflow { .. })),
+            "expected RowIndexOverflow, got {:?}",
+            result
+        );
     }
 
     #[test]

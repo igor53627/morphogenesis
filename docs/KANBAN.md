@@ -91,10 +91,10 @@ Critical correctness and production hardening:
   - Fix: Added UpdateError enum and EpochManager::submit_update() with row bounds check
   - Added EpochManager::num_rows() helper
 
-- [ ] Phase 22: Early error in dirty_chunks for OOB
+- [x] Phase 22: Early error in dirty_chunks for OOB
   - Currently silently ignores out-of-range chunks
   - But merge loop errors for same condition (inconsistent)
-  - Fix: Return MergeError::DeltaOutOfBounds early
+  - Fix: Changed try_dirty_chunks to propagate row_offset errors with `?`
 
 - [ ] Phase 23: Remove remaining expect()/panic paths
   - `build_next_snapshot().expect(...)` 
