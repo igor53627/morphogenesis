@@ -166,9 +166,10 @@ Final hardening pass - edge cases and failure modes:
   - Explains the method reads without lock and may show torn view
   - Recommends snapshot_with_epoch() for consistent (epoch, entries) pair
 
-- [ ] Phase 45: Move deprecated wrappers behind #[cfg(test)] (LOW)
-  - dirty_chunks(), dirty_chunks_vec(), build_next_snapshot() still callable in prod
-  - Fix: gate behind #[cfg(test)] or feature flag
+- [x] Phase 45: Move deprecated wrappers behind #[cfg(test)] (LOW)
+  - Added #[cfg(test)] to dirty_chunks(), dirty_chunks_vec(), build_next_snapshot()
+  - These panicking wrappers are now only available in test builds
+  - Production code cannot accidentally use them
 
 ### Core Protocol
 - [ ] UBT Merkle proof generation

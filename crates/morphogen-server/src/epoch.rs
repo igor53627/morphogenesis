@@ -42,6 +42,7 @@ pub fn try_dirty_chunks(
     Ok(result)
 }
 
+#[cfg(test)]
 #[deprecated(
     since = "0.2.0",
     note = "Use try_dirty_chunks instead to handle errors"
@@ -87,6 +88,7 @@ pub fn try_dirty_chunks_vec(
     collect_dirty_chunks_from_entries(&snapshot, row_size_bytes, chunk_size_bytes, num_chunks)
 }
 
+#[cfg(test)]
 #[deprecated(
     since = "0.2.0",
     note = "Use try_dirty_chunks_vec instead to handle errors"
@@ -187,6 +189,7 @@ pub fn try_build_next_snapshot(
     try_build_snapshot_from_entries(current, &entries, pending.row_size_bytes(), next_epoch_id)
 }
 
+#[cfg(test)]
 #[deprecated(
     since = "0.2.0",
     note = "Use try_build_next_snapshot instead to handle errors"
