@@ -107,9 +107,9 @@ Non-critical hardening from post-fix review:
   - Added doc comments + inline SAFETY comments to drain_for_epoch() and restore_for_epoch()
   - Added doc comment to snapshot_with_epoch() explaining atomicity guarantee
 
-- [ ] Phase 34: Add with_max_entries_and_epoch constructor (LOW)
-  - Currently no way to set both max_entries AND initial_epoch
-  - Add DeltaBuffer::with_max_entries_and_epoch(row_size, max, epoch)
+- [x] Phase 34: Add with_max_entries_and_epoch constructor (LOW)
+  - Added DeltaBuffer::with_max_entries_and_epoch(row_size, max, epoch)
+  - Allows setting both max_entries limit AND initial pending_epoch
 
 ### Core Protocol
 - [ ] UBT Merkle proof generation

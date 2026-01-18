@@ -90,6 +90,19 @@ impl DeltaBuffer {
         }
     }
 
+    pub fn with_max_entries_and_epoch(
+        row_size_bytes: usize,
+        max_entries: usize,
+        initial_epoch: u64,
+    ) -> Self {
+        Self {
+            row_size_bytes,
+            max_entries: Some(max_entries),
+            entries: RwLock::new(Vec::new()),
+            pending_epoch: AtomicU64::new(initial_epoch),
+        }
+    }
+
     pub fn max_entries(&self) -> Option<usize> {
         self.max_entries
     }
@@ -485,6 +498,30 @@ mod tests {
             buf.push(i, vec![1, 2, 3, 4]).unwrap();
         }
         assert_eq!(buf.len().unwrap(), 1000);
+    }
+
+    #[test]
+    fn with_max_entries_and_epoch_sets_both() {
+        let buf = DeltaBuffer::with_max_entries_and_epoch(4, 100, 42);
+
+        assert_eq!(buf.row_size_bytes(), 4);
+        assert_eq!(buf.max_entries(), Some(100));
+        assert_eq!(buf.pending_epoch(), 42);
+        assert!(buf.is_empty().unwrap());
+    }
+
+    #[test]
+    fn with_max_entries_and_epoch_enforces_limit() {
+        let buf = DeltaBuffer::with_max_entries_and_epoch(4, 2, 10);
+
+        buf.push(0, vec![1, 2, 3, 4]).unwrap();
+        buf.push(1, vec![5, 6, 7, 8]).unwrap();
+
+        let result = buf.push(2, vec![9, 10, 11, 12]);
+        assert!(matches!(
+            result,
+            Err(DeltaError::BufferFull { current: 2, max: 2 })
+        ));
     }
 }
 
