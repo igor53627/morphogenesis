@@ -217,9 +217,27 @@ impl DeltaBuffer {
         }
         self.validate_entries(&entries)?;
         let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
+
+        // Check for overflow BEFORE modifying any state
+        let total = entries
+            .len()
+            .checked_add(guard.len())
+            .ok_or(DeltaError::EntryCountOverflow)?;
+
+        // Merge entries (prepend restored, append existing)
         let existing = std::mem::take(&mut *guard);
         *guard = entries;
         guard.extend(existing);
+
+        // Check max_entries after merge - report but preserve data
+        if let Some(max) = self.max_entries {
+            if total > max {
+                return Err(DeltaError::BufferFull {
+                    current: total,
+                    max,
+                });
+            }
+        }
         Ok(())
     }
 
@@ -378,6 +396,30 @@ mod tests {
         buf.push(5, vec![1, 2, 3, 4]).unwrap();
         buf.restore(vec![]).unwrap();
         assert_eq!(buf.len().unwrap(), 1);
+    }
+
+    #[test]
+    fn restore_returns_buffer_full_when_exceeds_max() {
+        let buf = DeltaBuffer::with_max_entries(4, 2);
+        buf.push(0, vec![1, 2, 3, 4]).unwrap();
+        buf.push(1, vec![5, 6, 7, 8]).unwrap();
+
+        // Drain and try to restore more entries than max allows
+        let drained = buf.drain().unwrap();
+        assert_eq!(drained.len(), 2);
+
+        // Add one entry, then restore 2 = 3 total > max(2)
+        buf.push(2, vec![9, 10, 11, 12]).unwrap();
+        let result = buf.restore(drained);
+
+        // Should return BufferFull but preserve data
+        assert!(
+            matches!(result, Err(DeltaError::BufferFull { current: 3, max: 2 })),
+            "restore should return BufferFull when total exceeds max, got {:?}",
+            result
+        );
+        // Data should still be preserved
+        assert_eq!(buf.len().unwrap(), 3);
     }
 
     #[test]
