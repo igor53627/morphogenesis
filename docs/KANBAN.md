@@ -92,12 +92,12 @@ Critical bugs found in Phase 24 implementation:
   - Fix: Acquire read lock FIRST, then read pending_epoch while holding it
   - Added concurrency test that triggers torn read with old code
 
-- [ ] Phase 29: Reset pending_epoch on merge failure (CRITICAL)
+- [x] Phase 29: Reset pending_epoch on merge failure (CRITICAL)
   - On merge error, pending_epoch stays advanced but global epoch unchanged
   - scan_consistent() requires pending_epoch == matrix_epoch to succeed
   - Result: scan livelocks until TooManyRetries after any merge failure
-  - Fix: Add restore_for_epoch(epoch, entries) or set_pending_epoch() API
-  - Call in try_advance() error path to reset pending_epoch to current epoch
+  - Fix: Added restore_for_epoch(epoch, entries) to DeltaBuffer
+  - Updated try_advance() error path to call restore_for_epoch(current.epoch_id, entries)
 
 - [ ] Phase 30: Initialize pending_epoch from global epoch
   - DeltaBuffer::new() sets pending_epoch = 0

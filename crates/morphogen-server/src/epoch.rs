@@ -312,7 +312,7 @@ impl EpochManager {
         ) {
             Ok(snapshot) => snapshot,
             Err(e) => {
-                let _ = self.pending.restore(entries);
+                let _ = self.pending.restore_for_epoch(current.epoch_id, entries);
                 return Err(e);
             }
         };
@@ -1030,6 +1030,58 @@ mod tests {
         assert_eq!(snap.len(), 2);
         assert_eq!(snap[0].row_idx, 1000, "restored entry first");
         assert_eq!(snap[1].row_idx, 0, "new entry second");
+    }
+
+    #[test]
+    fn try_advance_resets_pending_epoch_on_merge_error() {
+        let global = make_global_state(0, 4);
+        let manager = EpochManager::new(global, 4).unwrap();
+
+        let initial_pending_epoch = manager.pending().pending_epoch();
+        assert_eq!(initial_pending_epoch, 0);
+
+        manager.pending().push(1000, vec![0xFF; 4]).unwrap();
+
+        let result = manager.try_advance();
+        assert!(result.is_err());
+
+        let pending_epoch_after_failure = manager.pending().pending_epoch();
+        let matrix_epoch = manager.current().epoch_id;
+
+        assert_eq!(
+            pending_epoch_after_failure, matrix_epoch,
+            "pending_epoch ({}) must equal matrix epoch ({}) after merge failure, \
+             otherwise scan_consistent will livelock",
+            pending_epoch_after_failure, matrix_epoch
+        );
+    }
+
+    #[test]
+    fn scan_consistent_succeeds_after_merge_failure() {
+        use crate::scan::scan_consistent_with_max_retries;
+        use morphogen_dpf::AesDpfKey;
+
+        let global = make_global_state(0, 4);
+        let manager = EpochManager::new(global.clone(), 4).unwrap();
+
+        manager.pending().push(1000, vec![0xFF; 4]).unwrap();
+        let result = manager.try_advance();
+        assert!(result.is_err());
+
+        let mut rng = rand::thread_rng();
+        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+        let keys = [key0, key1, key2];
+
+        let scan_result =
+            scan_consistent_with_max_retries(&global, manager.pending(), &keys, 4, 10);
+
+        assert!(
+            scan_result.is_ok(),
+            "scan_consistent should succeed after merge failure, but got: {:?}",
+            scan_result
+        );
     }
 }
 

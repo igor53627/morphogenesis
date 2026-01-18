@@ -138,6 +138,22 @@ impl DeltaBuffer {
         guard.extend(existing);
         Ok(())
     }
+
+    pub fn restore_for_epoch(
+        &self,
+        epoch: u64,
+        entries: Vec<DeltaEntry>,
+    ) -> Result<(), DeltaError> {
+        let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
+        self.pending_epoch.store(epoch, Ordering::Release);
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let existing = std::mem::take(&mut *guard);
+        *guard = entries;
+        guard.extend(existing);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
