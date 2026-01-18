@@ -116,10 +116,11 @@ Critical correctness and production hardening:
   - Must enforce: matrix_size_bytes % row_size_bytes == 0
   - Fix: Added ConfigError enum, ServerConfig::validate(), MorphogenServer::new returns Result
 
-- [ ] Phase 26: Backoff in scan_consistent() retry loop
+- [x] Phase 26: Backoff in scan_consistent() retry loop
   - Currently spins indefinitely under frequent merges
-  - Fix: Add spin_loop hints, yield_now after N retries
-  - Optional: max retry count or deadline for diagnostics
+  - Fix: Added TooManyRetries error, scan_consistent_with_max_retries API
+  - Backoff: spin_loop for first 10 attempts, yield_now after
+  - Default max retries: 1000
 
 - [ ] Phase 27: Max pending buffer size limit
   - Unbounded pending growth causes latency spikes / memory blowup

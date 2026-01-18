@@ -2,15 +2,21 @@ use morphogen_core::{DeltaBuffer, GlobalState};
 use morphogen_dpf::DpfKey;
 use morphogen_storage::ChunkedMatrix;
 
+pub const DEFAULT_MAX_RETRIES: usize = 1000;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ScanError {
     LockPoisoned,
+    TooManyRetries { attempts: usize },
 }
 
 impl std::fmt::Display for ScanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ScanError::LockPoisoned => write!(f, "lock poisoned during scan"),
+            ScanError::TooManyRetries { attempts } => {
+                write!(f, "scan failed after {} retry attempts", attempts)
+            }
         }
     }
 }
@@ -113,7 +119,17 @@ pub fn scan_consistent<K: DpfKey>(
     keys: &[K; 3],
     row_size_bytes: usize,
 ) -> Result<([Vec<u8>; 3], u64), ScanError> {
-    loop {
+    scan_consistent_with_max_retries(global, pending, keys, row_size_bytes, DEFAULT_MAX_RETRIES)
+}
+
+pub fn scan_consistent_with_max_retries<K: DpfKey>(
+    global: &GlobalState,
+    pending: &DeltaBuffer,
+    keys: &[K; 3],
+    row_size_bytes: usize,
+    max_retries: usize,
+) -> Result<([Vec<u8>; 3], u64), ScanError> {
+    for attempt in 0..max_retries {
         let snapshot1 = global.load();
         let epoch1 = snapshot1.epoch_id;
 
@@ -131,7 +147,16 @@ pub fn scan_consistent<K: DpfKey>(
             }
             return Ok((results, epoch1));
         }
+
+        if attempt < 10 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
     }
+    Err(ScanError::TooManyRetries {
+        attempts: max_retries,
+    })
 }
 
 fn xor_into(dest: &mut [u8], src: &[u8]) {
@@ -147,7 +172,24 @@ pub fn scan_consistent_parallel<K: DpfKey + Sync>(
     keys: &[K; 3],
     row_size_bytes: usize,
 ) -> Result<([Vec<u8>; 3], u64), ScanError> {
-    loop {
+    scan_consistent_parallel_with_max_retries(
+        global,
+        pending,
+        keys,
+        row_size_bytes,
+        DEFAULT_MAX_RETRIES,
+    )
+}
+
+#[cfg(feature = "parallel")]
+pub fn scan_consistent_parallel_with_max_retries<K: DpfKey + Sync>(
+    global: &GlobalState,
+    pending: &DeltaBuffer,
+    keys: &[K; 3],
+    row_size_bytes: usize,
+    max_retries: usize,
+) -> Result<([Vec<u8>; 3], u64), ScanError> {
+    for attempt in 0..max_retries {
         let snapshot1 = global.load();
         let epoch1 = snapshot1.epoch_id;
 
@@ -166,7 +208,16 @@ pub fn scan_consistent_parallel<K: DpfKey + Sync>(
             }
             return Ok((results, epoch1));
         }
+
+        if attempt < 10 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
     }
+    Err(ScanError::TooManyRetries {
+        attempts: max_retries,
+    })
 }
 
 fn empty_result(row_size_bytes: usize) -> [Vec<u8>; 3] {
@@ -847,7 +898,7 @@ fn xor_masked(dest: &mut [u8], src: &[u8], offset: usize, mask: u8) {
 
 #[cfg(test)]
 mod tests {
-    use super::{empty_result, scan_consistent, scan_delta};
+    use super::{empty_result, scan_consistent, scan_delta, ScanError};
     use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
     use morphogen_dpf::AesDpfKey;
     use morphogen_storage::ChunkedMatrix;
@@ -952,5 +1003,44 @@ mod tests {
             xor[i] = results_a[0][i] ^ results_b[0][i];
         }
         assert_eq!(xor, vec![0xAB, 0xCD, 0xEF, 0x12]);
+    }
+
+    #[test]
+    fn scan_consistent_with_max_retries_returns_error_on_exhaustion() {
+        use super::scan_consistent_with_max_retries;
+
+        let row_size = 4;
+        let global = make_global_state(0, 64, 32);
+        let pending = DeltaBuffer::new(row_size);
+
+        let mut rng = rand::thread_rng();
+        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+        let keys = [key0, key1, key2];
+
+        let result = scan_consistent_with_max_retries(&global, &pending, &keys, row_size, 0);
+        assert!(matches!(
+            result,
+            Err(ScanError::TooManyRetries { attempts: 0 })
+        ));
+    }
+
+    #[test]
+    fn scan_consistent_succeeds_within_retry_limit() {
+        use super::scan_consistent_with_max_retries;
+
+        let row_size = 4;
+        let global = make_global_state(0, 64, 32);
+        let pending = DeltaBuffer::new(row_size);
+
+        let mut rng = rand::thread_rng();
+        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+        let keys = [key0, key1, key2];
+
+        let result = scan_consistent_with_max_retries(&global, &pending, &keys, row_size, 1);
+        assert!(result.is_ok());
     }
 }
