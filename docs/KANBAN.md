@@ -79,10 +79,11 @@ Critical correctness and production hardening:
   - Concurrent scan sees old snapshot + empty pending = missing merged deltas
   - Fix: Double-check epoch_id loop in scan_consistent() and scan_consistent_parallel()
 
-- [ ] Phase 20: Stop swallowing lock poison errors
+- [x] Phase 20: Stop swallowing lock poison errors
   - `unwrap_or_default()` in scan_delta, dirty_chunks, dirty_chunks_vec
   - Converts corruption into silent data loss (empty pending)
-  - Fix: Return Result, bubble errors up
+  - Fix: Added try_dirty_chunks, try_dirty_chunks_vec, try_scan_delta
+  - Kept infallible versions as wrappers with expect() for convenience
 
 - [ ] Phase 21: Validate row bounds on push
   - Out-of-bounds row_idx only detected at merge time

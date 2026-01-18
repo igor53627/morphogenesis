@@ -59,8 +59,12 @@ pub fn scan_main_matrix<K: DpfKey>(
     result
 }
 
-pub fn scan_delta<K: DpfKey>(delta: &DeltaBuffer, keys: &[K; 3], results: &mut [Vec<u8>; 3]) {
-    let entries = delta.snapshot().unwrap_or_default();
+pub fn try_scan_delta<K: DpfKey>(
+    delta: &DeltaBuffer,
+    keys: &[K; 3],
+    results: &mut [Vec<u8>; 3],
+) -> Result<(), ScanError> {
+    let entries = delta.snapshot().map_err(|_| ScanError::LockPoisoned)?;
     for entry in &entries {
         for (k, key) in keys.iter().enumerate() {
             if key.eval_bit(entry.row_idx) {
@@ -68,6 +72,11 @@ pub fn scan_delta<K: DpfKey>(delta: &DeltaBuffer, keys: &[K; 3], results: &mut [
             }
         }
     }
+    Ok(())
+}
+
+pub fn scan_delta<K: DpfKey>(delta: &DeltaBuffer, keys: &[K; 3], results: &mut [Vec<u8>; 3]) {
+    try_scan_delta(delta, keys, results).expect("scan_delta: lock poisoned")
 }
 
 pub fn scan<K: DpfKey>(
@@ -848,8 +857,8 @@ mod tests {
     fn scan_delta_applies_matching_rows_with_dpf_pair() {
         let row_size = 8;
         let delta = DeltaBuffer::new(row_size);
-        delta.push(2, vec![0xAA; row_size]);
-        delta.push(7, vec![0xBB; row_size]);
+        delta.push(2, vec![0xAA; row_size]).unwrap();
+        delta.push(7, vec![0xBB; row_size]).unwrap();
 
         let mut rng = rand::thread_rng();
         let (key0_a, key0_b) = AesDpfKey::generate_pair(&mut rng, 2);
@@ -874,6 +883,25 @@ mod tests {
         assert_eq!(xor_results[0], vec![0xAA; row_size]);
         assert_eq!(xor_results[1], vec![0xBB; row_size]);
         assert_eq!(xor_results[2], vec![0x00; row_size]);
+    }
+
+    #[test]
+    fn try_scan_delta_returns_result() {
+        use super::try_scan_delta;
+
+        let row_size = 4;
+        let delta = DeltaBuffer::new(row_size);
+        delta.push(0, vec![0xAB, 0xCD, 0xEF, 0x12]).unwrap();
+
+        let mut rng = rand::thread_rng();
+        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+        let keys = [key0, key1, key2];
+
+        let mut results = empty_result(row_size);
+        let result = try_scan_delta(&delta, &keys, &mut results);
+        assert!(result.is_ok());
     }
 
     fn make_global_state(epoch_id: u64, total_size: usize, chunk_size: usize) -> Arc<GlobalState> {

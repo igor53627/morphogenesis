@@ -22,12 +22,12 @@ fn apply_xor_patch(dst: &mut [u8], src: &[u8]) {
     dst.iter_mut().zip(src.iter()).for_each(|(d, s)| *d ^= s);
 }
 
-pub fn dirty_chunks(
+pub fn try_dirty_chunks(
     pending: &DeltaBuffer,
     row_size_bytes: usize,
     chunk_size_bytes: usize,
-) -> HashSet<usize> {
-    let snapshot = pending.snapshot().unwrap_or_default();
+) -> Result<HashSet<usize>, MergeError> {
+    let snapshot = pending.snapshot().map_err(|_| MergeError::LockPoisoned)?;
     let mut result = HashSet::new();
     for entry in &snapshot {
         if let Ok(offset) = row_offset(entry, row_size_bytes) {
@@ -35,7 +35,16 @@ pub fn dirty_chunks(
             result.insert(chunk_index);
         }
     }
-    result
+    Ok(result)
+}
+
+pub fn dirty_chunks(
+    pending: &DeltaBuffer,
+    row_size_bytes: usize,
+    chunk_size_bytes: usize,
+) -> HashSet<usize> {
+    try_dirty_chunks(pending, row_size_bytes, chunk_size_bytes)
+        .expect("dirty_chunks: lock poisoned")
 }
 
 fn collect_dirty_chunks_from_entries(
@@ -55,15 +64,24 @@ fn collect_dirty_chunks_from_entries(
     Ok(dirty)
 }
 
+pub fn try_dirty_chunks_vec(
+    pending: &DeltaBuffer,
+    row_size_bytes: usize,
+    chunk_size_bytes: usize,
+    num_chunks: usize,
+) -> Result<Vec<bool>, MergeError> {
+    let snapshot = pending.snapshot().map_err(|_| MergeError::LockPoisoned)?;
+    collect_dirty_chunks_from_entries(&snapshot, row_size_bytes, chunk_size_bytes, num_chunks)
+}
+
 pub fn dirty_chunks_vec(
     pending: &DeltaBuffer,
     row_size_bytes: usize,
     chunk_size_bytes: usize,
     num_chunks: usize,
 ) -> Vec<bool> {
-    let snapshot = pending.snapshot().unwrap_or_default();
-    collect_dirty_chunks_from_entries(&snapshot, row_size_bytes, chunk_size_bytes, num_chunks)
-        .expect("dirty_chunks overflow")
+    try_dirty_chunks_vec(pending, row_size_bytes, chunk_size_bytes, num_chunks)
+        .expect("dirty_chunks_vec: lock poisoned or overflow")
 }
 
 fn clone_chunks_cow(current_matrix: &ChunkedMatrix, dirty: &[bool]) -> Vec<Arc<AlignedMatrix>> {
@@ -364,8 +382,9 @@ pub async fn spawn_merge_worker_with_callback<F>(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_next_snapshot, dirty_chunks, dirty_chunks_vec, try_build_next_snapshot, EpochHandle,
-        EpochManager, EpochManagerError, MergeError,
+        build_next_snapshot, dirty_chunks, dirty_chunks_vec, try_build_next_snapshot,
+        try_dirty_chunks, try_dirty_chunks_vec, EpochHandle, EpochManager, EpochManagerError,
+        MergeError,
     };
     use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
     use morphogen_storage::ChunkedMatrix;
@@ -381,7 +400,7 @@ mod tests {
     #[test]
     fn dirty_chunks_single_row_maps_to_correct_chunk() {
         let pending = DeltaBuffer::new(4);
-        pending.push(0, vec![1, 2, 3, 4]);
+        pending.push(0, vec![1, 2, 3, 4]).unwrap();
         let result = dirty_chunks(&pending, 4, 8);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&0));
@@ -390,7 +409,7 @@ mod tests {
     #[test]
     fn dirty_chunks_row_at_boundary() {
         let pending = DeltaBuffer::new(4);
-        pending.push(2, vec![1, 2, 3, 4]);
+        pending.push(2, vec![1, 2, 3, 4]).unwrap();
         let result = dirty_chunks(&pending, 4, 8);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&1));
@@ -399,8 +418,8 @@ mod tests {
     #[test]
     fn dirty_chunks_multiple_rows_same_chunk() {
         let pending = DeltaBuffer::new(4);
-        pending.push(0, vec![1, 1, 1, 1]);
-        pending.push(1, vec![2, 2, 2, 2]);
+        pending.push(0, vec![1, 1, 1, 1]).unwrap();
+        pending.push(1, vec![2, 2, 2, 2]).unwrap();
         let result = dirty_chunks(&pending, 4, 8);
         assert_eq!(result.len(), 1);
         assert!(result.contains(&0));
@@ -409,8 +428,8 @@ mod tests {
     #[test]
     fn dirty_chunks_multiple_chunks() {
         let pending = DeltaBuffer::new(4);
-        pending.push(0, vec![1, 1, 1, 1]);
-        pending.push(3, vec![2, 2, 2, 2]);
+        pending.push(0, vec![1, 1, 1, 1]).unwrap();
+        pending.push(3, vec![2, 2, 2, 2]).unwrap();
         let result = dirty_chunks(&pending, 4, 8);
         assert_eq!(result.len(), 2);
         assert!(result.contains(&0));
@@ -420,8 +439,8 @@ mod tests {
     #[test]
     fn dirty_chunks_vec_returns_bool_slice() {
         let pending = DeltaBuffer::new(4);
-        pending.push(0, vec![1, 1, 1, 1]);
-        pending.push(3, vec![2, 2, 2, 2]);
+        pending.push(0, vec![1, 1, 1, 1]).unwrap();
+        pending.push(3, vec![2, 2, 2, 2]).unwrap();
 
         let result = dirty_chunks_vec(&pending, 4, 8, 2);
         assert_eq!(result.len(), 2);
@@ -432,10 +451,35 @@ mod tests {
     #[test]
     fn dirty_chunks_vec_sparse_marking() {
         let pending = DeltaBuffer::new(4);
-        pending.push(4, vec![1, 1, 1, 1]);
+        pending.push(4, vec![1, 1, 1, 1]).unwrap();
 
         let result = dirty_chunks_vec(&pending, 4, 8, 4);
         assert_eq!(result, vec![false, false, true, false]);
+    }
+
+    #[test]
+    fn try_dirty_chunks_returns_result() {
+        let pending = DeltaBuffer::new(4);
+        pending.push(0, vec![1, 2, 3, 4]).unwrap();
+        let result = try_dirty_chunks(&pending, 4, 8);
+        assert!(result.is_ok());
+        let chunks = result.unwrap();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks.contains(&0));
+    }
+
+    #[test]
+    fn try_dirty_chunks_vec_returns_result() {
+        let pending = DeltaBuffer::new(4);
+        pending.push(1, vec![1, 1, 1, 1]).unwrap();
+        pending.push(3, vec![2, 2, 2, 2]).unwrap();
+
+        let result = try_dirty_chunks_vec(&pending, 4, 8, 2);
+        assert!(result.is_ok());
+        let dirty = result.unwrap();
+        assert_eq!(dirty.len(), 2);
+        assert!(dirty[0]);
+        assert!(dirty[1]);
     }
 
     #[test]
