@@ -175,6 +175,7 @@ pub fn build_next_snapshot(
 #[derive(Debug, PartialEq, Eq)]
 pub enum EpochManagerError {
     InvalidRowSize { row_size: usize },
+    ManagerAlreadyExists,
 }
 
 impl std::fmt::Display for EpochManagerError {
@@ -182,6 +183,9 @@ impl std::fmt::Display for EpochManagerError {
         match self {
             EpochManagerError::InvalidRowSize { row_size } => {
                 write!(f, "invalid row size: {} (must be > 0)", row_size)
+            }
+            EpochManagerError::ManagerAlreadyExists => {
+                write!(f, "an EpochManager already exists for this GlobalState")
             }
         }
     }
@@ -253,6 +257,9 @@ impl EpochManager {
                 row_size: row_size_bytes,
             });
         }
+        if !global.try_acquire_manager() {
+            return Err(EpochManagerError::ManagerAlreadyExists);
+        }
         let initial_epoch = global.load().epoch_id;
         Ok(Self {
             global,
@@ -323,6 +330,12 @@ impl EpochManager {
 
     pub fn acquire(&self) -> EpochHandle {
         EpochHandle(self.global.load())
+    }
+}
+
+impl Drop for EpochManager {
+    fn drop(&mut self) {
+        self.global.release_manager();
     }
 }
 
@@ -740,6 +753,35 @@ mod tests {
         let global = make_global_state(0, 4);
         let manager = EpochManager::new(global, 4).unwrap();
         assert_eq!(manager.num_rows(), 16);
+    }
+
+    #[test]
+    fn epoch_manager_rejects_second_manager_on_same_global_state() {
+        let global = make_global_state(0, 4);
+
+        let manager1 = EpochManager::new(global.clone(), 4);
+        assert!(manager1.is_ok(), "first manager should succeed");
+
+        let manager2 = EpochManager::new(global.clone(), 4);
+        assert!(
+            matches!(manager2, Err(EpochManagerError::ManagerAlreadyExists)),
+            "second manager on same GlobalState should fail with ManagerAlreadyExists"
+        );
+    }
+
+    #[test]
+    fn epoch_manager_allows_new_manager_after_drop() {
+        let global = make_global_state(0, 4);
+
+        {
+            let _manager1 = EpochManager::new(global.clone(), 4).unwrap();
+        }
+
+        let manager2 = EpochManager::new(global.clone(), 4);
+        assert!(
+            manager2.is_ok(),
+            "new manager should succeed after previous one is dropped"
+        );
     }
 
     #[test]

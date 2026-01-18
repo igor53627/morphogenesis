@@ -94,10 +94,12 @@ Non-critical hardening from post-fix review:
   - Fix: restore_for_epoch now restores ALL data (no data loss) but returns BufferFull error
   - Epoch is always reset, entries always preserved, error signals overflow for logging
 
-- [ ] Phase 32: Multiple EpochManager risk (MEDIUM)
+- [x] Phase 32: Multiple EpochManager risk (MEDIUM)
   - If 2+ EpochManagers share same GlobalState, per-manager merge_lock doesn't serialize
   - Can break pending_epoch == global_epoch invariant
-  - Fix: Either enforce single manager per GlobalState or move merge_lock into GlobalState
+  - Fix: Added has_manager: AtomicBool to GlobalState
+  - EpochManager::new() uses try_acquire_manager(), returns ManagerAlreadyExists error
+  - EpochManager::drop() calls release_manager() to allow new manager
 
 - [ ] Phase 33: Document pending_epoch invariants (LOW)
   - pending_epoch must only be modified while holding entries write lock
