@@ -43,7 +43,7 @@ fn main() {
     let row_size_bytes = config.row_size_bytes;
 
     let setup_start = Instant::now();
-    let server = MorphogenServer::new(config);
+    let server = MorphogenServer::new(config).expect("invalid config");
     let setup_elapsed = setup_start.elapsed();
     let mut rng = rand::thread_rng();
     let keys = [

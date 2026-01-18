@@ -4,7 +4,7 @@ use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
 use morphogen_dpf::DpfKey;
 use morphogen_storage::ChunkedMatrix;
 
-use crate::config::ServerConfig;
+use crate::config::{ConfigError, ServerConfig};
 use crate::epoch::{try_build_next_snapshot, MergeError};
 #[cfg(feature = "parallel")]
 use crate::scan::scan_consistent_parallel;
@@ -17,7 +17,9 @@ pub struct MorphogenServer {
 }
 
 impl MorphogenServer {
-    pub fn new(config: ServerConfig) -> Self {
+    pub fn new(config: ServerConfig) -> Result<Self, ConfigError> {
+        config.validate()?;
+
         let row_size_bytes = config.row_size_bytes;
         let mut matrix = Arc::new(ChunkedMatrix::new(
             config.matrix_size_bytes,
@@ -33,11 +35,11 @@ impl MorphogenServer {
             matrix,
         });
 
-        Self {
+        Ok(Self {
             config,
             state: GlobalState::new(snapshot),
             pending: Arc::new(DeltaBuffer::new(row_size_bytes)),
-        }
+        })
     }
 
     pub fn scan<K: DpfKey>(&self, keys: &[K; 3]) -> Result<([Vec<u8>; 3], u64), ScanError> {
@@ -115,7 +117,7 @@ mod tests {
 
     #[test]
     fn try_merge_epoch_returns_new_epoch_id() {
-        let mut server = MorphogenServer::new(test_config());
+        let mut server = MorphogenServer::new(test_config()).unwrap();
         server.submit_update(0, vec![1, 2, 3, 4]).unwrap();
 
         let result = server.try_merge_epoch();
@@ -124,10 +126,22 @@ mod tests {
 
     #[test]
     fn try_merge_epoch_errors_on_oob_row() {
-        let mut server = MorphogenServer::new(test_config());
+        let mut server = MorphogenServer::new(test_config()).unwrap();
         server.submit_update(1000, vec![1, 2, 3, 4]).unwrap();
 
         let result = server.try_merge_epoch();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_rejects_unaligned_config() {
+        let config = ServerConfig {
+            environment: crate::config::Environment::Test,
+            matrix_size_bytes: 65, // not divisible by 4
+            chunk_size_bytes: 32,
+            row_size_bytes: 4,
+            bench_fill_seed: None,
+        };
+        assert!(MorphogenServer::new(config).is_err());
     }
 }

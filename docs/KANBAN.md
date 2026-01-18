@@ -101,6 +101,30 @@ Critical correctness and production hardening:
   - Fix: Renamed to try_merge_epoch returning Result<u64, MergeError>
   - Kept infallible dirty_chunks/dirty_chunks_vec for test convenience only
 
+### Epoch Management - Oracle Review #4 (Jan 18, 2026)
+Critical correctness and production hardening:
+
+- [ ] Phase 24: Pending epoch marker for scan linearizability (CRITICAL)
+  - Current scan_consistent() epoch retry doesn't fully prevent races
+  - Window exists where pending is drained but matrix epoch unchanged
+  - Can cause missing updates or double-application
+  - Fix: Add pending_epoch to DeltaBuffer, validate both epochs match in scan
+
+- [x] Phase 25: Row/chunk alignment invariant (CRITICAL - potential UB)
+  - Rows straddling chunk boundaries cause merge errors and AVX512 UB
+  - Must enforce: chunk_size_bytes % row_size_bytes == 0
+  - Must enforce: matrix_size_bytes % row_size_bytes == 0
+  - Fix: Added ConfigError enum, ServerConfig::validate(), MorphogenServer::new returns Result
+
+- [ ] Phase 26: Backoff in scan_consistent() retry loop
+  - Currently spins indefinitely under frequent merges
+  - Fix: Add spin_loop hints, yield_now after N retries
+  - Optional: max retry count or deadline for diagnostics
+
+- [ ] Phase 27: Max pending buffer size limit
+  - Unbounded pending growth causes latency spikes / memory blowup
+  - Fix: Add max pending length or byte budget, reject updates when full
+
 ### Core Protocol
 - [ ] UBT Merkle proof generation
 
