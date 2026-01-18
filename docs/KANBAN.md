@@ -96,10 +96,10 @@ Critical correctness and production hardening:
   - But merge loop errors for same condition (inconsistent)
   - Fix: Changed try_dirty_chunks to propagate row_offset errors with `?`
 
-- [ ] Phase 23: Remove remaining expect()/panic paths
-  - `build_next_snapshot().expect(...)` 
-  - `dirty_chunks_vec().expect(...)`
-  - Fix: Use try_* variants, handle errors in callers
+- [x] Phase 23: Remove remaining expect()/panic paths
+  - `build_next_snapshot().expect(...)` used in MorphogenServer::merge_epoch
+  - Fix: Renamed to try_merge_epoch returning Result<u64, MergeError>
+  - Kept infallible dirty_chunks/dirty_chunks_vec for test convenience only
 
 ### Core Protocol
 - [ ] UBT Merkle proof generation

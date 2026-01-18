@@ -5,7 +5,7 @@ use morphogen_dpf::DpfKey;
 use morphogen_storage::ChunkedMatrix;
 
 use crate::config::ServerConfig;
-use crate::epoch::build_next_snapshot;
+use crate::epoch::{try_build_next_snapshot, MergeError};
 #[cfg(feature = "parallel")]
 use crate::scan::scan_consistent_parallel;
 use crate::scan::{scan_consistent, ScanError};
@@ -87,13 +87,47 @@ impl MorphogenServer {
         self.pending.push(row_idx, diff)
     }
 
-    pub fn merge_epoch(&mut self) {
+    pub fn try_merge_epoch(&mut self) -> Result<u64, MergeError> {
         let current = self.state.load();
         let next_epoch_id = current.epoch_id + 1;
         let next_snapshot =
-            build_next_snapshot(current.as_ref(), self.pending.as_ref(), next_epoch_id);
+            try_build_next_snapshot(current.as_ref(), self.pending.as_ref(), next_epoch_id)?;
 
         self.state.store(Arc::new(next_snapshot));
         self.pending = Arc::new(DeltaBuffer::new(self.config.row_size_bytes));
+        Ok(next_epoch_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> ServerConfig {
+        ServerConfig {
+            environment: crate::config::Environment::Test,
+            matrix_size_bytes: 64,
+            chunk_size_bytes: 32,
+            row_size_bytes: 4,
+            bench_fill_seed: None,
+        }
+    }
+
+    #[test]
+    fn try_merge_epoch_returns_new_epoch_id() {
+        let mut server = MorphogenServer::new(test_config());
+        server.submit_update(0, vec![1, 2, 3, 4]).unwrap();
+
+        let result = server.try_merge_epoch();
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    #[test]
+    fn try_merge_epoch_errors_on_oob_row() {
+        let mut server = MorphogenServer::new(test_config());
+        server.submit_update(1000, vec![1, 2, 3, 4]).unwrap();
+
+        let result = server.try_merge_epoch();
+        assert!(result.is_err());
     }
 }
