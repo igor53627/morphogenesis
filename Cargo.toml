@@ -1,0 +1,9 @@
+ [workspace]
+ members = [
+     "crates/morphogen-client",
+     "crates/morphogen-core",
+     "crates/morphogen-dpf",
+     "crates/morphogen-storage",
+     "crates/morphogen-server",
+ ]
+ resolver = "2"

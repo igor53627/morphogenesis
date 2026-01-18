@@ -1,0 +1,15 @@
+ [package]
+ name = "morphogen-dpf"
+ version = "0.1.0"
+ edition = "2021"
+
+ [lib]
+ name = "morphogen_dpf"
+ path = "src/lib.rs"
+
+ [features]
+ default = []
+ avx512 = []
+
+ [dependencies]
+ rand = "0.8"

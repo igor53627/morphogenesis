@@ -1,0 +1,12 @@
+ [package]
+ name = "morphogen-core"
+ version = "0.1.0"
+ edition = "2021"
+ 
+ [dependencies]
+ arc-swap = "1.7"
+ morphogen-storage = { path = "../morphogen-storage" }
+ 
+ [lib]
+ name = "morphogen_core"
+ path = "src/lib.rs"

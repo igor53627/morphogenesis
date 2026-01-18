@@ -1,0 +1,12 @@
+[package]
+name = "morphogen-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+morphogen-core = { path = "../morphogen-core" }
+morphogen-dpf = { path = "../morphogen-dpf" }
+rand = "0.8"
+
+[dev-dependencies]
+rand = "0.8"
