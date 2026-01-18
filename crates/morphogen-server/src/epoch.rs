@@ -295,12 +295,15 @@ impl EpochManager {
             .merge_lock
             .lock()
             .map_err(|_| MergeError::LockPoisoned)?;
-        let entries = self.pending.drain().map_err(|_| MergeError::LockPoisoned)?;
-        if entries.is_empty() {
-            return Ok(self.global.load().epoch_id);
-        }
         let current = self.global.load();
         let next_epoch_id = current.epoch_id + 1;
+        let entries = self
+            .pending
+            .drain_for_epoch(next_epoch_id)
+            .map_err(|_| MergeError::LockPoisoned)?;
+        if entries.is_empty() {
+            return Ok(current.epoch_id);
+        }
         let next = match try_build_snapshot_from_entries(
             &current,
             &entries,

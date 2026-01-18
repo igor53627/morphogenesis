@@ -51,7 +51,7 @@
 
 Key types: GlobalState, EpochManager, EpochHandle, MergeError
 
-### Epoch Management - Oracle Review #2 (Jan 18, 2026)
+### Epoch Management - Oracle Review #2-4 (Jan 18, 2026)
 Critical fixes for production readiness:
 
 - [x] Phase 14: Restore drained entries on merge error (prevent data loss)
@@ -59,6 +59,18 @@ Critical fixes for production readiness:
 - [x] Phase 16: Replace panics with Result in DeltaBuffer::push
 - [x] Phase 17: Validate row_size_bytes > 0 at EpochManager construction
 - [x] Phase 18: Handle lock poisoning gracefully (return error, don't panic)
+- [x] Phase 19: Scan consistency fix (double-check epoch_id loop)
+- [x] Phase 20: Stop swallowing lock poison errors (try_* variants)
+- [x] Phase 21: Validate row bounds on push (UpdateError, submit_update())
+- [x] Phase 22: Early error in dirty_chunks for OOB
+- [x] Phase 23: Remove remaining expect()/panic paths (try_merge_epoch)
+- [x] Phase 24: Pending epoch marker for scan linearizability
+  - Added pending_epoch: AtomicU64 to DeltaBuffer
+  - Added snapshot_with_epoch() and drain_for_epoch()
+  - Updated scan_consistent to validate both matrix epoch AND pending_epoch match
+- [x] Phase 25: Row/chunk alignment invariant (ConfigError, ServerConfig::validate())
+- [x] Phase 26: Backoff in scan_consistent() retry loop (TooManyRetries, max_retries)
+- [x] Phase 27: Max pending buffer size limit (DeltaError::BufferFull)
 
 ---
 
@@ -69,63 +81,6 @@ Critical fixes for production readiness:
 ---
 
 ## [TODO]
-
-### Epoch Management - Oracle Review #3 (Jan 18, 2026)
-Critical correctness and production hardening:
-
-- [x] Phase 19: Scan consistency fix (CRITICAL)
-  - Race: scan reads GlobalState then pending independently
-  - During try_advance: pending drained -> new snapshot stored
-  - Concurrent scan sees old snapshot + empty pending = missing merged deltas
-  - Fix: Double-check epoch_id loop in scan_consistent() and scan_consistent_parallel()
-
-- [x] Phase 20: Stop swallowing lock poison errors
-  - `unwrap_or_default()` in scan_delta, dirty_chunks, dirty_chunks_vec
-  - Converts corruption into silent data loss (empty pending)
-  - Fix: Added try_dirty_chunks, try_dirty_chunks_vec, try_scan_delta
-  - Kept infallible versions as wrappers with expect() for convenience
-
-- [x] Phase 21: Validate row bounds on push
-  - Out-of-bounds row_idx only detected at merge time
-  - Causes repeated merge failures (livelock-ish)
-  - Fix: Added UpdateError enum and EpochManager::submit_update() with row bounds check
-  - Added EpochManager::num_rows() helper
-
-- [x] Phase 22: Early error in dirty_chunks for OOB
-  - Currently silently ignores out-of-range chunks
-  - But merge loop errors for same condition (inconsistent)
-  - Fix: Changed try_dirty_chunks to propagate row_offset errors with `?`
-
-- [x] Phase 23: Remove remaining expect()/panic paths
-  - `build_next_snapshot().expect(...)` used in MorphogenServer::merge_epoch
-  - Fix: Renamed to try_merge_epoch returning Result<u64, MergeError>
-  - Kept infallible dirty_chunks/dirty_chunks_vec for test convenience only
-
-### Epoch Management - Oracle Review #4 (Jan 18, 2026)
-Critical correctness and production hardening:
-
-- [ ] Phase 24: Pending epoch marker for scan linearizability (CRITICAL)
-  - Current scan_consistent() epoch retry doesn't fully prevent races
-  - Window exists where pending is drained but matrix epoch unchanged
-  - Can cause missing updates or double-application
-  - Fix: Add pending_epoch to DeltaBuffer, validate both epochs match in scan
-
-- [x] Phase 25: Row/chunk alignment invariant (CRITICAL - potential UB)
-  - Rows straddling chunk boundaries cause merge errors and AVX512 UB
-  - Must enforce: chunk_size_bytes % row_size_bytes == 0
-  - Must enforce: matrix_size_bytes % row_size_bytes == 0
-  - Fix: Added ConfigError enum, ServerConfig::validate(), MorphogenServer::new returns Result
-
-- [x] Phase 26: Backoff in scan_consistent() retry loop
-  - Currently spins indefinitely under frequent merges
-  - Fix: Added TooManyRetries error, scan_consistent_with_max_retries API
-  - Backoff: spin_loop for first 10 attempts, yield_now after
-  - Default max retries: 1000
-
-- [x] Phase 27: Max pending buffer size limit
-  - Unbounded pending growth causes latency spikes / memory blowup
-  - Fix: Added DeltaError::BufferFull, DeltaBuffer::with_max_entries()
-  - Updated UpdateError to propagate BufferFull from DeltaError
 
 ### Core Protocol
 - [ ] UBT Merkle proof generation

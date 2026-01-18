@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -42,6 +43,7 @@ pub struct DeltaBuffer {
     row_size_bytes: usize,
     max_entries: Option<usize>,
     entries: RwLock<Vec<DeltaEntry>>,
+    pending_epoch: AtomicU64,
 }
 
 impl DeltaBuffer {
@@ -50,6 +52,7 @@ impl DeltaBuffer {
             row_size_bytes,
             max_entries: None,
             entries: RwLock::new(Vec::new()),
+            pending_epoch: AtomicU64::new(0),
         }
     }
 
@@ -58,6 +61,7 @@ impl DeltaBuffer {
             row_size_bytes,
             max_entries: Some(max_entries),
             entries: RwLock::new(Vec::new()),
+            pending_epoch: AtomicU64::new(0),
         }
     }
 
@@ -94,6 +98,16 @@ impl DeltaBuffer {
         Ok(guard.clone())
     }
 
+    pub fn snapshot_with_epoch(&self) -> Result<(u64, Vec<DeltaEntry>), DeltaError> {
+        let epoch = self.pending_epoch.load(Ordering::Acquire);
+        let guard = self.entries.read().map_err(|_| DeltaError::LockPoisoned)?;
+        Ok((epoch, guard.clone()))
+    }
+
+    pub fn pending_epoch(&self) -> u64 {
+        self.pending_epoch.load(Ordering::Acquire)
+    }
+
     pub fn len(&self) -> Result<usize, DeltaError> {
         let guard = self.entries.read().map_err(|_| DeltaError::LockPoisoned)?;
         Ok(guard.len())
@@ -105,6 +119,12 @@ impl DeltaBuffer {
 
     pub fn drain(&self) -> Result<Vec<DeltaEntry>, DeltaError> {
         let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
+        Ok(std::mem::take(&mut *guard))
+    }
+
+    pub fn drain_for_epoch(&self, new_epoch: u64) -> Result<Vec<DeltaEntry>, DeltaError> {
+        let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
+        self.pending_epoch.store(new_epoch, Ordering::Release);
         Ok(std::mem::take(&mut *guard))
     }
 
@@ -123,6 +143,43 @@ impl DeltaBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_with_epoch_returns_current_epoch_and_entries() {
+        let buf = DeltaBuffer::new(4);
+        buf.push(0, vec![1, 2, 3, 4]).unwrap();
+        buf.push(1, vec![5, 6, 7, 8]).unwrap();
+
+        let (epoch, entries) = buf.snapshot_with_epoch().unwrap();
+        assert_eq!(epoch, 0, "initial epoch should be 0");
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn drain_for_epoch_advances_pending_epoch() {
+        let buf = DeltaBuffer::new(4);
+        buf.push(0, vec![1, 2, 3, 4]).unwrap();
+
+        let entries = buf.drain_for_epoch(1).unwrap();
+        assert_eq!(entries.len(), 1);
+
+        let (epoch, _) = buf.snapshot_with_epoch().unwrap();
+        assert_eq!(epoch, 1, "epoch should advance after drain_for_epoch");
+    }
+
+    #[test]
+    fn pending_epoch_reflects_last_drain() {
+        let buf = DeltaBuffer::new(4);
+        assert_eq!(buf.pending_epoch(), 0);
+
+        buf.push(0, vec![1, 2, 3, 4]).unwrap();
+        let _ = buf.drain_for_epoch(5).unwrap();
+        assert_eq!(buf.pending_epoch(), 5);
+
+        buf.push(1, vec![5, 6, 7, 8]).unwrap();
+        let _ = buf.drain_for_epoch(10).unwrap();
+        assert_eq!(buf.pending_epoch(), 10);
+    }
 
     #[test]
     fn drain_returns_all_entries_and_clears_buffer() {

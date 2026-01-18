@@ -133,10 +133,12 @@ pub fn scan_consistent_with_max_retries<K: DpfKey>(
         let snapshot1 = global.load();
         let epoch1 = snapshot1.epoch_id;
 
-        let entries = pending.snapshot().map_err(|_| ScanError::LockPoisoned)?;
+        let (pending_epoch, entries) = pending
+            .snapshot_with_epoch()
+            .map_err(|_| ScanError::LockPoisoned)?;
 
         let snapshot2 = global.load();
-        if snapshot2.epoch_id == epoch1 {
+        if snapshot2.epoch_id == epoch1 && pending_epoch == epoch1 {
             let mut results = scan_main_matrix(snapshot1.matrix.as_ref(), keys, row_size_bytes);
             for entry in &entries {
                 for (k, key) in keys.iter().enumerate() {
@@ -193,10 +195,12 @@ pub fn scan_consistent_parallel_with_max_retries<K: DpfKey + Sync>(
         let snapshot1 = global.load();
         let epoch1 = snapshot1.epoch_id;
 
-        let entries = pending.snapshot().map_err(|_| ScanError::LockPoisoned)?;
+        let (pending_epoch, entries) = pending
+            .snapshot_with_epoch()
+            .map_err(|_| ScanError::LockPoisoned)?;
 
         let snapshot2 = global.load();
-        if snapshot2.epoch_id == epoch1 {
+        if snapshot2.epoch_id == epoch1 && pending_epoch == epoch1 {
             let mut results =
                 scan_main_matrix_parallel(snapshot1.matrix.as_ref(), keys, row_size_bytes);
             for entry in &entries {
@@ -1042,5 +1046,245 @@ mod tests {
 
         let result = scan_consistent_with_max_retries(&global, &pending, &keys, row_size, 1);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn scan_detects_pending_epoch_mismatch_and_retries() {
+        use super::scan_consistent_with_max_retries;
+
+        let row_size = 4;
+        let global = make_global_state(0, 64, 32);
+        let pending = DeltaBuffer::new(row_size);
+
+        pending.drain_for_epoch(1).expect("drain should succeed");
+
+        let mut rng = rand::thread_rng();
+        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+        let keys = [key0, key1, key2];
+
+        let result = scan_consistent_with_max_retries(&global, &pending, &keys, row_size, 5);
+        assert!(
+            matches!(result, Err(ScanError::TooManyRetries { attempts: 5 })),
+            "scan should fail when pending_epoch (1) != matrix epoch (0)"
+        );
+    }
+
+    #[test]
+    fn scan_succeeds_when_both_epochs_match() {
+        use super::scan_consistent_with_max_retries;
+
+        let row_size = 4;
+        let global = make_global_state(5, 64, 32);
+        let pending = DeltaBuffer::new(row_size);
+
+        pending.drain_for_epoch(5).expect("drain should succeed");
+
+        let mut rng = rand::thread_rng();
+        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+        let keys = [key0, key1, key2];
+
+        let result = scan_consistent_with_max_retries(&global, &pending, &keys, row_size, 1);
+        assert!(result.is_ok(), "scan should succeed when epochs match");
+        let (_, epoch) = result.unwrap();
+        assert_eq!(epoch, 5);
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::{scan_consistent_with_max_retries, ScanError};
+    use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
+    use morphogen_dpf::AesDpfKey;
+    use morphogen_storage::ChunkedMatrix;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    fn make_global_state(epoch_id: u64, total_size: usize, chunk_size: usize) -> Arc<GlobalState> {
+        let matrix = Arc::new(ChunkedMatrix::new(total_size, chunk_size));
+        let snapshot = EpochSnapshot { epoch_id, matrix };
+        Arc::new(GlobalState::new(Arc::new(snapshot)))
+    }
+
+    #[test]
+    fn concurrent_scan_and_merge_never_misses_deltas() {
+        let row_size = 4;
+        let num_rows = 16;
+        let total_size = row_size * num_rows;
+        let global = make_global_state(0, total_size, total_size);
+        let pending = Arc::new(DeltaBuffer::new(row_size));
+
+        let barrier = Arc::new(Barrier::new(3));
+        let iterations = 100;
+        let scan_successes = Arc::new(AtomicUsize::new(0));
+        let scan_retries = Arc::new(AtomicUsize::new(0));
+
+        let global_clone = global.clone();
+        let pending_clone = pending.clone();
+        let barrier_clone = barrier.clone();
+        let merger = thread::spawn(move || {
+            barrier_clone.wait();
+            for epoch in 1..=iterations {
+                pending_clone.push(0, vec![0xAA; row_size]).ok();
+                let entries = pending_clone
+                    .drain_for_epoch(epoch as u64)
+                    .expect("drain failed");
+
+                std::thread::yield_now();
+
+                if !entries.is_empty() {
+                    let matrix = Arc::new(ChunkedMatrix::new(total_size, total_size));
+                    let next = EpochSnapshot {
+                        epoch_id: epoch as u64,
+                        matrix,
+                    };
+                    global_clone.store(Arc::new(next));
+                }
+            }
+        });
+
+        let global_clone = global.clone();
+        let pending_clone = pending.clone();
+        let barrier_clone = barrier.clone();
+        let successes_clone = scan_successes.clone();
+        let retries_clone = scan_retries.clone();
+        let scanner1 = thread::spawn(move || {
+            let mut rng = rand::thread_rng();
+            let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+            let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+            let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+            let keys = [key0, key1, key2];
+
+            barrier_clone.wait();
+            for _ in 0..iterations {
+                match scan_consistent_with_max_retries(
+                    &global_clone,
+                    &pending_clone,
+                    &keys,
+                    row_size,
+                    1000,
+                ) {
+                    Ok(_) => {
+                        successes_clone.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(ScanError::TooManyRetries { .. }) => {
+                        retries_clone.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => panic!("unexpected error"),
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        let global_clone = global.clone();
+        let pending_clone = pending.clone();
+        let barrier_clone = barrier.clone();
+        let successes_clone = scan_successes.clone();
+        let retries_clone = scan_retries.clone();
+        let scanner2 = thread::spawn(move || {
+            let mut rng = rand::thread_rng();
+            let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+            let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+            let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+            let keys = [key0, key1, key2];
+
+            barrier_clone.wait();
+            for _ in 0..iterations {
+                match scan_consistent_with_max_retries(
+                    &global_clone,
+                    &pending_clone,
+                    &keys,
+                    row_size,
+                    1000,
+                ) {
+                    Ok(_) => {
+                        successes_clone.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(ScanError::TooManyRetries { .. }) => {
+                        retries_clone.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => panic!("unexpected error"),
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        merger.join().expect("merger panicked");
+        scanner1.join().expect("scanner1 panicked");
+        scanner2.join().expect("scanner2 panicked");
+
+        let successes = scan_successes.load(Ordering::Relaxed);
+        let retries = scan_retries.load(Ordering::Relaxed);
+        assert!(
+            successes > 0,
+            "at least some scans should succeed (got {} successes, {} retries)",
+            successes,
+            retries
+        );
+    }
+
+    #[test]
+    fn forced_race_window_triggers_retry() {
+        let row_size = 4;
+        let num_rows = 16;
+        let total_size = row_size * num_rows;
+        let global = make_global_state(0, total_size, total_size);
+        let pending = Arc::new(DeltaBuffer::new(row_size));
+
+        pending.push(0, vec![0xFF; row_size]).expect("push failed");
+
+        let step1_barrier = Arc::new(Barrier::new(2));
+        let step2_barrier = Arc::new(Barrier::new(2));
+
+        let global_clone = global.clone();
+        let pending_clone = pending.clone();
+        let step1_clone = step1_barrier.clone();
+        let step2_clone = step2_barrier.clone();
+
+        let merger = thread::spawn(move || {
+            step1_clone.wait();
+
+            let _entries = pending_clone.drain_for_epoch(1).expect("drain failed");
+
+            step2_clone.wait();
+
+            let matrix = Arc::new(ChunkedMatrix::new(total_size, total_size));
+            let next = EpochSnapshot {
+                epoch_id: 1,
+                matrix,
+            };
+            global_clone.store(Arc::new(next));
+        });
+
+        let snapshot_before = global.load();
+        assert_eq!(snapshot_before.epoch_id, 0);
+
+        step1_barrier.wait();
+
+        step2_barrier.wait();
+
+        let (pending_epoch, entries) = pending.snapshot_with_epoch().expect("snapshot failed");
+        assert_eq!(pending_epoch, 1, "pending_epoch should be 1 after drain");
+        assert!(entries.is_empty(), "entries should be empty after drain");
+
+        let matrix_epoch = global.load().epoch_id;
+        assert_eq!(matrix_epoch, 0, "matrix epoch should still be 0");
+
+        assert_ne!(
+            pending_epoch, matrix_epoch,
+            "RACE DETECTED: pending_epoch != matrix_epoch"
+        );
+
+        merger.join().expect("merger panicked");
+
+        let final_epoch = global.load().epoch_id;
+        assert_eq!(
+            final_epoch, 1,
+            "matrix epoch should be 1 after merge completes"
+        );
     }
 }
