@@ -119,10 +119,10 @@ Hardening issues found in post-phase-34 review:
   - restore() validates before acquiring lock
   - restore_for_epoch() validates before acquiring lock (no side effects on error)
 
-- [ ] Phase 36: Fix restore_for_epoch BufferFull check on empty entries (LOW)
-  - Early return when entries.is_empty() skips max_entries check
-  - Existing entries alone can exceed max but won't be reported
-  - Fix: compute total even when entries is empty, or check guard.len() in that branch
+- [x] Phase 36: Fix restore_for_epoch BufferFull check on empty entries (LOW)
+  - Removed early return when entries.is_empty()
+  - Now computes total and checks overflow even with empty entries
+  - Existing entries that exceed max are now properly reported
 
 - [ ] Phase 37: Prevent division-by-zero in try_dirty_chunks (MEDIUM)
   - chunk_location() divides by chunk_size_bytes without checking for 0

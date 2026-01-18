@@ -229,13 +229,18 @@ impl DeltaBuffer {
         let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
         // SAFETY: pending_epoch modification while holding write lock - see struct doc
         self.pending_epoch.store(epoch, Ordering::Release);
-        if entries.is_empty() {
-            return Ok(());
-        }
+
+        // Compute total and merge entries (even if entries is empty, we still check overflow)
         let existing = std::mem::take(&mut *guard);
         let total = entries.len() + existing.len();
-        *guard = entries;
-        guard.extend(existing);
+        if entries.is_empty() {
+            *guard = existing;
+        } else {
+            *guard = entries;
+            guard.extend(existing);
+        }
+
+        // Check overflow after merge - report but preserve data
         if let Some(max) = self.max_entries {
             if total > max {
                 return Err(DeltaError::BufferFull {
@@ -616,6 +621,50 @@ mod tests {
             buf.is_empty().unwrap(),
             "buffer should remain empty on error"
         );
+    }
+
+    #[test]
+    fn restore_for_epoch_empty_entries_ok_when_within_limit() {
+        let buf = DeltaBuffer::with_max_entries(4, 2);
+
+        // Add one entry (below max)
+        buf.push(0, vec![1, 2, 3, 4]).unwrap();
+
+        // Call restore_for_epoch with EMPTY entries
+        // Buffer has 1 entry, max is 2 - no overflow
+        let result = buf.restore_for_epoch(5, vec![]);
+
+        assert!(result.is_ok());
+        assert_eq!(buf.len().unwrap(), 1);
+        assert_eq!(buf.pending_epoch(), 5);
+    }
+
+    #[test]
+    fn restore_for_epoch_empty_entries_checks_existing_overflow() {
+        let buf = DeltaBuffer::with_max_entries(4, 2);
+
+        // Fill buffer beyond max using restore_for_epoch (which allows overflow)
+        buf.push(0, vec![1, 2, 3, 4]).unwrap();
+        buf.push(1, vec![5, 6, 7, 8]).unwrap();
+        let drained = buf.drain_for_epoch(1).unwrap();
+
+        buf.push(2, vec![9, 10, 11, 12]).unwrap();
+        buf.push(3, vec![13, 14, 15, 16]).unwrap();
+
+        // This will exceed max (4 entries, max 2) but still restore
+        let _ = buf.restore_for_epoch(0, drained);
+        assert_eq!(buf.len().unwrap(), 4); // 4 entries, max is 2
+
+        // Now call restore_for_epoch with EMPTY entries
+        // Existing buffer already exceeds max - should report overflow
+        let result = buf.restore_for_epoch(5, vec![]);
+
+        assert!(
+            matches!(result, Err(DeltaError::BufferFull { current: 4, max: 2 })),
+            "should report BufferFull even with empty entries when existing exceeds max"
+        );
+        // Epoch should still be updated
+        assert_eq!(buf.pending_epoch(), 5);
     }
 }
 

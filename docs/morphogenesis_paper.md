@@ -1,6 +1,6 @@
-# Part 2: Morphogenesis Scientific Paper
+# Morphogenesis
 
-**Title:** High-Throughput Private Information Retrieval for Ethereum via Epoch-Based Delta-PIR
+**High-Throughput Private Information Retrieval for Ethereum via Epoch-Based Delta-PIR**
 
 **Abstract:**
 We present *Morphogenesis*, a 2-Server Private Information Retrieval (PIR) protocol for Ethereum light clients. We formalize a DPF-PIR scheme over a linearized Cuckoo-mapped state, proving privacy in the semi-honest model. To solve the "Live Update" problem without leakage, we introduce **Epoch-Based Delta-PIR**, a concurrency control mechanism providing wait-free snapshot isolation. The protocol supports two security modes: **Privacy-Only** (256-byte rows, ~66ms latency) for honest-but-curious servers, and **Trustless** (2KB rows with UBT proofs, ~439ms latency) for full adversarial security. Evaluating on an AMD EPYC 9375F server, we achieve 393 GB/s scan throughput, enabling ~9 concurrent clients under 600ms in Privacy-Only mode.
@@ -118,4 +118,4 @@ The protocol takes a formless, high-entropy "soup" of encrypted bits and extract
 Since Turing's contributions span both computation theory and biological pattern formation, naming a privacy-preserving protocol after his biological discovery is poetically fitting.
 
 ## 6. Conclusion
-Morphogenesis v3.3 bridges the gap between theoretical PIR and systems reality. By combining **Parallel Cuckoo Retrieval** (for privacy) with **Epoch-Based Delta-PIR** (for consistency) and **dual query modes** (Privacy-Only for performance, Trustless for full verification), we demonstrate a viable path to sub-second, private state access for Ethereum with ~9 concurrent clients.
+Morphogenesis bridges the gap between theoretical PIR and systems reality. By combining **Parallel Cuckoo Retrieval** (for privacy) with **Epoch-Based Delta-PIR** (for consistency) and **dual query modes** (Privacy-Only for performance, Trustless for full verification), we demonstrate a viable path to sub-second, private state access for Ethereum with ~9 concurrent clients.
