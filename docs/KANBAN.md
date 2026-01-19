@@ -750,14 +750,14 @@ True GPU speedup requires custom CUDA implementation.
 - [ ] Phase 72c: Benchmark memory bandwidth
 - [x] Phase 72d: Epoch update strategy (selective dirty page upload in `EpochManager`)
 
-**Phase 73: Hardware AES on GPU**
+**Phase 73: Hardware AES on GPU (Jan 19, 2026) - COMPLETE**
 - [x] Phase 73a: Research GPU AES options - **RESOLVED (Not Viable)**
   - Finding: NVIDIA GPUs (Hopper/Blackwell) have no exposed AES instructions.
   - Decision: Use ChaCha8 (software) which hits 1885 GB/s on B200.
   - See [Crypto Analysis](CRYPTO_ANALYSIS.md) for full details.
-- [ ] Phase 73b: Implement PRG with chosen primitive - **DONE (ChaCha8)**
-- [ ] Phase 73c: Benchmark PRG throughput - **DONE**
-- [ ] Phase 73d: Integrate with fused kernel - **DONE**
+- [x] Phase 73b: Implement PRG with chosen primitive - **DONE (ChaCha8)**
+- [x] Phase 73c: Benchmark PRG throughput - **DONE**
+- [x] Phase 73d: Integrate with fused kernel - **DONE**
 
 **Phase 74: End-to-End GPU PIR (Jan 19, 2026) - IN PROGRESS**
 - [x] Phase 74a: Integrate phases 71-73 (API endpoint, GPU scanner, EpochManager integration)
