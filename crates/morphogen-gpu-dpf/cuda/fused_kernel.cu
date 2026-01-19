@@ -38,7 +38,7 @@ struct DpfKeyGpu {
     uint32_t final_cw[4];
 };
 
-__constant__ DpfKeyGpu c_keys[3];
+// Removed __constant__ c_keys[3] to simplify host-side invocation
 
 // Helper: Rotate Left
 __device__ __forceinline__ uint32_t rotl32(uint32_t x, int n) {
@@ -168,6 +168,7 @@ __device__ void dpf_eval_point_inline(
 // ----------------------------------------------------------------------------
 extern "C" __global__ void fused_pir_kernel(
     const uint4* __restrict__ db_pages,
+    const DpfKeyGpu* __restrict__ keys,
     uint4* __restrict__ out_acc0,
     uint4* __restrict__ out_acc1,
     uint4* __restrict__ out_acc2,
@@ -217,9 +218,9 @@ extern "C" __global__ void fused_pir_kernel(
 
         // Generate Masks for this page (3 keys)
         uint32_t mask0[4], mask1[4], mask2[4];
-        dpf_eval_point_inline(c_keys[0], global_page_idx, mask0);
-        dpf_eval_point_inline(c_keys[1], global_page_idx, mask1);
-        dpf_eval_point_inline(c_keys[2], global_page_idx, mask2);
+        dpf_eval_point_inline(keys[0], global_page_idx, mask0);
+        dpf_eval_point_inline(keys[1], global_page_idx, mask1);
+        dpf_eval_point_inline(keys[2], global_page_idx, mask2);
         
         uint4 m0 = make_uint4(mask0[0], mask0[1], mask0[2], mask0[3]);
         uint4 m1 = make_uint4(mask1[0], mask1[1], mask1[2], mask1[3]);

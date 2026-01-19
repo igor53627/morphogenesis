@@ -125,33 +125,14 @@ impl GpuScanner {
         let db_pages = db.as_slice();
         let start = std::time::Instant::now();
 
-        // 1. Prepare keys in constant memory
+        // 1. Prepare keys and copy to device
         let gpu_keys = [
             DpfKeyGpu::from_chacha_key(keys[0]),
             DpfKeyGpu::from_chacha_key(keys[1]),
             DpfKeyGpu::from_chacha_key(keys[2]),
         ];
         
-        // Get symbol and copy
-        let module = self.device.get_module(&self.module_name).unwrap();
-        // c_keys is defined as __constant__ DpfKeyGpu c_keys[3];
-        // In CUDA, we copy to it. cudarc's get_global works for device globals.
-        // For __constant__, we might need `get_global` too? Yes, constant memory is global scope.
-        let symbol = module.get_global("c_keys").unwrap();
-        // Create a slice of bytes to copy
-        let bytes: &[u8] = bytemuck::cast_slice(&gpu_keys);
-        // Using explicit copy method on the device for symbols if available,
-        // or getting the pointer from symbol and copying.
-        // CudaGlobal has a generic copy_from method if T: DeviceRepr.
-        // But DpfKeyGpu doesn't implement DeviceRepr (it's from cudarc).
-        // It's safer to use htod_copy_into if we have a device pointer.
-        // symbol.as_mut_ptr() gives DevicePtrMut? No, constants are read-only from kernel,
-        // but writable from host.
-        // `get_global` returns `CudaGlobal`.
-        // Let's use `device.htod_copy` to the symbol's pointer.
-        // But simpler: cudarc 0.11+ `get_global` returns `CudaGlobal` which has `u8` operations.
-        // Actually, let's just cast to bytes and copy.
-        self.device.htod_sync_copy_into(bytes, &mut symbol.slice(0..bytes.len()))?;
+        let keys_slice = self.device.htod_copy(bytemuck::cast_slice(&gpu_keys))?;
 
         // 2. Allocate output buffers on GPU
         let mut out0 = self.device.alloc_zeros::<u8>(PAGE_SIZE_BYTES)?;
@@ -167,6 +148,7 @@ impl GpuScanner {
 
         let params = (
             db_pages,
+            &keys_slice,
             &mut out0,
             &mut out1,
             &mut out2,
