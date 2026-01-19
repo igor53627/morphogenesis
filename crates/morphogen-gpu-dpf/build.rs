@@ -19,6 +19,7 @@ fn main() {
             panic!("Failed to compile CUDA kernel to PTX");
         }
             
+        println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
         println!("cargo:rustc-link-lib=dylib=cudart");
     } else {
         println!("cargo:warning=nvcc not found, skipping CUDA kernel compilation");

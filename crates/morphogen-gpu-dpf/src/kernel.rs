@@ -83,7 +83,6 @@ impl DpfKeyGpu {
 #[cfg(feature = "cuda")]
 pub struct GpuScanner {
     device: Arc<CudaDevice>,
-    module_name: String,
     fused_fn: CudaFunction,
 }
 
@@ -110,7 +109,6 @@ impl GpuScanner {
 
         Ok(Self {
             device,
-            module_name,
             fused_fn,
         })
     }
