@@ -81,6 +81,14 @@ Critical fixes for production readiness:
 
 (none)
 
+### Oracle Review #11 - Continued (Jan 19, 2026)
+- [x] Phase 60: Expose page PIR params in /epoch
+  - Added PagePirResponse struct with domain_bits, rows_per_page, num_pages, prg_keys
+  - EpochMetadataResponse now includes optional page_pir field
+  - epoch_handler populates page_pir from AppState.page_config when present
+  - Added hex_bytes_array serde module for [[u8; 16]; 2] serialization
+  - Tests: epoch_excludes_page_pir_when_disabled, epoch_includes_page_pir_when_enabled
+
 ---
 
 ## [TODO]

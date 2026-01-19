@@ -165,6 +165,100 @@ mod epoch {
         assert_eq!(seeds[1], 0x5678);
         assert_eq!(seeds[2], 0x9ABC);
     }
+
+    #[tokio::test]
+    async fn epoch_excludes_page_pir_when_disabled() {
+        let app = create_router(test_state()); // page_config: None
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/epoch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // page_pir field should be null/absent when disabled
+        assert!(json["page_pir"].is_null());
+    }
+
+    #[tokio::test]
+    async fn epoch_includes_page_pir_when_enabled() {
+        use morphogen_server::network::PagePirConfig;
+
+        let state = {
+            let row_size_bytes = 256;
+            let num_rows = 4;
+            let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 512));
+            let snapshot = EpochSnapshot {
+                epoch_id: 42,
+                matrix,
+            };
+            let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+            let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
+
+            let initial = EpochMetadata {
+                epoch_id: 42,
+                num_rows: 100_000,
+                seeds: [0x1234, 0x5678, 0x9ABC],
+                block_number: 12345678,
+                state_root: [0xAB; 32],
+            };
+            let (_tx, rx) = watch::channel(initial);
+            Arc::new(AppState {
+                global,
+                pending,
+                row_size_bytes,
+                num_rows: 100_000,
+                seeds: [0x1234, 0x5678, 0x9ABC],
+                block_number: 12345678,
+                state_root: [0xAB; 32],
+                epoch_rx: rx,
+                page_config: Some(PagePirConfig {
+                    rows_per_page: 16,
+                    domain_bits: 10,
+                    prg_keys: [[0x11; 16], [0x22; 16]],
+                }),
+            })
+        };
+
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/epoch")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // page_pir should be present with correct values
+        let page_pir = &json["page_pir"];
+        assert!(!page_pir.is_null(), "page_pir should be present");
+        assert_eq!(page_pir["domain_bits"], 10);
+        assert_eq!(page_pir["rows_per_page"], 16);
+        assert_eq!(page_pir["num_pages"], 1024); // 2^10 = 1024
+
+        // prg_keys should be hex-encoded
+        let prg_keys = page_pir["prg_keys"].as_array().unwrap();
+        assert_eq!(prg_keys.len(), 2);
+        assert!(prg_keys[0].as_str().unwrap().starts_with("0x"));
+        assert!(prg_keys[1].as_str().unwrap().starts_with("0x"));
+    }
 }
 
 mod query {

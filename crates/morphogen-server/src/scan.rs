@@ -1494,4 +1494,85 @@ mod concurrency_tests {
             &page_result[..8]
         );
     }
+
+    #[test]
+    fn try_scan_pages_chunked_rejects_unaligned_chunk() {
+        use super::{try_scan_pages_chunked, ScanError};
+        use morphogen_dpf::page::{generate_page_dpf_keys, PageDpfParams, PAGE_SIZE_BYTES};
+
+        let page_size = PAGE_SIZE_BYTES;
+        // Create matrix with size NOT aligned to page_size
+        let unaligned_size = page_size * 3 + 100; // 3 pages + 100 extra bytes
+        let matrix = ChunkedMatrix::new(unaligned_size, unaligned_size);
+
+        let params = PageDpfParams::new(8).unwrap();
+        let (k0, _) = generate_page_dpf_keys(&params, 0).unwrap();
+        let (k1, _) = generate_page_dpf_keys(&params, 1).unwrap();
+        let (k2, _) = generate_page_dpf_keys(&params, 2).unwrap();
+        let keys = [k0, k1, k2];
+
+        let result = try_scan_pages_chunked(&matrix, &keys, page_size, 64);
+
+        assert!(
+            matches!(
+                result,
+                Err(ScanError::ChunkNotAligned {
+                    chunk_idx: 0,
+                    remainder: 100,
+                    ..
+                })
+            ),
+            "Expected ChunkNotAligned error, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn try_scan_pages_chunked_accepts_aligned_matrix() {
+        use super::try_scan_pages_chunked;
+        use morphogen_dpf::page::{generate_page_dpf_keys, PageDpfParams, PAGE_SIZE_BYTES};
+
+        let page_size = PAGE_SIZE_BYTES;
+        let num_pages = 16;
+        let aligned_size = page_size * num_pages;
+        let matrix = ChunkedMatrix::new(aligned_size, aligned_size);
+
+        let params = PageDpfParams::new(8).unwrap();
+        let (k0, _) = generate_page_dpf_keys(&params, 0).unwrap();
+        let (k1, _) = generate_page_dpf_keys(&params, 1).unwrap();
+        let (k2, _) = generate_page_dpf_keys(&params, 2).unwrap();
+        let keys = [k0, k1, k2];
+
+        let result = try_scan_pages_chunked(&matrix, &keys, page_size, 64);
+
+        assert!(result.is_ok(), "Expected Ok, got {:?}", result);
+    }
+
+    #[test]
+    fn try_scan_pages_chunked_preallocates_page_refs() {
+        use super::try_scan_pages_chunked;
+        use morphogen_dpf::page::{generate_page_dpf_keys, PageDpfParams, PAGE_SIZE_BYTES};
+
+        let page_size = PAGE_SIZE_BYTES;
+        let num_pages = 256;
+        let total_size = page_size * num_pages;
+        let matrix = ChunkedMatrix::new(total_size, total_size);
+
+        let params = PageDpfParams::new(8).unwrap();
+        let (k0, _) = generate_page_dpf_keys(&params, 42).unwrap();
+        let (k1, _) = generate_page_dpf_keys(&params, 100).unwrap();
+        let (k2, _) = generate_page_dpf_keys(&params, 200).unwrap();
+        let keys = [k0, k1, k2];
+
+        // This should not panic or reallocate excessively
+        let result = try_scan_pages_chunked(&matrix, &keys, page_size, 64);
+        assert!(result.is_ok());
+
+        // Verify we get 3 results of correct size
+        let pages = result.unwrap();
+        assert_eq!(pages.len(), 3);
+        for page in &pages {
+            assert_eq!(page.len(), page_size);
+        }
+    }
 }

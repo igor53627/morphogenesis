@@ -57,6 +57,16 @@ pub struct HealthResponse {
     pub block_number: u64,
 }
 
+/// Page-level PIR parameters exposed in /epoch response.
+#[derive(Clone, Serialize)]
+pub struct PagePirResponse {
+    pub domain_bits: usize,
+    pub rows_per_page: usize,
+    pub num_pages: usize,
+    #[serde(with = "hex_bytes_array")]
+    pub prg_keys: [[u8; 16]; 2],
+}
+
 #[derive(Serialize)]
 pub struct EpochMetadataResponse {
     pub epoch_id: u64,
@@ -65,6 +75,8 @@ pub struct EpochMetadataResponse {
     pub block_number: u64,
     #[serde(with = "hex_bytes")]
     pub state_root: [u8; 32],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_pir: Option<PagePirResponse>,
 }
 
 #[derive(Deserialize)]
@@ -155,6 +167,22 @@ mod hex_bytes_vec {
     }
 }
 
+mod hex_bytes_array {
+    use serde::{self, Serializer};
+
+    pub fn serialize<S>(keys: &[[u8; 16]; 2], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(2))?;
+        for key in keys {
+            seq.serialize_element(&format!("0x{}", hex::encode(key)))?;
+        }
+        seq.end()
+    }
+}
+
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let snapshot = state.global.load();
     Json(HealthResponse {
@@ -166,12 +194,19 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthRe
 
 pub async fn epoch_handler(State(state): State<Arc<AppState>>) -> Json<EpochMetadataResponse> {
     let snapshot = state.global.load();
+    let page_pir = state.page_config.as_ref().map(|cfg| PagePirResponse {
+        domain_bits: cfg.domain_bits,
+        rows_per_page: cfg.rows_per_page,
+        num_pages: 1usize << cfg.domain_bits,
+        prg_keys: cfg.prg_keys,
+    });
     Json(EpochMetadataResponse {
         epoch_id: snapshot.epoch_id,
         num_rows: state.num_rows,
         seeds: state.seeds,
         block_number: state.block_number,
         state_root: state.state_root,
+        page_pir,
     })
 }
 
@@ -465,10 +500,35 @@ mod tests {
             seeds: [1, 2, 3],
             block_number: 100,
             state_root: [0xFF; 32],
+            page_pir: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"state_root\":\"0x"));
         assert!(json.contains("ffffffff"));
+        assert!(!json.contains("page_pir")); // skip_serializing_if works
+    }
+
+    #[test]
+    fn epoch_metadata_serializes_page_pir_when_present() {
+        let response = EpochMetadataResponse {
+            epoch_id: 1,
+            num_rows: 1000,
+            seeds: [1, 2, 3],
+            block_number: 100,
+            state_root: [0xFF; 32],
+            page_pir: Some(PagePirResponse {
+                domain_bits: 10,
+                rows_per_page: 16,
+                num_pages: 1024,
+                prg_keys: [[0xAA; 16], [0xBB; 16]],
+            }),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"page_pir\""));
+        assert!(json.contains("\"domain_bits\":10"));
+        assert!(json.contains("\"num_pages\":1024"));
+        assert!(json.contains("\"prg_keys\""));
+        assert!(json.contains("0xaaaa"));
     }
 
     #[test]
