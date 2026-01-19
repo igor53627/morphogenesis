@@ -3,7 +3,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        State, WebSocketUpgrade,
+        DefaultBodyLimit, State, WebSocketUpgrade,
     },
     http::StatusCode,
     response::{IntoResponse, Json},
@@ -196,14 +196,16 @@ pub async fn query_handler(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
-    // Run consistent scan
     let (results, epoch_id) = scan_consistent(
         state.global.as_ref(),
         state.pending.as_ref(),
         &keys,
         state.row_size_bytes,
     )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|e| match e {
+        crate::scan::ScanError::TooManyRetries { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        crate::scan::ScanError::LockPoisoned => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
 
     Ok(Json(QueryResponse {
         epoch_id,
@@ -286,12 +288,24 @@ pub async fn page_query_handler(
         PAGE_SIZE_BYTES,
         chunk_size,
     )
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|e| match e {
+        crate::scan::ScanError::TooManyRetries { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        crate::scan::ScanError::LockPoisoned => StatusCode::INTERNAL_SERVER_ERROR,
+    })?;
 
     Ok(Json(PageQueryResponse {
         epoch_id,
         pages: results.to_vec(),
     }))
+}
+
+const WS_INTERNAL_ERROR: &str = r#"{"error":"internal server error"}"#;
+
+fn ws_error_json(error: &str) -> String {
+    serde_json::to_string(&WsQueryError {
+        error: error.to_string(),
+    })
+    .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string())
 }
 
 async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
@@ -302,7 +316,6 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
         if let Message::Text(text) = msg {
             let response = match serde_json::from_str::<QueryRequest>(&text) {
                 Ok(request) if request.keys.len() == 3 => {
-                    // Parse DPF keys
                     let keys_result = (
                         AesDpfKey::from_bytes(&request.keys[0]),
                         AesDpfKey::from_bytes(&request.keys[1]),
@@ -318,31 +331,21 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
                                 &keys,
                                 state.row_size_bytes,
                             ) {
-                                Ok((results, epoch_id)) => serde_json::to_string(&QueryResponse {
-                                    epoch_id,
-                                    payloads: results.to_vec(),
-                                })
-                                .unwrap_or_else(|e| format!(r#"{{"error":"{}"}}"#, e)),
-                                Err(e) => serde_json::to_string(&WsQueryError {
-                                    error: format!("scan error: {}", e),
-                                })
-                                .unwrap(),
+                                Ok((results, epoch_id)) => {
+                                    serde_json::to_string(&QueryResponse {
+                                        epoch_id,
+                                        payloads: results.to_vec(),
+                                    })
+                                    .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string())
+                                }
+                                Err(e) => ws_error_json(&format!("scan error: {}", e)),
                             }
                         }
-                        _ => serde_json::to_string(&WsQueryError {
-                            error: "invalid key format".to_string(),
-                        })
-                        .unwrap(),
+                        _ => ws_error_json("invalid key format"),
                     }
                 }
-                Ok(_) => serde_json::to_string(&WsQueryError {
-                    error: "expected exactly 3 keys".to_string(),
-                })
-                .unwrap(),
-                Err(e) => serde_json::to_string(&WsQueryError {
-                    error: e.to_string(),
-                })
-                .unwrap(),
+                Ok(_) => ws_error_json("expected exactly 3 keys"),
+                Err(e) => ws_error_json(&e.to_string()),
             };
 
             if socket.send(Message::Text(response.into())).await.is_err() {
@@ -352,6 +355,12 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
+/// Maximum request body size: 16KB for row queries, 8KB for page queries
+/// Row query: 3 keys × 25 bytes = 75 bytes + JSON overhead ≈ 500 bytes
+/// Page query: 3 keys × 500 bytes = 1500 bytes + JSON overhead ≈ 4KB
+/// Using 16KB as a safe upper bound with room for future expansion
+pub const MAX_REQUEST_BODY_SIZE: usize = 16 * 1024;
+
 pub fn create_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
@@ -360,6 +369,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/query/page", post(page_query_handler))
         .route("/ws/epoch", get(ws_epoch_handler))
         .route("/ws/query", get(ws_query_handler))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_SIZE))
         .with_state(state)
 }
 

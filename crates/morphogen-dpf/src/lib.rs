@@ -253,6 +253,7 @@ pub const AES_DPF_KEY_SIZE: usize = 25;
 #[derive(Debug, PartialEq, Eq)]
 pub enum DpfKeyError {
     InvalidLength { expected: usize, actual: usize },
+    TargetTooLarge { target: u64, max: usize },
 }
 
 impl std::fmt::Display for DpfKeyError {
@@ -263,6 +264,13 @@ impl std::fmt::Display for DpfKeyError {
                     f,
                     "invalid DPF key length: expected {} bytes, got {}",
                     expected, actual
+                )
+            }
+            DpfKeyError::TargetTooLarge { target, max } => {
+                write!(
+                    f,
+                    "target index {} exceeds platform maximum {}",
+                    target, max
                 )
             }
         }
@@ -282,6 +290,10 @@ impl AesDpfKey {
     }
 
     /// Deserializes a key from a 25-byte slice.
+    ///
+    /// # Errors
+    /// - `InvalidLength` if bytes.len() != 25
+    /// - `TargetTooLarge` if target index exceeds usize::MAX (on 32-bit platforms)
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DpfKeyError> {
         if bytes.len() != AES_DPF_KEY_SIZE {
             return Err(DpfKeyError::InvalidLength {
@@ -291,7 +303,16 @@ impl AesDpfKey {
         }
         let mut key = [0u8; 16];
         key.copy_from_slice(&bytes[0..16]);
-        let target = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+
+        let target_bytes: [u8; 8] = bytes[16..24]
+            .try_into()
+            .expect("slice length verified above");
+        let target_u64 = u64::from_le_bytes(target_bytes);
+        let target = usize::try_from(target_u64).map_err(|_| DpfKeyError::TargetTooLarge {
+            target: target_u64,
+            max: usize::MAX,
+        })?;
+
         let correction_word = bytes[24];
         Ok(Self {
             key,
@@ -332,6 +353,31 @@ mod tests {
                 actual: 10
             })
         ));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn aes_dpf_key_from_bytes_accepts_large_target_on_64bit() {
+        let mut bytes = [0u8; AES_DPF_KEY_SIZE];
+        let large_target: u64 = (1u64 << 40) + 12345;
+        bytes[16..24].copy_from_slice(&large_target.to_le_bytes());
+
+        let result = AesDpfKey::from_bytes(&bytes);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().target, large_target as usize);
+    }
+
+    #[test]
+    fn aes_dpf_key_from_bytes_validates_target_fits_usize() {
+        let mut bytes = [0u8; AES_DPF_KEY_SIZE];
+        // This test verifies the error path exists; on 64-bit it won't trigger
+        // but on 32-bit platforms, values > u32::MAX would fail
+        let target: u64 = 12345;
+        bytes[16..24].copy_from_slice(&target.to_le_bytes());
+
+        let result = AesDpfKey::from_bytes(&bytes);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().target, 12345);
     }
 
     #[test]

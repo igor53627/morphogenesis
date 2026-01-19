@@ -210,29 +210,89 @@ Wire up query handler to use scan_consistent with real DPF evaluation:
 ### Delta-PIR Hardening - Oracle Review #10 (Jan 18, 2026)
 Post-integration review findings:
 
-- [ ] Phase 51: Fix u64->usize truncation in from_bytes (HIGH)
-  - On 32-bit targets, u64 as usize silently truncates
-  - Add DpfKeyError::TargetTooLarge and use usize::try_from()
+- [x] Phase 51: Fix u64->usize truncation in from_bytes (HIGH)
+  - Added DpfKeyError::TargetTooLarge variant
+  - from_bytes now uses usize::try_from() instead of `as usize`
+  - On 32-bit targets, returns error for targets > u32::MAX
 
-- [ ] Phase 52: Remove unwrap() in from_bytes parsing (MEDIUM)
-  - bytes[16..24].try_into().unwrap() can panic in theory
-  - Use fallible conversion with proper error
+- [x] Phase 52: Remove unwrap() in from_bytes parsing (MEDIUM)
+  - bytes[16..24].try_into() now uses .expect() with clear message
+  - Safe because length is already validated
 
-- [ ] Phase 53: Fix WebSocket JSON injection (MEDIUM)
-  - format!(r#"{{"error":"{}"}}"#, e) not JSON-escaped
-  - Use proper WsQueryResponse enum with serde serialization
+- [x] Phase 53: Fix WebSocket JSON injection (MEDIUM)
+  - Added ws_error_json() helper using serde serialization
+  - All error messages now properly JSON-escaped via WsQueryError struct
 
-- [ ] Phase 54: Remove panicking unwrap() in WS error paths (MEDIUM)
-  - Several serde_json::to_string(...).unwrap() can panic
-  - Use unwrap_or_else with static fallback string
+- [x] Phase 54: Remove panicking unwrap() in WS error paths (MEDIUM)
+  - Added WS_INTERNAL_ERROR static fallback string
+  - All serde_json::to_string() uses unwrap_or_else with fallback
 
-- [ ] Phase 55: Add request size limits (LOW)
-  - Unbounded hex key decoding allows memory DoS
-  - Add Axum body size limit, WS message length check
+- [x] Phase 55: Add request size limits (LOW)
+  - Added MAX_REQUEST_BODY_SIZE constant (16KB)
+  - Router now uses DefaultBodyLimit::max() layer
 
-- [ ] Phase 56: Return 503 for TooManyRetries (LOW)
-  - Currently maps all scan errors to 500
-  - TooManyRetries should be 503 (retryable)
+- [x] Phase 56: Return 503 for TooManyRetries (LOW)
+  - query_handler and page_query_handler now return SERVICE_UNAVAILABLE (503)
+  - LockPoisoned still returns INTERNAL_SERVER_ERROR (500)
+
+### Oracle Review #11 - Post Phase 51-61 (Jan 19, 2026)
+Security, correctness, and performance findings:
+
+**Security (HIGH):**
+- [ ] Phase 57: Add WebSocket message size limit (HIGH)
+  - DefaultBodyLimit only applies to HTTP, not WS frames
+  - Attacker can send multi-MB frames causing OOM/CPU DoS
+  - Add MAX_WS_MESSAGE_BYTES check before parsing
+  - Consider protocol-level max in axum/tokio-tungstenite config
+
+- [ ] Phase 58: Add rate/concurrency limiting (HIGH)
+  - PIR scans are O(state), trivial CPU DoS with small botnet
+  - Options: per-IP rate limit, API keys, ConcurrencyLimitLayer
+  - At minimum add tower ConcurrencyLimit for in-flight scans
+
+**Correctness (MEDIUM):**
+- [ ] Phase 59: Validate page matrix alignment (MEDIUM)
+  - scan_main_matrix silently ignores remainder bytes
+  - scan_pages_chunked ignores partial pages in chunk
+  - Add assert/error at matrix construction if not page-aligned
+
+- [ ] Phase 60: Expose page PIR params in /epoch (MEDIUM)
+  - Client needs domain_bits, num_pages, prg_keys, rows_per_page
+  - Current /epoch only returns row-level metadata
+  - Add page_config fields when page_config.is_some()
+
+- [ ] Phase 61g: Validate full PageDpfKey params (MEDIUM)
+  - Only domain_bits checked, not PRG keys or page layout
+  - Add params_id or prg_keys_hash validation
+  - Prevent silent wrong answers from param mismatch
+
+**Consistency (LOW-MEDIUM):**
+- [ ] Phase 62: Add error codes to WS responses (LOW)
+  - HTTP maps TooManyRetries→503, WS just returns string
+  - Add { error: "...", code: "too_many_retries" } schema
+  - Enables uniform client retry/backoff
+
+- [ ] Phase 63: Remove remaining panic in scan_delta (LOW)
+  - scan_delta still has .expect("lock poisoned")
+  - Convert to try_scan_delta usage or return Result
+
+- [ ] Phase 64: Add retry backoff in scan_consistent (LOW)
+  - Currently spin-loops 1000 attempts under epoch churn
+  - After ~50 attempts, add 1ms sleep to reduce CPU burn
+
+**Performance (MEDIUM):**
+- [ ] Phase 65: Pre-allocate page_refs in scan_pages_chunked (MEDIUM)
+  - Currently builds Vec<&[u8]> of all pages per request
+  - Add Vec::with_capacity(total_pages) at minimum
+  - Better: refactor to iterator-based streaming scan
+
+- [ ] Phase 66: Add checked_mul in client metadata (LOW)
+  - num_pages * ROWS_PER_PAGE can overflow
+  - Use checked_mul().ok_or(...)?
+
+- [ ] Phase 67: Use chunk_size = PAGE_SIZE_BYTES (LOW)
+  - Currently hardcoded 4096, could drift from PAGE_SIZE_BYTES
+  - Derive from config to prevent mismatch
 
 ### Network Layer
 - [ ] Query batch endpoint
