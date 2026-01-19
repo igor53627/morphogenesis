@@ -248,6 +248,66 @@ impl ChaChaKey {
     pub fn is_party1(&self) -> bool {
         self.party == 1
     }
+
+    /// Serialize the key to bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(64 + self.correction_words.len() * 18);
+        bytes.extend_from_slice(&self.root_seed.to_bytes());
+        bytes.push(self.root_t);
+        bytes.push(self.party);
+        bytes.push(self.domain_bits as u8);
+        
+        for cw in &self.correction_words {
+            bytes.extend_from_slice(&cw.seed_cw.to_bytes());
+            bytes.push(cw.t_cw_left);
+            bytes.push(cw.t_cw_right);
+        }
+        
+        bytes.extend_from_slice(&self.final_cw.to_bytes());
+        bytes
+    }
+
+    /// Deserialize the key from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, GpuDpfError> {
+        if bytes.len() < 19 + 16 {
+            return Err(GpuDpfError::InvalidKeyFormat("Byte array too short"));
+        }
+
+        let root_seed = Seed128::from_bytes(bytes[0..16].try_into().unwrap());
+        let root_t = bytes[16];
+        let party = bytes[17];
+        let domain_bits = bytes[18] as usize;
+
+        let expected_len = 19 + domain_bits * 18 + 16;
+        if bytes.len() != expected_len {
+            return Err(GpuDpfError::InvalidKeyFormat("Invalid byte array length"));
+        }
+
+        let mut correction_words = Vec::with_capacity(domain_bits);
+        let mut offset = 19;
+        for _ in 0..domain_bits {
+            let seed_cw = Seed128::from_bytes(bytes[offset..offset + 16].try_into().unwrap());
+            let t_cw_left = bytes[offset + 16];
+            let t_cw_right = bytes[offset + 17];
+            correction_words.push(CorrectionWord {
+                seed_cw,
+                t_cw_left,
+                t_cw_right,
+            });
+            offset += 18;
+        }
+
+        let final_cw = Seed128::from_bytes(bytes[offset..offset + 16].try_into().unwrap());
+
+        Ok(Self {
+            root_seed,
+            root_t,
+            party,
+            domain_bits,
+            correction_words,
+            final_cw,
+        })
+    }
 }
 
 /// Generate a pair of DPF keys for a target page index.
@@ -514,6 +574,30 @@ mod tests {
                 let xor = out0.xor(&out1);
                 assert_eq!(xor, Seed128::ZERO);
             }
+        }
+    }
+
+    #[test]
+    fn serialization_roundtrip() {
+        let params = ChaChaParams::new(10).unwrap();
+        let (k0, k1) = generate_chacha_dpf_keys(&params, 42).unwrap();
+
+        let b0 = k0.to_bytes();
+        let b1 = k1.to_bytes();
+
+        let k0_rec = ChaChaKey::from_bytes(&b0).unwrap();
+        let k1_rec = ChaChaKey::from_bytes(&b1).unwrap();
+
+        assert_eq!(k0.root_seed, k0_rec.root_seed);
+        assert_eq!(k0.root_t, k0_rec.root_t);
+        assert_eq!(k0.party, k0_rec.party);
+        assert_eq!(k0.domain_bits, k0_rec.domain_bits);
+        assert_eq!(k0.correction_words.len(), k0_rec.correction_words.len());
+        assert_eq!(k0.final_cw, k0_rec.final_cw);
+
+        for i in 0..1024 {
+            assert_eq!(k0.eval(i), k0_rec.eval(i));
+            assert_eq!(k1.eval(i), k1_rec.eval(i));
         }
     }
 }

@@ -43,6 +43,10 @@ pub struct AppState {
     pub epoch_rx: watch::Receiver<EpochMetadata>,
     /// Page-level PIR configuration (None = page PIR disabled)
     pub page_config: Option<PagePirConfig>,
+    #[cfg(feature = "cuda")]
+    pub gpu_scanner: Option<Arc<morphogen_gpu_dpf::kernel::GpuScanner>>,
+    #[cfg(feature = "cuda")]
+    pub gpu_matrix: Option<Arc<std::sync::Mutex<Option<morphogen_gpu_dpf::storage::GpuPageMatrix>>>>,
 }
 
 /// Configuration for page-level PIR queries.

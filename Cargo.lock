@@ -1062,6 +1062,7 @@ dependencies = [
  "morphogen-client",
  "morphogen-core",
  "morphogen-dpf",
+ "morphogen-gpu-dpf",
  "morphogen-storage",
  "rand 0.8.5",
  "rayon",
