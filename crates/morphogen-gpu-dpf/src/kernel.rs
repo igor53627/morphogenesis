@@ -18,9 +18,7 @@ use rayon::prelude::*;
 #[cfg(feature = "cuda")]
 use crate::storage::GpuPageMatrix;
 #[cfg(feature = "cuda")]
-use crate::dpf::CorrectionWord;
-#[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig};
+use cudarc::driver::{CudaDevice, CudaFunction, LaunchAsync, LaunchConfig, DriverError};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -30,6 +28,9 @@ pub const PAGE_SIZE_BYTES: usize = 4096;
 /// Default subtree size for kernel processing.
 /// Each block processes this many pages.
 pub const SUBTREE_SIZE: usize = 1024;
+
+/// Threads per block for CUDA kernel.
+pub const THREADS_PER_BLOCK: usize = 256;
 
 /// Maximum domain bits supported by the GPU kernel.
 pub const MAX_DOMAIN_BITS: usize = 25;
@@ -47,6 +48,7 @@ pub struct DpfKeyGpu {
     pub cw_seed: [[u32; 4]; MAX_DOMAIN_BITS],
     pub cw_t_left: [u8; MAX_DOMAIN_BITS],
     pub cw_t_right: [u8; MAX_DOMAIN_BITS],
+    pub _pad2: [u8; 2], // Alignment for final_cw
     pub final_cw: [u32; 4],
 }
 
@@ -71,6 +73,7 @@ impl DpfKeyGpu {
             cw_seed,
             cw_t_left,
             cw_t_right,
+            _pad2: [0; 2],
             final_cw: key.final_cw.words,
         }
     }
@@ -87,7 +90,7 @@ pub struct GpuScanner {
 #[cfg(feature = "cuda")]
 impl GpuScanner {
     /// Create a new GpuScanner by loading the fused kernel.
-    pub fn new(device_ord: usize) -> Result<Self, cudarc::driver::DriverError> {
+    pub fn new(device_ord: usize) -> Result<Self, DriverError> {
         let device = CudaDevice::new(device_ord)?;
         
         // Load the PTX/CUBIN compiled by build.rs
@@ -95,7 +98,10 @@ impl GpuScanner {
         let ptx_path = concat!(env!("OUT_DIR"), "/fused_kernel.ptx");
         let ptx = std::fs::read_to_string(ptx_path).map_err(|e| {
             eprintln!("Failed to read PTX: {}", e);
-            cudarc::driver::DriverError::MemoryAllocationFailed // Fallback error
+            // We don't have easy access to CUresult here, so we wrap a custom error or panic
+            // But DriverError wraps CUresult.
+            // For now, let's panic as this is a build artifact issue.
+            panic!("Failed to read PTX: {}", e);
         })?;
 
         let module_name = "fused_pir".to_string();
@@ -114,7 +120,7 @@ impl GpuScanner {
         &self,
         db: &GpuPageMatrix,
         keys: [&ChaChaKey; 3],
-    ) -> Result<PirResult, cudarc::driver::DriverError> {
+    ) -> Result<PirResult, DriverError> {
         let num_pages = db.num_pages();
         let db_pages = db.as_slice();
         let start = std::time::Instant::now();
@@ -126,9 +132,26 @@ impl GpuScanner {
             DpfKeyGpu::from_chacha_key(keys[2]),
         ];
         
-        // Note: cudarc handles constant memory via specific APIs or symbol names
-        // In our fused_kernel.cu, it's defined as __constant__ DpfKeyGpu c_keys[3];
-        self.device.dtm().copy_host_to_symbol(&self.module_name, "c_keys", &gpu_keys)?;
+        // Get symbol and copy
+        let module = self.device.get_module(&self.module_name).unwrap();
+        // c_keys is defined as __constant__ DpfKeyGpu c_keys[3];
+        // In CUDA, we copy to it. cudarc's get_global works for device globals.
+        // For __constant__, we might need `get_global` too? Yes, constant memory is global scope.
+        let symbol = module.get_global("c_keys").unwrap();
+        // Create a slice of bytes to copy
+        let bytes: &[u8] = bytemuck::cast_slice(&gpu_keys);
+        // Using explicit copy method on the device for symbols if available,
+        // or getting the pointer from symbol and copying.
+        // CudaGlobal has a generic copy_from method if T: DeviceRepr.
+        // But DpfKeyGpu doesn't implement DeviceRepr (it's from cudarc).
+        // It's safer to use htod_copy_into if we have a device pointer.
+        // symbol.as_mut_ptr() gives DevicePtrMut? No, constants are read-only from kernel,
+        // but writable from host.
+        // `get_global` returns `CudaGlobal`.
+        // Let's use `device.htod_copy` to the symbol's pointer.
+        // But simpler: cudarc 0.11+ `get_global` returns `CudaGlobal` which has `u8` operations.
+        // Actually, let's just cast to bytes and copy.
+        self.device.htod_sync_copy_into(bytes, &mut symbol.slice(0..bytes.len()))?;
 
         // 2. Allocate output buffers on GPU
         let mut out0 = self.device.alloc_zeros::<u8>(PAGE_SIZE_BYTES)?;

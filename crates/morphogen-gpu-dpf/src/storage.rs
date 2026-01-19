@@ -4,7 +4,7 @@
 //! in GPU device memory.
 
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaSlice, DevicePtrMut};
+use cudarc::driver::{CudaDevice, CudaSlice};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
@@ -24,7 +24,7 @@ impl GpuPageMatrix {
     /// Create a new GpuPageMatrix from a CPU buffer.
     pub fn new(device: Arc<CudaDevice>, cpu_data: &[u8]) -> Result<Self, cudarc::driver::DriverError> {
         if cpu_data.len() % PAGE_SIZE_BYTES != 0 {
-            return Err(cudarc::driver::DriverError::InvalidValue);
+            panic!("cpu_data length must be multiple of PAGE_SIZE_BYTES");
         }
 
         let num_pages = cpu_data.len() / PAGE_SIZE_BYTES;
@@ -52,12 +52,12 @@ impl GpuPageMatrix {
     /// Update a range of pages from the CPU.
     pub fn update_pages(&mut self, start_page: usize, cpu_pages: &[u8]) -> Result<(), cudarc::driver::DriverError> {
         if cpu_pages.len() % PAGE_SIZE_BYTES != 0 {
-            return Err(cudarc::driver::DriverError::InvalidValue);
+            panic!("cpu_pages length must be multiple of PAGE_SIZE_BYTES");
         }
 
         let num_update_pages = cpu_pages.len() / PAGE_SIZE_BYTES;
         if start_page + num_update_pages > self.num_pages {
-            return Err(cudarc::driver::DriverError::InvalidValue);
+            panic!("Update range exceeds matrix bounds");
         }
 
         let offset = start_page * PAGE_SIZE_BYTES;

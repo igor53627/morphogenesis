@@ -4,7 +4,7 @@ app = modal.App("morphogen-rust-test")
 
 # Image with Rust and CUDA
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04")
+    modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
     .apt_install("curl", "build-essential", "pkg-config", "libssl-dev", "git")
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
