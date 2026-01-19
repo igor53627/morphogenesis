@@ -365,7 +365,15 @@ Oracle recommendation: Vendor for streaming only, defer half-tree until bottlene
   - O(chunk_size) memory for DPF buffer instead of O(N)
   - Deprecated old eval_and_accumulate() with O(N) allocation
   - Tests verify chunked output matches full_eval for various chunk sizes
-- [ ] Phase 63e: Benchmark memory usage: before (528MB) vs after (<1MB)
+- [x] Phase 63e: Benchmark memory usage: before (528MB) vs after (<1MB)
+  - At 16-bit domain (64K pages):
+    - Full eval: 1024 KB buffer, 6.4ms, 10.2 Melem/s
+    - Chunked (4096): 64 KB buffer, 9.3ms, 7.0 Melem/s
+  - At 25-bit domain (27M pages for mainnet):
+    - Full eval: 512 MB buffer
+    - Chunked (4096): 64 KB buffer
+    - Memory reduction: 8192x
+  - Performance trade-off: ~1.45x slower for 16x less memory (at chunk=4096)
 
 **Phase 64: Integrate streaming eval into page PIR**
 - [ ] Phase 64a: Update PageDpfKey::eval_and_accumulate() to use eval_range

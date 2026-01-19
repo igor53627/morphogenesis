@@ -151,11 +151,77 @@ fn bench_page_pir_comparison(c: &mut Criterion) {
 }
 
 #[cfg(feature = "fss")]
+fn bench_chunked_vs_full_memory(c: &mut Criterion) {
+    use morphogen_dpf::page::{generate_page_dpf_keys, PageDpfParams, PAGE_SIZE_BYTES};
+
+    let mut group = c.benchmark_group("chunked_vs_full_memory");
+
+    // Test at 16-bit domain (64K pages) to keep benchmark fast
+    // Memory analysis:
+    // - Full eval: 64K * 16 bytes = 1MB DPF output buffer
+    // - Chunked (4096): 4096 * 16 bytes = 64KB DPF output buffer
+    let domain_bits = 16;
+    let num_pages: usize = 1 << domain_bits;
+
+    let params = PageDpfParams::new(domain_bits).unwrap();
+    let target_page = num_pages / 2;
+    let (k0, _k1) = generate_page_dpf_keys(&params, target_page).unwrap();
+
+    // Create dummy page data
+    let page_data: Vec<[u8; PAGE_SIZE_BYTES]> = (0..num_pages)
+        .map(|i| {
+            let mut page = [0u8; PAGE_SIZE_BYTES];
+            page[0] = i as u8;
+            page
+        })
+        .collect();
+    let pages: Vec<&[u8]> = page_data.iter().map(|p| p.as_slice()).collect();
+
+    group.throughput(Throughput::Elements(num_pages as u64));
+
+    // Full eval: allocates O(N) = 1MB for DPF output
+    #[allow(deprecated)]
+    group.bench_function("full_eval_1MB_alloc", |b| {
+        b.iter(|| {
+            let result = k0.eval_and_accumulate(black_box(pages.iter().copied()));
+            black_box(result)
+        });
+    });
+
+    // Chunked eval with various chunk sizes
+    for chunk_size in [64, 256, 1024, 4096] {
+        let alloc_kb = chunk_size * 16 / 1024;
+        group.bench_function(format!("chunked_{}KB_alloc", alloc_kb), |b| {
+            b.iter(|| {
+                let result = k0.eval_and_accumulate_chunked(black_box(&pages), chunk_size);
+                black_box(result)
+            });
+        });
+    }
+
+    group.finish();
+
+    // Print memory summary
+    println!("\n=== Memory Usage Summary (16-bit domain = 64K pages) ===");
+    println!("Full eval DPF buffer:     {} KB", num_pages * 16 / 1024);
+    println!("Chunked (64) DPF buffer:  {} KB", 64 * 16 / 1024);
+    println!("Chunked (256) DPF buffer: {} KB", 256 * 16 / 1024);
+    println!("Chunked (1024) DPF buffer:{} KB", 1024 * 16 / 1024);
+    println!("Chunked (4096) DPF buffer:{} KB", 4096 * 16 / 1024);
+    println!("\n=== Projected Memory at 25-bit domain (27M pages) ===");
+    let pages_27m: usize = 1 << 25;
+    println!("Full eval DPF buffer:     {} MB", pages_27m * 16 / 1024 / 1024);
+    println!("Chunked (4096) DPF buffer:{} KB", 4096 * 16 / 1024);
+    println!("Memory reduction:         {}x", pages_27m / 4096);
+}
+
+#[cfg(feature = "fss")]
 criterion_group!(
     benches,
     bench_current_dpf,
     bench_fss_dpf,
-    bench_page_pir_comparison
+    bench_page_pir_comparison,
+    bench_chunked_vs_full_memory
 );
 
 #[cfg(not(feature = "fss"))]
