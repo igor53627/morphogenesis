@@ -95,6 +95,30 @@ Critical fixes for production readiness:
   - Prevents silent wrong answers from parameter mismatch
   - Test: page_query_rejects_mismatched_prg_keys
 
+- [x] Phase 62: Add error codes to WS responses (LOW)
+  - Added `code` field to WsQueryError struct
+  - Error codes: bad_request, message_too_large, too_many_retries, internal_error
+  - Test: ws_query_error_includes_code_field
+
+- [x] Phase 63: Remove remaining panic in scan_delta (LOW)
+  - Deprecated scan_delta and scan (behind #[cfg(test)])
+  - Added try_scan() that returns Result
+  - Updated e2e tests to use try_scan()
+
+- [x] Phase 64: Add retry backoff in scan_consistent (LOW)
+  - Added SPIN_LOOP_THRESHOLD (10) and YIELD_THRESHOLD (50) constants
+  - After 50 attempts, sleeps 1ms to reduce CPU burn
+
+- [x] Phase 65: Pre-allocate page_refs in scan_pages_chunked (MEDIUM)
+  - Already done: Vec::with_capacity(total_pages) at line 257
+
+- [x] Phase 66: Add checked_mul in client metadata (LOW)
+  - generate_page_query now uses checked_mul for num_pages * ROWS_PER_PAGE
+  - Returns InvalidDomainBits error on overflow
+
+- [x] Phase 67: Use chunk_size = PAGE_SIZE_BYTES (LOW)
+  - Replaced hardcoded 4096 with PAGE_SIZE_BYTES constant
+
 ---
 
 ## [TODO]
@@ -283,32 +307,14 @@ Security, correctness, and performance findings:
   - Prevents silent wrong answers from param mismatch
 
 **Consistency (LOW-MEDIUM):**
-- [ ] Phase 62: Add error codes to WS responses (LOW)
-  - HTTP maps TooManyRetries→503, WS just returns string
-  - Add { error: "...", code: "too_many_retries" } schema
-  - Enables uniform client retry/backoff
-
-- [ ] Phase 63: Remove remaining panic in scan_delta (LOW)
-  - scan_delta still has .expect("lock poisoned")
-  - Convert to try_scan_delta usage or return Result
-
-- [ ] Phase 64: Add retry backoff in scan_consistent (LOW)
-  - Currently spin-loops 1000 attempts under epoch churn
-  - After ~50 attempts, add 1ms sleep to reduce CPU burn
+- [x] Phase 62: Add error codes to WS responses (LOW) - DONE
+- [x] Phase 63: Remove remaining panic in scan_delta (LOW) - DONE
+- [x] Phase 64: Add retry backoff in scan_consistent (LOW) - DONE
 
 **Performance (MEDIUM):**
-- [ ] Phase 65: Pre-allocate page_refs in scan_pages_chunked (MEDIUM)
-  - Currently builds Vec<&[u8]> of all pages per request
-  - Add Vec::with_capacity(total_pages) at minimum
-  - Better: refactor to iterator-based streaming scan
-
-- [ ] Phase 66: Add checked_mul in client metadata (LOW)
-  - num_pages * ROWS_PER_PAGE can overflow
-  - Use checked_mul().ok_or(...)?
-
-- [ ] Phase 67: Use chunk_size = PAGE_SIZE_BYTES (LOW)
-  - Currently hardcoded 4096, could drift from PAGE_SIZE_BYTES
-  - Derive from config to prevent mismatch
+- [x] Phase 65: Pre-allocate page_refs in scan_pages_chunked (MEDIUM) - Already done
+- [x] Phase 66: Add checked_mul in client metadata (LOW) - DONE
+- [x] Phase 67: Use chunk_size = PAGE_SIZE_BYTES (LOW) - DONE
 
 ### Network Layer
 - [ ] Query batch endpoint

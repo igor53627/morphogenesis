@@ -1039,4 +1039,42 @@ mod websocket_query {
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(json["error"].as_str().unwrap().contains("too large"));
     }
+
+    #[tokio::test]
+    async fn ws_query_error_includes_code_field() {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = create_router(test_state());
+
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/query"))
+            .await
+            .unwrap();
+
+        // Send invalid request (wrong key count)
+        let request = r#"{"keys":["0xaa","0xbb"]}"#;
+        socket
+            .send(tungstenite::Message::text(request))
+            .await
+            .unwrap();
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .expect("timeout")
+            .expect("stream ended")
+            .expect("websocket error");
+
+        let text = match msg {
+            tungstenite::Message::Text(t) => t,
+            other => panic!("expected text message, got {:?}", other),
+        };
+
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(json["error"].is_string(), "should have error field");
+        assert!(json["code"].is_string(), "should have code field");
+        assert_eq!(json["code"], "bad_request");
+    }
 }

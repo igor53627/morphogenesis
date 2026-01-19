@@ -115,16 +115,23 @@ pub fn try_scan_delta<K: DpfKey>(
     Ok(())
 }
 
+/// Deprecated: Use `try_scan_delta` instead to handle lock poisoning gracefully.
+#[cfg(test)]
+#[deprecated(since = "0.1.0", note = "use try_scan_delta instead")]
 pub fn scan_delta<K: DpfKey>(delta: &DeltaBuffer, keys: &[K; 3], results: &mut [Vec<u8>; 3]) {
     try_scan_delta(delta, keys, results).expect("scan_delta: lock poisoned")
 }
 
-pub fn scan<K: DpfKey>(
+/// Scans the matrix and delta buffer, returning results.
+///
+/// # Errors
+/// Returns `ScanError::LockPoisoned` if delta buffer lock is poisoned.
+pub fn try_scan<K: DpfKey>(
     matrix: &ChunkedMatrix,
     delta: &DeltaBuffer,
     keys: &[K; 3],
     row_size_bytes: usize,
-) -> [Vec<u8>; 3] {
+) -> Result<[Vec<u8>; 3], ScanError> {
     #[cfg(feature = "profiling")]
     let mut profiler = Profiler::new();
 
@@ -136,7 +143,7 @@ pub fn scan<K: DpfKey>(
     #[cfg(feature = "profiling")]
     profiler.checkpoint("scan_main_matrix");
 
-    scan_delta(delta, keys, &mut results);
+    try_scan_delta(delta, keys, &mut results)?;
 
     #[cfg(feature = "profiling")]
     profiler.checkpoint("scan_delta");
@@ -144,7 +151,20 @@ pub fn scan<K: DpfKey>(
     #[cfg(feature = "profiling")]
     eprintln!("{}", profiler.report());
 
-    results
+    Ok(results)
+}
+
+/// Deprecated: Use `try_scan` instead to handle lock poisoning gracefully.
+#[cfg(test)]
+#[deprecated(since = "0.1.0", note = "use try_scan instead")]
+#[allow(deprecated)]
+pub fn scan<K: DpfKey>(
+    matrix: &ChunkedMatrix,
+    delta: &DeltaBuffer,
+    keys: &[K; 3],
+    row_size_bytes: usize,
+) -> [Vec<u8>; 3] {
+    try_scan(matrix, delta, keys, row_size_bytes).expect("scan: lock poisoned")
 }
 
 pub fn scan_consistent<K: DpfKey>(
@@ -155,6 +175,10 @@ pub fn scan_consistent<K: DpfKey>(
 ) -> Result<([Vec<u8>; 3], u64), ScanError> {
     scan_consistent_with_max_retries(global, pending, keys, row_size_bytes, DEFAULT_MAX_RETRIES)
 }
+
+/// Backoff thresholds for scan_consistent retry loop.
+const SPIN_LOOP_THRESHOLD: usize = 10;
+const YIELD_THRESHOLD: usize = 50;
 
 pub fn scan_consistent_with_max_retries<K: DpfKey>(
     global: &GlobalState,
@@ -184,10 +208,12 @@ pub fn scan_consistent_with_max_retries<K: DpfKey>(
             return Ok((results, epoch1));
         }
 
-        if attempt < 10 {
+        if attempt < SPIN_LOOP_THRESHOLD {
             std::hint::spin_loop();
-        } else {
+        } else if attempt < YIELD_THRESHOLD {
             std::thread::yield_now();
+        } else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
     Err(ScanError::TooManyRetries {
@@ -1060,6 +1086,7 @@ fn xor_masked(dest: &mut [u8], src: &[u8], offset: usize, mask: u8) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(deprecated)]
     use super::{empty_result, scan_consistent, scan_delta, ScanError};
     use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
     use morphogen_dpf::AesDpfKey;
@@ -1067,6 +1094,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    #[allow(deprecated)]
     fn scan_delta_applies_matching_rows_with_dpf_pair() {
         let row_size = 8;
         let delta = DeltaBuffer::new(row_size);

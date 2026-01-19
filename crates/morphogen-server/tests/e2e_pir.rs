@@ -33,8 +33,8 @@ fn e2e_two_server_pir_recovers_payload() {
     let keys_a = [key0_a, key1_a, key2_a];
     let keys_b = [key0_b, key1_b, key2_b];
 
-    let results_a = morphogen_server::scan(&matrix_a, &delta_a, &keys_a, ROW_SIZE);
-    let results_b = morphogen_server::scan(&matrix_b, &delta_b, &keys_b, ROW_SIZE);
+    let results_a = morphogen_server::try_scan(&matrix_a, &delta_a, &keys_a, ROW_SIZE).unwrap();
+    let results_b = morphogen_server::try_scan(&matrix_b, &delta_b, &keys_b, ROW_SIZE).unwrap();
 
     let mut recovered = vec![0u8; ROW_SIZE];
     for i in 0..ROW_SIZE {
@@ -69,8 +69,8 @@ fn e2e_pir_with_delta_buffer() {
     let keys_a = [key0_a, key1_a, key2_a];
     let keys_b = [key0_b, key1_b, key2_b];
 
-    let results_a = morphogen_server::scan(&matrix_a, &delta_a, &keys_a, ROW_SIZE);
-    let results_b = morphogen_server::scan(&matrix_b, &delta_b, &keys_b, ROW_SIZE);
+    let results_a = morphogen_server::try_scan(&matrix_a, &delta_a, &keys_a, ROW_SIZE).unwrap();
+    let results_b = morphogen_server::try_scan(&matrix_b, &delta_b, &keys_b, ROW_SIZE).unwrap();
 
     let mut recovered = vec![0u8; ROW_SIZE];
     for i in 0..ROW_SIZE {
@@ -119,8 +119,8 @@ fn e2e_three_parallel_queries_recover_different_rows() {
     let keys_a = [key0_a, key1_a, key2_a];
     let keys_b = [key0_b, key1_b, key2_b];
 
-    let results_a = morphogen_server::scan(&matrix_a, &delta_a, &keys_a, ROW_SIZE);
-    let results_b = morphogen_server::scan(&matrix_b, &delta_b, &keys_b, ROW_SIZE);
+    let results_a = morphogen_server::try_scan(&matrix_a, &delta_a, &keys_a, ROW_SIZE).unwrap();
+    let results_b = morphogen_server::try_scan(&matrix_b, &delta_b, &keys_b, ROW_SIZE).unwrap();
 
     for i in 0..3 {
         let mut recovered = vec![0u8; ROW_SIZE];
@@ -182,8 +182,8 @@ fn e2e_cuckoo_addressed_pir() {
     let keys_a = [key0_a, key1_a, key2_a];
     let keys_b = [key0_b, key1_b, key2_b];
 
-    let results_a = morphogen_server::scan(&matrix_a, &delta_a, &keys_a, ROW_SIZE);
-    let results_b = morphogen_server::scan(&matrix_b, &delta_b, &keys_b, ROW_SIZE);
+    let results_a = morphogen_server::try_scan(&matrix_a, &delta_a, &keys_a, ROW_SIZE).unwrap();
+    let results_b = morphogen_server::try_scan(&matrix_b, &delta_b, &keys_b, ROW_SIZE).unwrap();
 
     let mut found_payload = false;
     for i in 0..3 {
@@ -250,8 +250,8 @@ fn e2e_full_client_server_flow() {
     let mut rng = rand::thread_rng();
     let query = generate_query(&mut rng, target_account, &metadata);
 
-    let results_a = morphogen_server::scan(&matrix_a, &delta_a, &query.keys_a, ROW_SIZE);
-    let results_b = morphogen_server::scan(&matrix_b, &delta_b, &query.keys_b, ROW_SIZE);
+    let results_a = morphogen_server::try_scan(&matrix_a, &delta_a, &query.keys_a, ROW_SIZE).unwrap();
+    let results_b = morphogen_server::try_scan(&matrix_b, &delta_b, &query.keys_b, ROW_SIZE).unwrap();
 
     let response_a = ServerResponse {
         epoch_id: metadata.epoch_id,

@@ -284,6 +284,7 @@ async fn handle_ws_epoch(mut socket: WebSocket, mut epoch_rx: watch::Receiver<Ep
 #[derive(Serialize)]
 pub struct WsQueryError {
     pub error: String,
+    pub code: String,
 }
 
 pub async fn ws_query_handler(
@@ -331,12 +332,11 @@ pub async fn page_query_handler(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
-    let chunk_size = 4096;
     let (results, epoch_id) = scan_pages_consistent(
         state.global.as_ref(),
         &keys,
         PAGE_SIZE_BYTES,
-        chunk_size,
+        PAGE_SIZE_BYTES, // Use page size as DPF chunk size for consistency
     )
     .map_err(scan_error_to_status)?;
 
@@ -346,11 +346,12 @@ pub async fn page_query_handler(
     }))
 }
 
-const WS_INTERNAL_ERROR: &str = r#"{"error":"internal server error"}"#;
+const WS_INTERNAL_ERROR: &str = r#"{"error":"internal server error","code":"internal_error"}"#;
 
-fn ws_error_json(error: &str) -> String {
+fn ws_error_json(error: &str, code: &str) -> String {
     serde_json::to_string(&WsQueryError {
         error: error.to_string(),
+        code: code.to_string(),
     })
     .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string())
 }
@@ -362,7 +363,7 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
     while let Some(Ok(msg)) = socket.recv().await {
         if let Message::Text(text) = msg {
             if text.len() > MAX_WS_MESSAGE_BYTES {
-                let error = ws_error_json("message too large");
+                let error = ws_error_json("message too large", "message_too_large");
                 let _ = socket.send(Message::Text(error.into())).await;
                 continue;
             }
@@ -391,14 +392,23 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
                                     })
                                     .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string())
                                 }
-                                Err(e) => ws_error_json(&format!("scan error: {}", e)),
+                                Err(e) => {
+                                    use crate::scan::ScanError;
+                                    let code = match e {
+                                        ScanError::TooManyRetries { .. } => "too_many_retries",
+                                        ScanError::LockPoisoned => "internal_error",
+                                        ScanError::MatrixNotAligned { .. } => "internal_error",
+                                        ScanError::ChunkNotAligned { .. } => "internal_error",
+                                    };
+                                    ws_error_json(&format!("scan error: {}", e), code)
+                                }
                             }
                         }
-                        _ => ws_error_json("invalid key format"),
+                        _ => ws_error_json("invalid key format", "bad_request"),
                     }
                 }
-                Ok(_) => ws_error_json("expected exactly 3 keys"),
-                Err(e) => ws_error_json(&e.to_string()),
+                Ok(_) => ws_error_json("expected exactly 3 keys", "bad_request"),
+                Err(e) => ws_error_json(&e.to_string(), "bad_request"),
             };
 
             if socket.send(Message::Text(response.into())).await.is_err() {

@@ -91,7 +91,13 @@ pub fn generate_page_query(
     account_key: &[u8],
     metadata: &PageEpochMetadata,
 ) -> Result<PageQueryKeys, PageDpfError> {
-    let num_rows = metadata.num_pages * ROWS_PER_PAGE;
+    let num_rows = metadata
+        .num_pages
+        .checked_mul(ROWS_PER_PAGE)
+        .ok_or(PageDpfError::InvalidDomainBits {
+            domain_bits: metadata.params.domain_bits,
+            reason: "num_pages * ROWS_PER_PAGE would overflow",
+        })?;
     let addresser = CuckooAddresser::with_seeds(num_rows, metadata.seeds);
     let row_positions = addresser.hash_indices(account_key);
 
