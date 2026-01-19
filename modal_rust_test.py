@@ -11,16 +11,14 @@ image = (
         "echo 'source $HOME/.cargo/env' >> $HOME/.bashrc",
     )
     .env({"PATH": "/root/.cargo/bin:$PATH"})
+    .add_local_dir(
+        ".",
+        remote_path="/root/morphogen",
+        ignore=["target", ".git", ".jj", "venv", "__pycache__", ".DS_Store", "crates/morphogen-gpu-dpf/target"]
+    )
 )
 
-# Mount only necessary files
-mount = modal.Mount.from_local_dir(
-    ".",
-    remote_path="/root/morphogen",
-    condition=lambda p: not any(x in p for x in ["target", ".git", ".jj", "venv", "__pycache__", ".DS_Store"]),
-)
-
-@app.function(image=image, gpu="T4", timeout=600, mounts=[mount])
+@app.function(image=image, gpu="T4", timeout=600)
 def test_gpu_integration():
     import subprocess
     import os

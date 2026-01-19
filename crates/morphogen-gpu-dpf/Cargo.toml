@@ -21,7 +21,7 @@ hex = "0.4"
 # Random number generation
 rand = "0.8"
 # Optional CUDA bindings
-cudarc = { version = "0.12", optional = true }
+cudarc = { version = "0.12", optional = true, features = ["cuda-version-from-build-system"] }
 # Bytemuck for safe transmutes
 bytemuck = { version = "1.14", features = ["derive"] }
 rayon = "1.11.0"

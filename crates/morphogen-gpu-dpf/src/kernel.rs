@@ -13,9 +13,10 @@
 
 use crate::chacha_prg::Seed128;
 use crate::dpf::ChaChaKey;
-use crate::storage::GpuPageMatrix;
 use rayon::prelude::*;
 
+#[cfg(feature = "cuda")]
+use crate::storage::GpuPageMatrix;
 #[cfg(feature = "cuda")]
 use crate::dpf::CorrectionWord;
 #[cfg(feature = "cuda")]
