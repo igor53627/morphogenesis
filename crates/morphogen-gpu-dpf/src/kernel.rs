@@ -13,6 +13,7 @@
 
 use crate::chacha_prg::Seed128;
 use crate::dpf::ChaChaKey;
+use rayon::prelude::*;
 
 /// Size of each page in bytes.
 pub const PAGE_SIZE_BYTES: usize = 4096;
@@ -54,9 +55,24 @@ fn xor_page_masked(acc: &mut [u8], page: &[u8], mask: &Seed128) {
     }
 }
 
+/// XOR source page into destination page.
+#[inline(always)]
+fn xor_pages(dest: &mut [u8], src: &[u8]) {
+    debug_assert_eq!(dest.len(), PAGE_SIZE_BYTES);
+    debug_assert_eq!(src.len(), PAGE_SIZE_BYTES);
+
+    let dest_seeds: &mut [Seed128] = bytemuck::cast_slice_mut(dest);
+    let src_seeds: &[Seed128] = bytemuck::cast_slice(src);
+
+    for (d, s) in dest_seeds.iter_mut().zip(src_seeds.iter()) {
+        *d = d.xor(s);
+    }
+}
+
 /// CPU reference implementation of fused 3-key PIR evaluation.
 ///
 /// Processes pages in tiles and evaluates all 3 DPF keys in a single pass.
+/// Uses Rayon for parallel processing.
 pub fn eval_fused_3dpf_cpu(
     keys: [&ChaChaKey; 3],
     pages: &[&[u8]],
@@ -76,50 +92,51 @@ pub fn eval_fused_3dpf_cpu(
 
     let start = std::time::Instant::now();
 
-    // Initialize accumulators
-    let mut acc0 = vec![0u8; PAGE_SIZE_BYTES];
-    let mut acc1 = vec![0u8; PAGE_SIZE_BYTES];
-    let mut acc2 = vec![0u8; PAGE_SIZE_BYTES];
-
-    let mut dpf_ns: u64 = 0;
-    let mut xor_ns: u64 = 0;
-
     // Process in tiles
     let num_tiles = (num_pages + SUBTREE_SIZE - 1) / SUBTREE_SIZE;
 
-    for tile in 0..num_tiles {
-        let tile_start = tile * SUBTREE_SIZE;
-        let tile_end = (tile_start + SUBTREE_SIZE).min(num_pages);
-        let current_tile_size = tile_end - tile_start;
+    let (acc0, acc1, acc2) = (0..num_tiles)
+        .into_par_iter()
+        .map(|tile| {
+            let mut acc0 = vec![0u8; PAGE_SIZE_BYTES];
+            let mut acc1 = vec![0u8; PAGE_SIZE_BYTES];
+            let mut acc2 = vec![0u8; PAGE_SIZE_BYTES];
+            
+            let tile_start = tile * SUBTREE_SIZE;
+            let tile_end = (tile_start + SUBTREE_SIZE).min(num_pages);
+            let current_tile_size = tile_end - tile_start;
 
-        // Evaluate DPF masks for this tile
-        let dpf_start = std::time::Instant::now();
+            // Pre-compute masks for all pages in tile using optimized O(SUBTREE_SIZE) expansion
+            let mut masks0 = vec![Seed128::ZERO; SUBTREE_SIZE];
+            let mut masks1 = vec![Seed128::ZERO; SUBTREE_SIZE];
+            let mut masks2 = vec![Seed128::ZERO; SUBTREE_SIZE];
 
-        // Pre-compute masks for all pages in tile using optimized O(SUBTREE_SIZE) expansion
-        let mut masks0 = vec![Seed128::ZERO; SUBTREE_SIZE];
-        let mut masks1 = vec![Seed128::ZERO; SUBTREE_SIZE];
-        let mut masks2 = vec![Seed128::ZERO; SUBTREE_SIZE];
+            // Note: error handling inside map is tricky, we panic for simplicity in this bench
+            keys[0].eval_subtree(tile_start, &mut masks0).expect("eval_subtree failed");
+            keys[1].eval_subtree(tile_start, &mut masks1).expect("eval_subtree failed");
+            keys[2].eval_subtree(tile_start, &mut masks2).expect("eval_subtree failed");
 
-        keys[0].eval_subtree(tile_start, &mut masks0).map_err(|_| "eval_subtree failed")?;
-        keys[1].eval_subtree(tile_start, &mut masks1).map_err(|_| "eval_subtree failed")?;
-        keys[2].eval_subtree(tile_start, &mut masks2).map_err(|_| "eval_subtree failed")?;
+            for i in 0..current_tile_size {
+                let page_idx = tile_start + i;
+                let page = pages[page_idx];
+                xor_page_masked(&mut acc0, page, &masks0[i]);
+                xor_page_masked(&mut acc1, page, &masks1[i]);
+                xor_page_masked(&mut acc2, page, &masks2[i]);
+            }
+            
+            (acc0, acc1, acc2)
+        })
+        .reduce(
+            || (vec![0u8; PAGE_SIZE_BYTES], vec![0u8; PAGE_SIZE_BYTES], vec![0u8; PAGE_SIZE_BYTES]),
+            |mut a, b| {
+                xor_pages(&mut a.0, &b.0);
+                xor_pages(&mut a.1, &b.1);
+                xor_pages(&mut a.2, &b.2);
+                a
+            }
+        );
 
-        dpf_ns += dpf_start.elapsed().as_nanos() as u64;
-
-        // Apply masks and accumulate
-        let xor_start = std::time::Instant::now();
-
-        for i in 0..current_tile_size {
-            let page_idx = tile_start + i;
-            let page = pages[page_idx];
-            xor_page_masked(&mut acc0, page, &masks0[i]);
-            xor_page_masked(&mut acc1, page, &masks1[i]);
-            xor_page_masked(&mut acc2, page, &masks2[i]);
-        }
-
-        xor_ns += xor_start.elapsed().as_nanos() as u64;
-    }
-
+    // Note: Timing is less granular with parallelism, we estimate based on total wall time
     let total_ns = start.elapsed().as_nanos() as u64;
 
     Ok(PirResult {
@@ -127,8 +144,8 @@ pub fn eval_fused_3dpf_cpu(
         page1: acc1,
         page2: acc2,
         timing: KernelTiming {
-            dpf_eval_ns: dpf_ns,
-            xor_accumulate_ns: xor_ns,
+            dpf_eval_ns: 0, // Not easily measured in parallel
+            xor_accumulate_ns: 0, 
             total_ns,
         },
     })
