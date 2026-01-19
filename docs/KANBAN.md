@@ -85,11 +85,9 @@ Critical fixes for production readiness:
   - 16-bit scan: **1.94ms** (was 28ms)
   - 25-bit projected: **1.0s** (was 14.4s)
   - Gap to <600ms target: **1.7x**
-- [ ] Phase 71h: Restore missing fused CUDA kernel from local cache - **IN PROGRESS**
-  - Implemented `cuda/fused_kernel.cu` with `fused_pir_kernel`
-  - Uses shared memory reduction (12KB) and global atomic XOR
-- [ ] Phase 71i: Compile CUDA kernel (ptx/cubin) via build.rs
-- [ ] Phase 71j: Integrate `cudarc` to launch kernel from Rust
+- [x] Phase 71h: Restore missing fused CUDA kernel from local cache - **DONE**
+- [x] Phase 71i: Compile CUDA kernel (ptx/cubin) via build.rs - **DONE**
+- [x] Phase 71j: Integrate `cudarc` to launch kernel from Rust - **DONE**
 
 **Phase 71d-e: CUDA Kernel Implementation (Jan 19, 2026) - COMPLETE**
 - [x] Phase 71d: CUDA kernel prototype
@@ -746,19 +744,11 @@ True GPU speedup requires custom CUDA implementation.
 - [ ] Phase 71e: Benchmark fused vs separate passes
   - Target: 10-20x over CPU (30-60 M/s)
 
-**Phase 72: GPU-Resident Database**
-- [ ] Phase 72a: Design GPU memory layout
-  - 108GB DB requires 2x H100 (80GB each) or 3x A100 (40GB each)
-  - Or: Keep hot pages in GPU, cold pages on CPU (tiered)
-- [ ] Phase 72b: Implement GPU page matrix
-  - Aligned allocation for coalesced memory access
-  - Page size = 4KB = 64 cache lines = good for GPU
+**Phase 72: GPU-Resident Database (Jan 19, 2026) - IN PROGRESS**
+- [x] Phase 72a: Design GPU memory layout (4KB pages, contiguous)
+- [x] Phase 72b: Implement `GpuPageMatrix` in `morphogen-gpu-dpf`
 - [ ] Phase 72c: Benchmark memory bandwidth
-  - H100 HBM3: 3.35 TB/s theoretical
-  - Target: 108GB in ~32ms (full scan)
-- [ ] Phase 72d: Epoch update strategy
-  - Delta buffer on CPU, batch upload to GPU
-  - Or: Dual-buffer swap for zero-copy updates
+- [x] Phase 72d: Epoch update strategy (selective dirty page upload in `EpochManager`)
 
 **Phase 73: Hardware AES on GPU**
 - [x] Phase 73a: Research GPU AES options - **RESOLVED (Not Viable)**

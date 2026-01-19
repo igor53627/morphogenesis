@@ -282,6 +282,8 @@ impl From<morphogen_core::DeltaError> for UpdateError {
 pub struct EpochManager {
     global: Arc<GlobalState>,
     pending: Arc<DeltaBuffer>,
+    #[cfg(feature = "cuda")]
+    gpu_matrix: Arc<Mutex<Option<morphogen_gpu_dpf::storage::GpuPageMatrix>>>,
     merge_lock: Mutex<()>,
 }
 
@@ -299,8 +301,21 @@ impl EpochManager {
         Ok(Self {
             global,
             pending: Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, initial_epoch)),
+            #[cfg(feature = "cuda")]
+            gpu_matrix: Arc::new(Mutex::new(None)),
             merge_lock: Mutex::new(()),
         })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn set_gpu_matrix(&self, matrix: morphogen_gpu_dpf::storage::GpuPageMatrix) {
+        let mut guard = self.gpu_matrix.lock().unwrap();
+        *guard = Some(matrix);
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn gpu_matrix(&self) -> Arc<Mutex<Option<morphogen_gpu_dpf::storage::GpuPageMatrix>>> {
+        Arc::clone(&self.gpu_matrix)
     }
 
     pub fn current(&self) -> Arc<EpochSnapshot> {
@@ -383,6 +398,37 @@ impl EpochManager {
             }
         };
         self.global.store(Arc::new(next));
+
+        #[cfg(feature = "cuda")]
+        {
+            let mut gpu_guard = self.gpu_matrix.lock().map_err(|_| MergeError::LockPoisoned)?;
+            if let Some(gpu_matrix) = gpu_guard.as_mut() {
+                let snapshot = self.global.load();
+                let chunk_size = snapshot.matrix.chunk_size_bytes();
+                let num_chunks = snapshot.matrix.num_chunks();
+                let dirty = collect_dirty_chunks_from_entries(
+                    &entries,
+                    self.pending.row_size_bytes(),
+                    chunk_size,
+                    num_chunks,
+                )?;
+
+                for (chunk_idx, &is_dirty) in dirty.iter().enumerate() {
+                    if is_dirty {
+                        let chunk = snapshot.matrix.chunk(chunk_idx);
+                        let start_byte = chunk_idx * chunk_size;
+                        let start_page =
+                            start_byte / morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+                        if let Err(e) = gpu_matrix.update_pages(start_page, chunk.as_slice()) {
+                            eprintln!("GPU update failed for chunk {}: {:?}", chunk_idx, e);
+                            // We don't fail the whole advance because CPU is already updated,
+                            // but this signals a serious inconsistency.
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(next_epoch_id)
     }
 

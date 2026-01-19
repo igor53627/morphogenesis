@@ -20,6 +20,7 @@ pub extern crate cudarc;
 pub mod chacha_prg;
 pub mod dpf;
 pub mod kernel;
+pub mod storage;
 
 pub use chacha_prg::{ChaCha8Prg, PrgOutput};
 pub use dpf::{ChaChaKey, ChaChaParams, GpuDpfError};

@@ -13,6 +13,7 @@
 
 use crate::chacha_prg::Seed128;
 use crate::dpf::ChaChaKey;
+use crate::storage::GpuPageMatrix;
 use rayon::prelude::*;
 
 #[cfg(feature = "cuda")]
@@ -110,10 +111,11 @@ impl GpuScanner {
     /// Execute a fused PIR scan on the GPU.
     pub unsafe fn scan(
         &self,
-        db_pages: &CudaSlice<u8>,
+        db: &GpuPageMatrix,
         keys: [&ChaChaKey; 3],
-        num_pages: usize,
     ) -> Result<PirResult, cudarc::driver::DriverError> {
+        let num_pages = db.num_pages();
+        let db_pages = db.as_slice();
         let start = std::time::Instant::now();
 
         // 1. Prepare keys in constant memory

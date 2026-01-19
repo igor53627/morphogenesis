@@ -6,6 +6,7 @@
  [dependencies]
  morphogen-core = { path = "../morphogen-core" }
  morphogen-dpf = { path = "../morphogen-dpf", features = ["fss"] }
+ morphogen-gpu-dpf = { path = "../morphogen-gpu-dpf", optional = true }
  morphogen-storage = { path = "../morphogen-storage" }
  rayon = "1.10"
  rand = "0.8"
@@ -30,6 +31,7 @@
  [features]
  default = []
  avx512 = ["morphogen-dpf/avx512"]
+ cuda = ["dep:morphogen-gpu-dpf", "morphogen-gpu-dpf/cuda"]
  profiling = []
  streaming_stores = []
  parallel = []
