@@ -351,8 +351,16 @@ Need proper 2-server FSS/DPF where keys are computationally indistinguishable.
   - Added PageQueryRequest, PageQueryResponse structs
   - Added PagePirConfig to AppState (optional, for dual-mode support)
   - Updated all test fixtures with page_config: None
-- [ ] Phase 61c: Add page-level scan function (scan_pages_chunked)
-- [ ] Phase 61d: Wire up page query handler (POST /query/page)
+- [x] Phase 61c: Add page-level scan function (scan_pages_chunked)
+  - scan_pages_chunked(): evaluates 3 PageDpfKeys over page matrix
+  - scan_pages_consistent(): epoch-consistent version with retry loop
+  - Uses eval_and_accumulate_chunked for O(chunk_size) memory
+  - Test verifies 2-server XOR recovers correct target page
+- [x] Phase 61d: Wire up page query handler (POST /query/page)
+  - page_query_handler(): parses 3 PageDpfKeys, calls scan_pages_consistent
+  - Returns 404 when page_config is None (page PIR disabled)
+  - Validates domain_bits matches server config
+  - Returns PageQueryResponse with epoch_id and 3 page payloads (4KB each)
 - [ ] Phase 61e: Update client library for page-level queries
 - [ ] Phase 61f: Reorganize data as pages (migration)
 

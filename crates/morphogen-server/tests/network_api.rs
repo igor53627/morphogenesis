@@ -514,6 +514,198 @@ mod websocket_epoch {
     }
 }
 
+mod page_query {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Method, Request, StatusCode};
+    use morphogen_dpf::page::{generate_page_dpf_keys, PageDpfParams, PAGE_SIZE_BYTES};
+    use morphogen_server::network::PagePirConfig;
+    use tower::util::ServiceExt;
+
+    fn test_state_with_pages() -> (Arc<AppState>, PageDpfParams) {
+        let row_size_bytes = 256;
+        let num_pages = 256; // 8-bit domain
+        let page_size = PAGE_SIZE_BYTES; // 4096 bytes
+        let total_size = num_pages * page_size;
+        let matrix = Arc::new(ChunkedMatrix::new(total_size, 1024 * 1024));
+
+        // Fill pages with identifiable data
+        for page_idx in 0..num_pages {
+            let chunk_idx = 0;
+            let chunk = matrix.chunk(chunk_idx);
+            let start = page_idx * page_size;
+            let slice = &chunk.as_slice()[start..start + page_size];
+            // SAFETY: we need mutable access - use unsafe interior mutability
+            let slice_ptr = slice.as_ptr() as *mut u8;
+            unsafe {
+                std::slice::from_raw_parts_mut(slice_ptr, page_size)
+                    .fill(page_idx as u8);
+            }
+        }
+
+        let snapshot = EpochSnapshot {
+            epoch_id: 42,
+            matrix,
+        };
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
+
+        let params = PageDpfParams::new(8).unwrap();
+        let page_config = PagePirConfig {
+            rows_per_page: 16,
+            domain_bits: 8,
+            prg_keys: params.prg_keys,
+        };
+
+        let initial = EpochMetadata {
+            epoch_id: 42,
+            num_rows: num_pages * 16,
+            seeds: [0x1234, 0x5678, 0x9ABC],
+            block_number: 12345678,
+            state_root: [0xAB; 32],
+        };
+        let (_tx, rx) = watch::channel(initial);
+        let state = Arc::new(AppState {
+            global,
+            pending,
+            row_size_bytes,
+            num_rows: num_pages * 16,
+            seeds: [0x1234, 0x5678, 0x9ABC],
+            block_number: 12345678,
+            state_root: [0xAB; 32],
+            epoch_rx: rx,
+            page_config: Some(page_config),
+        });
+        (state, params)
+    }
+
+    fn test_page_dpf_keys(params: &PageDpfParams, target_page: usize) -> String {
+        let (k0, _k1) = generate_page_dpf_keys(params, target_page).unwrap();
+        // For single-server test, we use same key 3 times
+        let hex0 = format!("0x{}", hex::encode(k0.to_bytes()));
+        let hex1 = format!("0x{}", hex::encode(k0.to_bytes()));
+        let hex2 = format!("0x{}", hex::encode(k0.to_bytes()));
+        format!(r#"{{"keys":["{hex0}","{hex1}","{hex2}"]}}"#)
+    }
+
+    #[tokio::test]
+    async fn page_query_returns_404_when_disabled() {
+        let app = create_router(test_state()); // page_config: None
+
+        let body = r#"{"keys":["0xaa","0xbb","0xcc"]}"#;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query/page")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn page_query_accepts_three_keys() {
+        let (state, params) = test_state_with_pages();
+        let app = create_router(state);
+        let body = test_page_dpf_keys(&params, 42);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query/page")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn page_query_rejects_wrong_key_count() {
+        let (state, params) = test_state_with_pages();
+        let app = create_router(state);
+        let (k0, _) = generate_page_dpf_keys(&params, 0).unwrap();
+        let hex0 = format!("0x{}", hex::encode(k0.to_bytes()));
+        let body = format!(r#"{{"keys":["{hex0}","{hex0}"]}}"#); // only 2 keys
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query/page")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn page_query_returns_three_pages() {
+        let (state, params) = test_state_with_pages();
+        let app = create_router(state);
+        let body = test_page_dpf_keys(&params, 42);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query/page")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = axum::body::to_bytes(response.into_body(), 32768)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(json["epoch_id"], 42);
+        let pages = json["pages"].as_array().unwrap();
+        assert_eq!(pages.len(), 3);
+        // Each page should be PAGE_SIZE_BYTES * 2 hex chars + "0x" prefix
+        let expected_hex_len = 2 + PAGE_SIZE_BYTES * 2;
+        assert_eq!(pages[0].as_str().unwrap().len(), expected_hex_len);
+    }
+
+    #[tokio::test]
+    async fn page_query_rejects_invalid_key_format() {
+        let (state, _params) = test_state_with_pages();
+        let app = create_router(state);
+        // Send invalid key (wrong length)
+        let body = r#"{"keys":["0xaabbcc","0xddeeff","0x112233"]}"#;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query/page")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
 mod websocket_query {
     use super::*;
     use futures_util::{SinkExt, StreamExt};

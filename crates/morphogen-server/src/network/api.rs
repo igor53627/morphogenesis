@@ -249,6 +249,51 @@ pub async fn ws_query_handler(
     ws.on_upgrade(move |socket| handle_ws_query(socket, state))
 }
 
+pub async fn page_query_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PageQueryRequest>,
+) -> Result<Json<PageQueryResponse>, StatusCode> {
+    use crate::scan::scan_pages_consistent;
+    use morphogen_dpf::page::{PageDpfKey, PAGE_SIZE_BYTES};
+
+    let page_config = state.page_config.as_ref().ok_or(StatusCode::NOT_FOUND)?;
+
+    if request.keys.len() != 3 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let keys: [PageDpfKey; 3] = match (
+        PageDpfKey::from_bytes(&request.keys[0]),
+        PageDpfKey::from_bytes(&request.keys[1]),
+        PageDpfKey::from_bytes(&request.keys[2]),
+    ) {
+        (Ok(k0), Ok(k1), Ok(k2)) => {
+            if k0.domain_bits() != page_config.domain_bits
+                || k1.domain_bits() != page_config.domain_bits
+                || k2.domain_bits() != page_config.domain_bits
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            [k0, k1, k2]
+        }
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    let chunk_size = 4096;
+    let (results, epoch_id) = scan_pages_consistent(
+        state.global.as_ref(),
+        &keys,
+        PAGE_SIZE_BYTES,
+        chunk_size,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(PageQueryResponse {
+        epoch_id,
+        pages: results.to_vec(),
+    }))
+}
+
 async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
     use crate::scan::scan_consistent;
     use morphogen_dpf::AesDpfKey;
@@ -312,6 +357,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health_handler))
         .route("/epoch", get(epoch_handler))
         .route("/query", post(query_handler))
+        .route("/query/page", post(page_query_handler))
         .route("/ws/epoch", get(ws_epoch_handler))
         .route("/ws/query", get(ws_query_handler))
         .with_state(state)

@@ -167,6 +167,107 @@ fn xor_into(dest: &mut [u8], src: &[u8]) {
     }
 }
 
+/// Page-level PIR scan using privacy-preserving DPF.
+///
+/// Unlike row-level scan, this uses proper 2-server DPF where servers
+/// cannot determine which page is being queried.
+///
+/// # Arguments
+/// * `matrix` - Page data stored contiguously (page_size_bytes per page)
+/// * `keys` - 3 PageDpfKeys (for Cuckoo addressing)
+/// * `page_size_bytes` - Size of each page (typically 4096)
+/// * `chunk_size` - DPF evaluation chunk size (e.g., 4096 for 64KB buffer)
+///
+/// # Returns
+/// 3 page payloads that client XORs with other server's response
+///
+/// # Note
+/// Pages must not span chunk boundaries. The chunk_size_bytes should be
+/// a multiple of page_size_bytes.
+pub fn scan_pages_chunked(
+    matrix: &ChunkedMatrix,
+    keys: &[morphogen_dpf::page::PageDpfKey; 3],
+    page_size_bytes: usize,
+    dpf_chunk_size: usize,
+) -> [Vec<u8>; 3] {
+    if page_size_bytes == 0 {
+        return [vec![], vec![], vec![]];
+    }
+
+    let mut page_refs: Vec<&[u8]> = Vec::new();
+
+    for chunk_idx in 0..matrix.num_chunks() {
+        let chunk = matrix.chunk(chunk_idx);
+        let chunk_len = matrix.chunk_size(chunk_idx);
+        let pages_in_chunk = chunk_len / page_size_bytes;
+        let chunk_slice = chunk.as_slice();
+
+        for p in 0..pages_in_chunk {
+            let start = p * page_size_bytes;
+            let end = start + page_size_bytes;
+            page_refs.push(&chunk_slice[start..end]);
+        }
+    }
+
+    let results: [Vec<u8>; 3] = std::array::from_fn(|i| {
+        keys[i].eval_and_accumulate_chunked(&page_refs, dpf_chunk_size)
+    });
+
+    results
+}
+
+/// Page-level PIR scan with epoch consistency.
+///
+/// Ensures the scan sees a consistent view even during epoch transitions.
+pub fn scan_pages_consistent(
+    global: &GlobalState,
+    keys: &[morphogen_dpf::page::PageDpfKey; 3],
+    page_size_bytes: usize,
+    chunk_size: usize,
+) -> Result<([Vec<u8>; 3], u64), ScanError> {
+    scan_pages_consistent_with_max_retries(
+        global,
+        keys,
+        page_size_bytes,
+        chunk_size,
+        DEFAULT_MAX_RETRIES,
+    )
+}
+
+/// Page-level PIR scan with configurable retry limit.
+pub fn scan_pages_consistent_with_max_retries(
+    global: &GlobalState,
+    keys: &[morphogen_dpf::page::PageDpfKey; 3],
+    page_size_bytes: usize,
+    chunk_size: usize,
+    max_retries: usize,
+) -> Result<([Vec<u8>; 3], u64), ScanError> {
+    for attempt in 0..max_retries {
+        let snapshot1 = global.load();
+        let epoch1 = snapshot1.epoch_id;
+
+        let snapshot2 = global.load();
+        if snapshot2.epoch_id == epoch1 {
+            let results = scan_pages_chunked(
+                snapshot1.matrix.as_ref(),
+                keys,
+                page_size_bytes,
+                chunk_size,
+            );
+            return Ok((results, epoch1));
+        }
+
+        if attempt < 10 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
+    Err(ScanError::TooManyRetries {
+        attempts: max_retries,
+    })
+}
+
 #[cfg(feature = "parallel")]
 pub fn scan_consistent_parallel<K: DpfKey + Sync>(
     global: &GlobalState,
@@ -1285,6 +1386,55 @@ mod concurrency_tests {
         assert_eq!(
             final_epoch, 1,
             "matrix epoch should be 1 after merge completes"
+        );
+    }
+
+    #[test]
+    fn scan_pages_chunked_returns_correct_page() {
+        use super::scan_pages_chunked;
+        use morphogen_dpf::page::{
+            generate_page_dpf_keys, xor_pages, PageDpfParams, PAGE_SIZE_BYTES,
+        };
+
+        let num_pages = 256;
+        let page_size = PAGE_SIZE_BYTES;
+        let total_size = num_pages * page_size;
+
+        let mut matrix = ChunkedMatrix::new(total_size, total_size);
+        for p in 0..num_pages {
+            let mut page_data = vec![0u8; page_size];
+            page_data.fill(p as u8);
+            matrix.write_row(p, page_size, &page_data);
+        }
+
+        let matrix = Arc::new(matrix);
+        let snapshot = EpochSnapshot {
+            epoch_id: 0,
+            matrix,
+        };
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+
+        let params = PageDpfParams::new(8).unwrap();
+        let target_page = 42;
+
+        let (k0_0, k0_1) = generate_page_dpf_keys(&params, target_page).unwrap();
+        let (k1_0, k1_1) = generate_page_dpf_keys(&params, 100).unwrap();
+        let (k2_0, k2_1) = generate_page_dpf_keys(&params, 200).unwrap();
+
+        let keys_server0 = [k0_0, k1_0, k2_0];
+        let keys_server1 = [k0_1, k1_1, k2_1];
+
+        let results0 = scan_pages_chunked(global.load().matrix.as_ref(), &keys_server0, page_size, 64);
+        let results1 = scan_pages_chunked(global.load().matrix.as_ref(), &keys_server1, page_size, 64);
+
+        let mut page_result = vec![0u8; page_size];
+        xor_pages(&results0[0], &results1[0], &mut page_result);
+
+        assert!(
+            page_result.iter().all(|&b| b == target_page as u8),
+            "Expected page filled with {}, got {:?}",
+            target_page,
+            &page_result[..8]
         );
     }
 }
