@@ -89,6 +89,12 @@ Critical fixes for production readiness:
   - Added hex_bytes_array serde module for [[u8; 16]; 2] serialization
   - Tests: epoch_excludes_page_pir_when_disabled, epoch_includes_page_pir_when_enabled
 
+- [x] Phase 61g: Validate full PageDpfKey params (MEDIUM)
+  - Added prg_keys() method to PageDpfKey to access embedded PRG keys
+  - page_query_handler now validates PRG keys match server config
+  - Prevents silent wrong answers from parameter mismatch
+  - Test: page_query_rejects_mismatched_prg_keys
+
 ---
 
 ## [TODO]
@@ -271,10 +277,10 @@ Security, correctness, and performance findings:
   - Current /epoch only returns row-level metadata
   - Add page_config fields when page_config.is_some()
 
-- [ ] Phase 61g: Validate full PageDpfKey params (MEDIUM)
-  - Only domain_bits checked, not PRG keys or page layout
-  - Add params_id or prg_keys_hash validation
-  - Prevent silent wrong answers from param mismatch
+- [x] Phase 61g: Validate full PageDpfKey params (MEDIUM)
+  - Added prg_keys() method to PageDpfKey
+  - page_query_handler validates PRG keys match server config
+  - Prevents silent wrong answers from param mismatch
 
 **Consistency (LOW-MEDIUM):**
 - [ ] Phase 62: Add error codes to WS responses (LOW)

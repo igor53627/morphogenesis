@@ -312,9 +312,17 @@ pub async fn page_query_handler(
         PageDpfKey::from_bytes(&request.keys[2]),
     ) {
         (Ok(k0), Ok(k1), Ok(k2)) => {
+            // Validate domain_bits matches server config
             if k0.domain_bits() != page_config.domain_bits
                 || k1.domain_bits() != page_config.domain_bits
                 || k2.domain_bits() != page_config.domain_bits
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            // Validate PRG keys match server config (prevents silent wrong answers)
+            if k0.prg_keys() != &page_config.prg_keys
+                || k1.prg_keys() != &page_config.prg_keys
+                || k2.prg_keys() != &page_config.prg_keys
             {
                 return Err(StatusCode::BAD_REQUEST);
             }

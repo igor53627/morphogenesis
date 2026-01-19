@@ -328,6 +328,14 @@ impl PageDpfKey {
         self.params.domain_bits
     }
 
+    /// Returns the PRG keys embedded in this DPF key.
+    ///
+    /// Servers should validate these match their configuration to prevent
+    /// silent incorrect results from parameter mismatch.
+    pub fn prg_keys(&self) -> &[[u8; 16]; 2] {
+        &self.params.prg_keys
+    }
+
     pub fn full_eval(&self, output: &mut [ByteGroup<16>]) -> Result<(), PageDpfError> {
         let expected = self.params.max_pages();
         if output.len() != expected {

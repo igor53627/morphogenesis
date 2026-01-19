@@ -798,6 +798,73 @@ mod page_query {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn page_query_rejects_mismatched_prg_keys() {
+        // Create state with one set of PRG keys
+        let row_size_bytes = 256;
+        let num_pages = 256;
+        let page_size = PAGE_SIZE_BYTES;
+        let total_size = num_pages * page_size;
+        let matrix = Arc::new(ChunkedMatrix::new(total_size, 1024 * 1024));
+
+        let snapshot = EpochSnapshot {
+            epoch_id: 42,
+            matrix,
+        };
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
+
+        // Server uses these PRG keys
+        let server_prg_keys = [[0xAA; 16], [0xBB; 16]];
+        let page_config = PagePirConfig {
+            rows_per_page: 16,
+            domain_bits: 8,
+            prg_keys: server_prg_keys,
+        };
+
+        let initial = EpochMetadata {
+            epoch_id: 42,
+            num_rows: num_pages * 16,
+            seeds: [0x1234, 0x5678, 0x9ABC],
+            block_number: 12345678,
+            state_root: [0xAB; 32],
+        };
+        let (_tx, rx) = watch::channel(initial);
+        let state = Arc::new(AppState {
+            global,
+            pending,
+            row_size_bytes,
+            num_rows: num_pages * 16,
+            seeds: [0x1234, 0x5678, 0x9ABC],
+            block_number: 12345678,
+            state_root: [0xAB; 32],
+            epoch_rx: rx,
+            page_config: Some(page_config),
+        });
+
+        // Client generates keys with DIFFERENT PRG keys
+        let client_params = PageDpfParams::new(8).unwrap(); // Random PRG keys
+        let (k0, _k1) = generate_page_dpf_keys(&client_params, 42).unwrap();
+        let hex0 = format!("0x{}", hex::encode(k0.to_bytes()));
+        let body = format!(r#"{{"keys":["{hex0}","{hex0}","{hex0}"]}}"#);
+
+        let app = create_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query/page")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should reject because PRG keys don't match server config
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }
 
 mod websocket_query {
