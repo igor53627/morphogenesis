@@ -385,3 +385,149 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "fss"))]
+mod fss_tests {
+    #[allow(unused_imports)]
+    use super::*;
+
+    // fss-rs PRG parameters:
+    // Aes128MatyasMeyerOseasPrg<OUT_BLEN, OUT_BLEN_N, CIPHER_N>
+    // - OUT_BLEN: output byte length (must match DPF OUT_BLEN, must be multiple of 16)
+    // - OUT_BLEN_N: must be 1 for DPF (DpfImpl requires Prg<OUT_BLEN, 1>)
+    // - CIPHER_N: (OUT_BLEN / 16) * OUT_BLEN_N * 2 = (16/16) * 1 * 2 = 2
+    //
+    // For 16-byte output: OUT_BLEN=16, OUT_BLEN_N=1, CIPHER_N=2
+
+    #[test]
+    fn fss_rs_dpf_pair_xor_to_point_function() {
+        use fss_rs::dpf::{Dpf, DpfImpl, PointFn};
+        use fss_rs::group::byte::ByteGroup;
+        use fss_rs::group::Group;
+        use fss_rs::prg::Aes128MatyasMeyerOseasPrg;
+
+        // Create PRG: 16-byte output, 1 chunk (required for DPF), 2 ciphers
+        let prg_keys: [[u8; 16]; 2] = rand::random();
+        let prg =
+            Aes128MatyasMeyerOseasPrg::<16, 1, 2>::new(&std::array::from_fn(|i| &prg_keys[i]));
+
+        // Create DPF: 2-byte input domain (64K rows), 16-byte output
+        let dpf = DpfImpl::<2, 16, _>::new(prg);
+
+        // Target index (as 2-byte big-endian)
+        let target: u16 = 42;
+        let alpha = target.to_be_bytes();
+
+        // Output value at target (all 0xFF)
+        let beta = ByteGroup([0xFF; 16]);
+
+        let point_fn = PointFn { alpha, beta };
+
+        // Generate key pair
+        let s0s: [[u8; 16]; 2] = rand::random();
+        let share = dpf.gen(&point_fn, [&s0s[0], &s0s[1]]);
+
+        // Create per-party shares (share0 has s0s[0], share1 has s0s[1])
+        use fss_rs::Share;
+        let k0 = Share {
+            s0s: vec![share.s0s[0]],
+            cws: share.cws.clone(),
+            cw_np1: share.cw_np1.clone(),
+        };
+        let k1 = Share {
+            s0s: vec![share.s0s[1]],
+            cws: share.cws.clone(),
+            cw_np1: share.cw_np1.clone(),
+        };
+
+        // Evaluate both shares at target and non-target
+        let mut y0_target = ByteGroup::zero();
+        let mut y1_target = ByteGroup::zero();
+        let mut y0_other = ByteGroup::zero();
+        let mut y1_other = ByteGroup::zero();
+
+        dpf.eval(false, &k0, &[&alpha], &mut [&mut y0_target]);
+        dpf.eval(true, &k1, &[&alpha], &mut [&mut y1_target]);
+
+        let other: [u8; 2] = (100u16).to_be_bytes();
+        dpf.eval(false, &k0, &[&other], &mut [&mut y0_other]);
+        dpf.eval(true, &k1, &[&other], &mut [&mut y1_other]);
+
+        // XOR the shares
+        let mut xor_target = [0u8; 16];
+        let mut xor_other = [0u8; 16];
+        for i in 0..16 {
+            xor_target[i] = y0_target.0[i] ^ y1_target.0[i];
+            xor_other[i] = y0_other.0[i] ^ y1_other.0[i];
+        }
+
+        assert_eq!(xor_target, [0xFF; 16], "XOR at target should be all 0xFF");
+        assert_eq!(
+            xor_other, [0x00; 16],
+            "XOR at non-target should be all 0x00"
+        );
+    }
+
+    #[test]
+    fn fss_rs_dpf_full_eval_correctness() {
+        use fss_rs::dpf::{Dpf, DpfImpl, PointFn};
+        use fss_rs::group::byte::ByteGroup;
+        use fss_rs::group::Group;
+        use fss_rs::prg::Aes128MatyasMeyerOseasPrg;
+
+        // 1-byte domain = 256 rows, 16-byte output
+        let prg_keys: [[u8; 16]; 2] = rand::random();
+        let prg =
+            Aes128MatyasMeyerOseasPrg::<16, 1, 2>::new(&std::array::from_fn(|i| &prg_keys[i]));
+        let dpf = DpfImpl::<1, 16, _>::new(prg);
+
+        let target: u8 = 42;
+        let alpha = [target];
+        let beta = ByteGroup([0xFF; 16]);
+        let point_fn = PointFn { alpha, beta };
+
+        let s0s: [[u8; 16]; 2] = rand::random();
+        let share = dpf.gen(&point_fn, [&s0s[0], &s0s[1]]);
+
+        // Create per-party shares
+        use fss_rs::Share;
+        let k0 = Share {
+            s0s: vec![share.s0s[0]],
+            cws: share.cws.clone(),
+            cw_np1: share.cw_np1.clone(),
+        };
+        let k1 = Share {
+            s0s: vec![share.s0s[1]],
+            cws: share.cws.clone(),
+            cw_np1: share.cw_np1.clone(),
+        };
+
+        // Full domain evaluation
+        let mut ys0: Vec<ByteGroup<16>> = vec![ByteGroup::zero(); 256];
+        let mut ys1: Vec<ByteGroup<16>> = vec![ByteGroup::zero(); 256];
+
+        // API expects &mut [&mut G], so we need refs
+        let mut ys0_refs: Vec<&mut ByteGroup<16>> = ys0.iter_mut().collect();
+        let mut ys1_refs: Vec<&mut ByteGroup<16>> = ys1.iter_mut().collect();
+
+        dpf.full_eval(false, &k0, &mut ys0_refs);
+        dpf.full_eval(true, &k1, &mut ys1_refs);
+
+        // Check XOR at all positions
+        for i in 0..256 {
+            let mut xor = [0u8; 16];
+            for j in 0..16 {
+                xor[j] = ys0[i].0[j] ^ ys1[i].0[j];
+            }
+            if i == target as usize {
+                assert_eq!(xor, [0xFF; 16], "XOR at target {} should be all 0xFF", i);
+            } else {
+                assert_eq!(
+                    xor, [0x00; 16],
+                    "XOR at non-target {} should be all 0x00",
+                    i
+                );
+            }
+        }
+    }
+}

@@ -10,6 +10,15 @@
  [features]
  default = []
  avx512 = []
+ fss = ["dep:fss-rs"]
 
  [dependencies]
  rand = "0.8"
+ fss-rs = { version = "0.6", optional = true, features = ["stable"] }
+
+ [dev-dependencies]
+ criterion = "0.5"
+
+ [[bench]]
+ name = "dpf_bench"
+ harness = false

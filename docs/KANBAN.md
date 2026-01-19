@@ -299,10 +299,14 @@ Need proper 2-server FSS/DPF where keys are computationally indistinguishable.
 - Acceptable if "which page" leakage is tolerable
 
 **Tasks:**
-- [ ] Evaluate fss-rs full_eval performance on 250M domain
-- [ ] Benchmark fss-rs vs current dummy DPF
-- [ ] Design page/bucket fallback if fss-rs too slow
-- [ ] Integration plan for replacing AesDpfKey
+- [x] Phase 57: Add fss-rs dependency and basic integration test
+  - Added fss-rs v0.6 with "stable" feature
+  - Tests verify DPF pair XOR to point function
+  - Tests verify full_eval correctness (256 rows)
+- [ ] Phase 58: Benchmark fss-rs full_eval vs current AesDpfKey
+- [ ] Phase 59: Measure overhead at different domain sizes (100K, 1M, 10M)
+- [ ] Phase 60: Design page/bucket fallback if fss-rs too slow
+- [ ] Phase 61: Integration plan for replacing AesDpfKey
 
 ---
 
