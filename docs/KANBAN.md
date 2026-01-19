@@ -331,6 +331,14 @@ Security, correctness, and performance findings:
 - [ ] Epoch transition under load
 - [ ] Memory leak detection
 
+### Privacy Hardening
+- [ ] Rotate Cuckoo seeds on epoch advance
+  - Currently seeds are static (set at server startup)
+  - Same account → same page forever (linkability risk)
+  - Fix: Generate new random seeds in EpochManager::try_advance()
+  - Requires Cuckoo table rebuild on epoch rollover
+  - Trade-off: Rebuild cost vs privacy benefit (consider every N epochs)
+
 ### Production Hardening
 - [ ] Error handling and recovery
 - [ ] Logging and observability
