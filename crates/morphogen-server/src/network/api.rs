@@ -175,6 +175,16 @@ pub async fn epoch_handler(State(state): State<Arc<AppState>>) -> Json<EpochMeta
     })
 }
 
+fn scan_error_to_status(e: crate::scan::ScanError) -> StatusCode {
+    use crate::scan::ScanError;
+    match e {
+        ScanError::TooManyRetries { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        ScanError::LockPoisoned
+        | ScanError::MatrixNotAligned { .. }
+        | ScanError::ChunkNotAligned { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
 pub async fn query_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<QueryRequest>,
@@ -202,10 +212,7 @@ pub async fn query_handler(
         &keys,
         state.row_size_bytes,
     )
-    .map_err(|e| match e {
-        crate::scan::ScanError::TooManyRetries { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        crate::scan::ScanError::LockPoisoned => StatusCode::INTERNAL_SERVER_ERROR,
-    })?;
+    .map_err(scan_error_to_status)?;
 
     Ok(Json(QueryResponse {
         epoch_id,
@@ -288,10 +295,7 @@ pub async fn page_query_handler(
         PAGE_SIZE_BYTES,
         chunk_size,
     )
-    .map_err(|e| match e {
-        crate::scan::ScanError::TooManyRetries { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        crate::scan::ScanError::LockPoisoned => StatusCode::INTERNAL_SERVER_ERROR,
-    })?;
+    .map_err(scan_error_to_status)?;
 
     Ok(Json(PageQueryResponse {
         epoch_id,

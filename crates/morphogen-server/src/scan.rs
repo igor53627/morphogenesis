@@ -8,6 +8,17 @@ pub const DEFAULT_MAX_RETRIES: usize = 1000;
 pub enum ScanError {
     LockPoisoned,
     TooManyRetries { attempts: usize },
+    MatrixNotAligned {
+        total_bytes: usize,
+        unit_size: usize,
+        remainder: usize,
+    },
+    ChunkNotAligned {
+        chunk_idx: usize,
+        chunk_bytes: usize,
+        unit_size: usize,
+        remainder: usize,
+    },
 }
 
 impl std::fmt::Display for ScanError {
@@ -16,6 +27,29 @@ impl std::fmt::Display for ScanError {
             ScanError::LockPoisoned => write!(f, "lock poisoned during scan"),
             ScanError::TooManyRetries { attempts } => {
                 write!(f, "scan failed after {} retry attempts", attempts)
+            }
+            ScanError::MatrixNotAligned {
+                total_bytes,
+                unit_size,
+                remainder,
+            } => {
+                write!(
+                    f,
+                    "matrix size {} not aligned to {} bytes (remainder: {})",
+                    total_bytes, unit_size, remainder
+                )
+            }
+            ScanError::ChunkNotAligned {
+                chunk_idx,
+                chunk_bytes,
+                unit_size,
+                remainder,
+            } => {
+                write!(
+                    f,
+                    "chunk {} size {} not aligned to {} bytes (remainder: {})",
+                    chunk_idx, chunk_bytes, unit_size, remainder
+                )
             }
         }
     }
@@ -181,24 +215,35 @@ fn xor_into(dest: &mut [u8], src: &[u8]) {
 /// # Returns
 /// 3 page payloads that client XORs with other server's response
 ///
-/// # Note
-/// Pages must not span chunk boundaries. The chunk_size_bytes should be
-/// a multiple of page_size_bytes.
-pub fn scan_pages_chunked(
+/// # Errors
+/// Returns `ScanError::ChunkNotAligned` if any chunk is not page-aligned.
+pub fn try_scan_pages_chunked(
     matrix: &ChunkedMatrix,
     keys: &[morphogen_dpf::page::PageDpfKey; 3],
     page_size_bytes: usize,
     dpf_chunk_size: usize,
-) -> [Vec<u8>; 3] {
+) -> Result<[Vec<u8>; 3], ScanError> {
     if page_size_bytes == 0 {
-        return [vec![], vec![], vec![]];
+        return Ok([vec![], vec![], vec![]]);
     }
 
-    let mut page_refs: Vec<&[u8]> = Vec::new();
+    let total_pages = matrix.total_size_bytes() / page_size_bytes;
+    let mut page_refs: Vec<&[u8]> = Vec::with_capacity(total_pages);
 
     for chunk_idx in 0..matrix.num_chunks() {
         let chunk = matrix.chunk(chunk_idx);
         let chunk_len = matrix.chunk_size(chunk_idx);
+        let remainder = chunk_len % page_size_bytes;
+
+        if remainder != 0 {
+            return Err(ScanError::ChunkNotAligned {
+                chunk_idx,
+                chunk_bytes: chunk_len,
+                unit_size: page_size_bytes,
+                remainder,
+            });
+        }
+
         let pages_in_chunk = chunk_len / page_size_bytes;
         let chunk_slice = chunk.as_slice();
 
@@ -213,7 +258,19 @@ pub fn scan_pages_chunked(
         keys[i].eval_and_accumulate_chunked(&page_refs, dpf_chunk_size)
     });
 
-    results
+    Ok(results)
+}
+
+/// Page-level PIR scan (panics on alignment error - prefer try_scan_pages_chunked)
+#[cfg(test)]
+pub fn scan_pages_chunked(
+    matrix: &ChunkedMatrix,
+    keys: &[morphogen_dpf::page::PageDpfKey; 3],
+    page_size_bytes: usize,
+    dpf_chunk_size: usize,
+) -> [Vec<u8>; 3] {
+    try_scan_pages_chunked(matrix, keys, page_size_bytes, dpf_chunk_size)
+        .expect("matrix not page-aligned")
 }
 
 /// Page-level PIR scan with epoch consistency.
@@ -248,12 +305,12 @@ pub fn scan_pages_consistent_with_max_retries(
 
         let snapshot2 = global.load();
         if snapshot2.epoch_id == epoch1 {
-            let results = scan_pages_chunked(
+            let results = try_scan_pages_chunked(
                 snapshot1.matrix.as_ref(),
                 keys,
                 page_size_bytes,
                 chunk_size,
-            );
+            )?;
             return Ok((results, epoch1));
         }
 

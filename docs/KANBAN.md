@@ -252,10 +252,11 @@ Security, correctness, and performance findings:
   - create_router_with_concurrency() for custom limits
 
 **Correctness (MEDIUM):**
-- [ ] Phase 59: Validate page matrix alignment (MEDIUM)
-  - scan_main_matrix silently ignores remainder bytes
-  - scan_pages_chunked ignores partial pages in chunk
-  - Add assert/error at matrix construction if not page-aligned
+- [x] Phase 59: Validate page matrix alignment (MEDIUM)
+  - Added ScanError::MatrixNotAligned and ChunkNotAligned variants
+  - try_scan_pages_chunked validates each chunk is page-aligned
+  - Pre-allocates page_refs with Vec::with_capacity(total_pages)
+  - scan_pages_consistent now propagates alignment errors
 
 - [ ] Phase 60: Expose page PIR params in /epoch (MEDIUM)
   - Client needs domain_bits, num_pages, prg_keys, rows_per_page
