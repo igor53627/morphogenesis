@@ -18,7 +18,7 @@ use rayon::prelude::*;
 #[cfg(feature = "cuda")]
 use crate::storage::GpuPageMatrix;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaFunction, LaunchAsync, LaunchConfig, DriverError};
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig, DriverError};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 
