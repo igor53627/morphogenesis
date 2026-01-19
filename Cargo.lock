@@ -1018,6 +1018,7 @@ dependencies = [
  "fss-rs",
  "morphogen-core",
  "morphogen-dpf",
+ "morphogen-gpu-dpf",
  "rand 0.8.5",
 ]
 
