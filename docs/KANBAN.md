@@ -335,7 +335,50 @@ Need proper 2-server FSS/DPF where keys are computationally indistinguishable.
   - 25-bit domain works (production: 27M pages for Ethereum mainnet)
   - True 2-server privacy: servers learn nothing about target page
 
+- [x] Phase 60b: Oracle review #2 fixes
+  - Fixed max_pages() for 32-bit targets (caps at usize::BITS)
+  - Added boundary domain tests (2/7/9/15/17/24 bits with first/mid/last targets)
+  - Added eval_and_accumulate() streaming API for server-side evaluation
+  - Streaming API avoids separate O(N) DPF output allocation during page scan
+  - 24 tests pass including new boundary and streaming tests
+
 - [ ] Phase 61: Integration plan for replacing AesDpfKey
+
+### Vendor fss-rs for Streaming Eval (Jan 19, 2026)
+Goal: Eliminate O(N) DPF output allocation (528MB at 25-bit domain).
+Oracle recommendation: Vendor for streaming only, defer half-tree until bottleneck measured.
+
+**Phase 62: Vendor fss-rs**
+- [x] Phase 62a: Copy fss-rs v0.6.0 source into crates/morphogen-dpf/vendor/fss-rs
+- [x] Phase 62b: Update Cargo.toml to use vendored copy (path dependency)
+- [x] Phase 62c: Verify existing tests still pass with vendored version (24/24 pass)
+- [x] Phase 62d: Document vendoring rationale in vendor/fss-rs/VENDORING.md
+
+**Phase 63: Implement streaming/chunked eval API**
+- [ ] Phase 63a: Add `eval_range(start_idx, &mut [G])` to DpfImpl (chunked eval)
+- [ ] Phase 63b: Add `full_eval_callback(f: impl FnMut(usize, G))` (true streaming)
+- [ ] Phase 63c: Refactor internal tree traversal to emit leaves incrementally
+- [ ] Phase 63d: Add tests for eval_range correctness at chunk boundaries
+- [ ] Phase 63e: Benchmark memory usage: before (528MB) vs after (<1MB)
+
+**Phase 64: Integrate streaming eval into page PIR**
+- [ ] Phase 64a: Update PageDpfKey::eval_and_accumulate() to use eval_range
+- [ ] Phase 64b: Process DB pages in chunks (e.g., 4096 pages at a time)
+- [ ] Phase 64c: Parallel chunk processing with rayon
+- [ ] Phase 64d: Benchmark end-to-end latency at 25-bit domain
+
+**Phase 65: Measure bottleneck split**
+- [ ] Phase 65a: Instrument time split: DPF eval vs DB scan vs XOR accumulate
+- [ ] Phase 65b: Profile at mainnet scale (27M pages, 108GB data)
+- [ ] Phase 65c: Document findings - is DPF eval >30% of total time?
+- [ ] Phase 65d: Decision gate: proceed to half-tree only if DPF dominates
+
+**Phase 66: Half-tree DPF (conditional)**
+- [ ] Phase 66a: Implement HalfTreeDpfKey based on Guo et al. 2022
+- [ ] Phase 66b: New key format with half-tree correction words
+- [ ] Phase 66c: Correctness tests with deterministic test vectors
+- [ ] Phase 66d: Benchmark 1.5x improvement claim
+- [ ] Phase 66e: Integration with PageDpfParams (feature flag)
 
 ### DPF Optimization Research (Jan 19, 2026)
 Literature review findings from Semantic Scholar search:

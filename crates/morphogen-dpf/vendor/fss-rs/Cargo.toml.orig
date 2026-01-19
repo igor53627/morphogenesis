@@ -1,0 +1,39 @@
+bench = [
+  { name = "dcf_gen", harness = false },
+  { name = "dcf_eval", harness = false },
+  { name = "dcf_eval_batch", harness = false },
+  { name = "dcf_full_eval", harness = false },
+  { name = "dpf_gen", harness = false },
+  { name = "dpf_eval", harness = false },
+  { name = "dpf_eval_batch", harness = false },
+  { name = "dpf_full_eval", harness = false },
+]
+
+[package]
+name = "fss-rs"
+version = "0.6.0"
+edition = "2021"
+authors = ["myl7 <myl@myl.moe>"]
+description = "Function secret sharing including distributed comparison & point functions"
+license = "Apache-2.0"
+repository = "https://github.com/myl7/fss.git"
+keywords = ["crypto", "fss", "dcf", "dpf"]
+categories = ["cryptography"]
+
+[features]
+default = ["prg", "multi-thread"]
+prg = ["aes"]
+multi-thread = ["rayon"]
+stable = ["wide"]
+int-be = []
+
+[dependencies]
+bitvec = "1.0.1"
+aes = { version = "0.8.3", optional = true }
+rayon = { version = "1.7.0", optional = true }
+wide = { version = "0.7.26", optional = true }
+
+[dev-dependencies]
+rand = { version = "0.8.5", features = ["std", "std_rng"] }
+criterion = "0.5.1"
+arbtest = "0.3.1"

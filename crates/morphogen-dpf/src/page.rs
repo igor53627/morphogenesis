@@ -120,10 +120,11 @@ impl PageDpfParams {
                 reason: "must be > 0",
             });
         }
-        if domain_bits > 32 {
+        let max_bits = (usize::BITS as usize).min(32);
+        if domain_bits > max_bits {
             return Err(PageDpfError::InvalidDomainBits {
                 domain_bits,
-                reason: "must be <= 32",
+                reason: "exceeds platform usize width or 32-bit limit",
             });
         }
         Ok(Self {
@@ -341,6 +342,54 @@ impl PageDpfKey {
             }
         }
         Ok(())
+    }
+
+    /// Streaming evaluation: evaluates DPF and accumulates masked pages in one pass.
+    /// Avoids O(N) memory allocation for DPF outputs.
+    ///
+    /// Returns a response page where only the target page's data survives the masking.
+    pub fn eval_and_accumulate<'a>(&self, pages: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+        use fss_rs::group::Group;
+
+        let num_pages = self.params.max_pages();
+        let mut response = vec![0u8; PAGE_SIZE_BYTES];
+
+        let mut dpf_output = vec![ByteGroup::zero(); num_pages];
+        let mut refs: Vec<&mut ByteGroup<16>> = dpf_output.iter_mut().collect();
+
+        match self.params.input_bytes() {
+            1 => {
+                let dpf = self.params.create_dpf_1byte();
+                dpf.full_eval(self.is_party1, &self.share, &mut refs);
+            }
+            2 => {
+                let dpf = self.params.create_dpf_2byte();
+                dpf.full_eval(self.is_party1, &self.share, &mut refs);
+            }
+            3 => {
+                let dpf = self.params.create_dpf_3byte();
+                dpf.full_eval(self.is_party1, &self.share, &mut refs);
+            }
+            _ => {
+                let dpf = self.params.create_dpf_4byte();
+                dpf.full_eval(self.is_party1, &self.share, &mut refs);
+            }
+        }
+
+        for (page_idx, page_data) in pages.enumerate() {
+            if page_idx >= num_pages {
+                break;
+            }
+            let mask = dpf_output[page_idx].0[0];
+            if mask != 0 {
+                let len = page_data.len().min(PAGE_SIZE_BYTES);
+                for i in 0..len {
+                    response[i] ^= page_data[i] & mask;
+                }
+            }
+        }
+
+        response
     }
 }
 
@@ -622,6 +671,75 @@ mod fss_page_tests {
             result,
             Err(PageDpfError::OutputSizeMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn page_dpf_boundary_domain_sizes() {
+        for domain_bits in [2, 7, 9, 15, 17, 24] {
+            let params = PageDpfParams::new(domain_bits).unwrap();
+            let max = params.max_pages();
+
+            let target_first = 0;
+            let target_last = max - 1;
+            let target_mid = max / 2;
+
+            for target in [target_first, target_mid, target_last] {
+                let (k0, k1) = generate_page_dpf_keys(&params, target).unwrap();
+
+                let mut output0 = vec![ByteGroup::zero(); max];
+                let mut output1 = vec![ByteGroup::zero(); max];
+
+                k0.full_eval(&mut output0).unwrap();
+                k1.full_eval(&mut output1).unwrap();
+
+                let mut xor_target = [0u8; 16];
+                for j in 0..16 {
+                    xor_target[j] = output0[target].0[j] ^ output1[target].0[j];
+                }
+                assert_eq!(
+                    xor_target, [0xFF; 16],
+                    "domain_bits={}, target={}: XOR should be 0xFF",
+                    domain_bits, target
+                );
+
+                let check_idx = if target == 0 { 1 } else { 0 };
+                let mut xor_other = [0u8; 16];
+                for j in 0..16 {
+                    xor_other[j] = output0[check_idx].0[j] ^ output1[check_idx].0[j];
+                }
+                assert_eq!(
+                    xor_other, [0x00; 16],
+                    "domain_bits={}, non-target={}: XOR should be 0x00",
+                    domain_bits, check_idx
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn page_dpf_streaming_eval_correctness() {
+        let params = PageDpfParams::new(8).unwrap();
+        let target_page = 42;
+        let (k0, k1) = generate_page_dpf_keys(&params, target_page).unwrap();
+
+        let num_pages = params.max_pages();
+        let mut matrix = vec![[0u8; PAGE_SIZE_BYTES]; num_pages];
+        for (p, page) in matrix.iter_mut().enumerate() {
+            page.fill(p as u8);
+        }
+
+        let response0 = k0.eval_and_accumulate(matrix.iter().map(|p| p.as_slice()));
+        let response1 = k1.eval_and_accumulate(matrix.iter().map(|p| p.as_slice()));
+
+        let mut result = vec![0u8; PAGE_SIZE_BYTES];
+        xor_pages(&response0, &response1, &mut result);
+
+        assert!(
+            result.iter().all(|&b| b == target_page as u8),
+            "Expected page filled with {}, got {:?}",
+            target_page,
+            &result[..8]
+        );
     }
 
     #[test]
