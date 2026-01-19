@@ -132,7 +132,7 @@ impl GpuScanner {
             DpfKeyGpu::from_chacha_key(keys[2]),
         ];
         
-        let keys_slice = self.device.htod_sync_copy(bytemuck::cast_slice(&gpu_keys))?;
+        let keys_slice: CudaSlice<u8> = self.device.htod_sync_copy(bytemuck::cast_slice(&gpu_keys))?;
 
         // 2. Allocate output buffers on GPU
         let mut out0 = self.device.alloc_zeros::<u8>(PAGE_SIZE_BYTES)?;
