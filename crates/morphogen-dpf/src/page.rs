@@ -348,6 +348,7 @@ impl PageDpfKey {
     /// Avoids O(N) memory allocation for DPF outputs.
     ///
     /// Returns a response page where only the target page's data survives the masking.
+    #[deprecated(note = "use eval_and_accumulate_chunked for O(chunk_size) memory instead of O(N)")]
     pub fn eval_and_accumulate<'a>(&self, pages: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
         use fss_rs::group::Group;
 
@@ -387,6 +388,75 @@ impl PageDpfKey {
                     response[i] ^= page_data[i] & mask;
                 }
             }
+        }
+
+        response
+    }
+
+    /// Chunked streaming evaluation: evaluates DPF in chunks and accumulates masked pages.
+    /// Uses O(chunk_size) memory instead of O(N) for the DPF output buffer.
+    ///
+    /// # Arguments
+    /// * `pages` - Iterator over page data (must be indexed: impl ExactSizeIterator or Vec)
+    /// * `chunk_size` - Number of DPF evaluations per chunk (e.g., 4096)
+    ///
+    /// Returns a response page where only the target page's data survives the masking.
+    pub fn eval_and_accumulate_chunked<'a>(
+        &self,
+        pages: &[&'a [u8]],
+        chunk_size: usize,
+    ) -> Vec<u8> {
+        use fss_rs::dpf::Dpf;
+        use fss_rs::group::Group;
+
+        let num_pages = self.params.max_pages().min(pages.len());
+        let mut response = vec![0u8; PAGE_SIZE_BYTES];
+        let chunk_size = chunk_size.max(1);
+
+        let mut dpf_chunk = vec![ByteGroup::zero(); chunk_size];
+
+        let mut chunk_start = 0;
+        while chunk_start < num_pages {
+            let chunk_end = (chunk_start + chunk_size).min(num_pages);
+            let this_chunk_len = chunk_end - chunk_start;
+
+            let output = &mut dpf_chunk[..this_chunk_len];
+            for g in output.iter_mut() {
+                *g = ByteGroup::zero();
+            }
+
+            match self.params.input_bytes() {
+                1 => {
+                    let dpf = self.params.create_dpf_1byte();
+                    dpf.eval_range(self.is_party1, &self.share, chunk_start, output);
+                }
+                2 => {
+                    let dpf = self.params.create_dpf_2byte();
+                    dpf.eval_range(self.is_party1, &self.share, chunk_start, output);
+                }
+                3 => {
+                    let dpf = self.params.create_dpf_3byte();
+                    dpf.eval_range(self.is_party1, &self.share, chunk_start, output);
+                }
+                _ => {
+                    let dpf = self.params.create_dpf_4byte();
+                    dpf.eval_range(self.is_party1, &self.share, chunk_start, output);
+                }
+            }
+
+            for (i, dpf_val) in output.iter().enumerate() {
+                let page_idx = chunk_start + i;
+                let mask = dpf_val.0[0];
+                if mask != 0 {
+                    let page_data = pages[page_idx];
+                    let len = page_data.len().min(PAGE_SIZE_BYTES);
+                    for j in 0..len {
+                        response[j] ^= page_data[j] & mask;
+                    }
+                }
+            }
+
+            chunk_start = chunk_end;
         }
 
         response
@@ -717,6 +787,7 @@ mod fss_page_tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn page_dpf_streaming_eval_correctness() {
         let params = PageDpfParams::new(8).unwrap();
         let target_page = 42;
@@ -740,6 +811,71 @@ mod fss_page_tests {
             target_page,
             &result[..8]
         );
+    }
+
+    #[test]
+    fn page_dpf_chunked_eval_correctness() {
+        let params = PageDpfParams::new(8).unwrap();
+        let target_page = 42;
+        let (k0, k1) = generate_page_dpf_keys(&params, target_page).unwrap();
+
+        let num_pages = params.max_pages();
+        let mut matrix = vec![[0u8; PAGE_SIZE_BYTES]; num_pages];
+        for (p, page) in matrix.iter_mut().enumerate() {
+            page.fill(p as u8);
+        }
+
+        let pages: Vec<&[u8]> = matrix.iter().map(|p| p.as_slice()).collect();
+
+        let response0 = k0.eval_and_accumulate_chunked(&pages, 32);
+        let response1 = k1.eval_and_accumulate_chunked(&pages, 32);
+
+        let mut result = vec![0u8; PAGE_SIZE_BYTES];
+        xor_pages(&response0, &response1, &mut result);
+
+        assert!(
+            result.iter().all(|&b| b == target_page as u8),
+            "Expected page filled with {}, got {:?}",
+            target_page,
+            &result[..8]
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn page_dpf_chunked_matches_full_eval() {
+        let params = PageDpfParams::new(10).unwrap();
+        let target_page = 500;
+        let (k0, k1) = generate_page_dpf_keys(&params, target_page).unwrap();
+
+        let num_pages = params.max_pages();
+        let mut matrix = vec![[0u8; PAGE_SIZE_BYTES]; num_pages];
+        for (p, page) in matrix.iter_mut().enumerate() {
+            for i in 0..PAGE_SIZE_BYTES {
+                page[i] = ((p * PAGE_SIZE_BYTES + i) % 256) as u8;
+            }
+        }
+
+        let pages: Vec<&[u8]> = matrix.iter().map(|p| p.as_slice()).collect();
+
+        let response0_full = k0.eval_and_accumulate(pages.iter().copied());
+        let response1_full = k1.eval_and_accumulate(pages.iter().copied());
+
+        for chunk_size in [1, 16, 64, 256, 1024] {
+            let response0_chunked = k0.eval_and_accumulate_chunked(&pages, chunk_size);
+            let response1_chunked = k1.eval_and_accumulate_chunked(&pages, chunk_size);
+
+            assert_eq!(
+                response0_full, response0_chunked,
+                "chunk_size={}: party0 mismatch",
+                chunk_size
+            );
+            assert_eq!(
+                response1_full, response1_chunked,
+                "chunk_size={}: party1 mismatch",
+                chunk_size
+            );
+        }
     }
 
     #[test]

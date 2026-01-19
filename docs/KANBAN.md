@@ -360,9 +360,11 @@ Oracle recommendation: Vendor for streaming only, defer half-tree until bottlene
   - Uses eval_range_layer() that only descends into overlapping subtrees
   - Supports rayon parallelism when multi-thread feature enabled
   - Tests verify correctness at boundaries and match full_eval output
-- [ ] Phase 63b: Add `full_eval_callback(f: impl FnMut(usize, G))` (true streaming)
-- [ ] Phase 63c: Refactor internal tree traversal to emit leaves incrementally
-- [ ] Phase 63d: Add tests for eval_range correctness at chunk boundaries
+- [x] Phase 63b-d: Add eval_and_accumulate_chunked() to PageDpfKey
+  - Uses eval_range() to process pages in chunks
+  - O(chunk_size) memory for DPF buffer instead of O(N)
+  - Deprecated old eval_and_accumulate() with O(N) allocation
+  - Tests verify chunked output matches full_eval for various chunk sizes
 - [ ] Phase 63e: Benchmark memory usage: before (528MB) vs after (<1MB)
 
 **Phase 64: Integrate streaming eval into page PIR**
