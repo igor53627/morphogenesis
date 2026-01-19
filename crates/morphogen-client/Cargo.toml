@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 morphogen-core = { path = "../morphogen-core" }
 morphogen-dpf = { path = "../morphogen-dpf", features = ["fss"] }
+morphogen-gpu-dpf = { path = "../morphogen-gpu-dpf" }
 rand = "0.8"
 
 [dev-dependencies]
