@@ -5,7 +5,7 @@
 
  [dependencies]
  morphogen-core = { path = "../morphogen-core" }
- morphogen-dpf = { path = "../morphogen-dpf" }
+ morphogen-dpf = { path = "../morphogen-dpf", features = ["fss"] }
  morphogen-storage = { path = "../morphogen-storage" }
  rayon = "1.10"
  rand = "0.8"

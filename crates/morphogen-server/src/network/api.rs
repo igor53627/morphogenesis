@@ -35,6 +35,19 @@ pub struct AppState {
     pub block_number: u64,
     pub state_root: [u8; 32],
     pub epoch_rx: watch::Receiver<EpochMetadata>,
+    /// Page-level PIR configuration (None = page PIR disabled)
+    pub page_config: Option<PagePirConfig>,
+}
+
+/// Configuration for page-level PIR queries.
+#[derive(Clone)]
+pub struct PagePirConfig {
+    /// Number of rows per page (typically 16)
+    pub rows_per_page: usize,
+    /// Domain bits for DPF (log2 of number of pages)
+    pub domain_bits: usize,
+    /// PRG keys shared between both servers (public parameter)
+    pub prg_keys: [[u8; 16]; 2],
 }
 
 #[derive(Serialize)]
@@ -65,6 +78,27 @@ pub struct QueryResponse {
     pub epoch_id: u64,
     #[serde(with = "hex_bytes_vec")]
     pub payloads: Vec<Vec<u8>>,
+}
+
+/// Page-level PIR query request (privacy-preserving).
+///
+/// Uses proper 2-server DPF where servers cannot determine the target page.
+#[derive(Deserialize)]
+pub struct PageQueryRequest {
+    /// Serialized PageDpfKey (one of the pair, the other goes to the other server)
+    #[serde(with = "hex_bytes_vec")]
+    pub keys: Vec<Vec<u8>>,
+}
+
+/// Page-level PIR query response.
+///
+/// Returns full pages (4KB each) that the client XORs with the other server's response.
+#[derive(Serialize)]
+pub struct PageQueryResponse {
+    pub epoch_id: u64,
+    /// 3 page payloads (4KB each for standard page size)
+    #[serde(with = "hex_bytes_vec")]
+    pub pages: Vec<Vec<u8>>,
 }
 
 #[allow(dead_code)]
@@ -317,6 +351,7 @@ mod tests {
             block_number: 12345678,
             state_root: [0xAB; 32],
             epoch_rx: rx,
+            page_config: None,
         })
     }
 

@@ -347,7 +347,10 @@ Need proper 2-server FSS/DPF where keys are computationally indistinguishable.
   - 25-bit domain (mainnet): 491 bytes per key
   - Roundtrip tests verify full_eval produces identical output
   - Created docs/PAGE_PIR_INTEGRATION.md with full migration plan
-- [ ] Phase 61b: Create page-level query types (PageQueryRequest/Response)
+- [x] Phase 61b: Create page-level query types (PageQueryRequest/Response)
+  - Added PageQueryRequest, PageQueryResponse structs
+  - Added PagePirConfig to AppState (optional, for dual-mode support)
+  - Updated all test fixtures with page_config: None
 - [ ] Phase 61c: Add page-level scan function (scan_pages_chunked)
 - [ ] Phase 61d: Wire up page query handler (POST /query/page)
 - [ ] Phase 61e: Update client library for page-level queries

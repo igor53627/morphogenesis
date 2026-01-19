@@ -55,6 +55,7 @@ fn test_state() -> Arc<AppState> {
         block_number: 12345678,
         state_root: [0xAB; 32],
         epoch_rx: rx,
+        page_config: None,
     })
 }
 
@@ -268,6 +269,7 @@ mod query {
             block_number: 100,
             state_root: [0; 32],
             epoch_rx: rx,
+            page_config: None,
         });
         let app = create_router(state);
         let (_keys, body) = test_dpf_keys();
@@ -329,6 +331,7 @@ mod websocket_epoch {
             block_number: 12345678,
             state_root: [0xAB; 32],
             epoch_rx: rx,
+            page_config: None,
         });
         (state, tx)
     }
