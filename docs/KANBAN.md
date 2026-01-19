@@ -323,11 +323,17 @@ Need proper 2-server FSS/DPF where keys are computationally indistinguishable.
   - With GPU acceleration (15x): ~56ms
   - Conclusion: Page-level PIR viable for mainnet
 
-- [ ] Phase 60: Implement page-level PIR with fss-rs
-  - Reorganize matrix: each "row" = 4KB page (16 × 256B original rows)
-  - Use DpfImpl<3, 16, _> for 3-byte domain (up to 16M pages)
-  - Client receives 4KB, extracts target row locally
-  - True 2-server privacy (servers learn nothing)
+- [x] Phase 60: Implement page-level PIR with fss-rs
+  - Created page.rs module with PageDpfParams, PageDpfKey, generate_page_dpf_keys()
+  - PageAddress struct for row→page+offset mapping
+  - Supports 1-4 byte domains (1-32 bits) with proper validation
+  - Uses DpfImpl with new_with_filter for non-power-of-8 domain sizes
+  - Key insight: alpha must be left-shifted for new_with_filter (MSB encoding)
+  - extract_row_from_page() and xor_pages() helpers
+  - full_eval() now validates output size, returns Result
+  - Tests pass for 8/10/16/20/25-bit domains + E2E PIR flow
+  - 25-bit domain works (production: 27M pages for Ethereum mainnet)
+  - True 2-server privacy: servers learn nothing about target page
 
 - [ ] Phase 61: Integration plan for replacing AesDpfKey
 

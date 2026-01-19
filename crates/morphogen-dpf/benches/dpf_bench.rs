@@ -45,11 +45,7 @@ fn bench_fss_dpf(c: &mut Criterion) {
     // Test up to 1M for page-level PIR analysis
     // Page PIR: 250M rows / 16 rows per page = 15.6M pages
     // We test: 64K, 256K, 1M to extrapolate to 16M
-    for (domain_bits, label) in [
-        (16u32, "64K"),
-        (18, "256K"),
-        (20, "1M"),
-    ] {
+    for (domain_bits, label) in [(16u32, "64K"), (18, "256K"), (20, "1M")] {
         let domain_size: usize = 1 << domain_bits;
 
         group.throughput(Throughput::Elements(domain_size as u64));
@@ -63,11 +59,7 @@ fn bench_fss_dpf(c: &mut Criterion) {
             let dpf = DpfImpl::<3, 16, _>::new_with_filter(prg, domain_bits as usize);
 
             let target: u32 = 42;
-            let alpha = [
-                (target >> 16) as u8,
-                (target >> 8) as u8,
-                target as u8,
-            ];
+            let alpha = [(target >> 16) as u8, (target >> 8) as u8, target as u8];
             let beta = ByteGroup([0xFF; 16]);
             let point_fn = PointFn { alpha, beta };
 
@@ -111,7 +103,7 @@ fn bench_page_pir_comparison(c: &mut Criterion) {
     // Compare row-level vs page-level at equivalent data sizes
     // 1M rows at 256B = 256MB data
     // 1M pages at 4KB = 4GB data (but same DPF domain cost)
-    
+
     let domain_size: usize = 1 << 20; // 1M
 
     // Benchmark 1: Current AesDpfKey at 1M rows
@@ -159,7 +151,12 @@ fn bench_page_pir_comparison(c: &mut Criterion) {
 }
 
 #[cfg(feature = "fss")]
-criterion_group!(benches, bench_current_dpf, bench_fss_dpf, bench_page_pir_comparison);
+criterion_group!(
+    benches,
+    bench_current_dpf,
+    bench_fss_dpf,
+    bench_page_pir_comparison
+);
 
 #[cfg(not(feature = "fss"))]
 criterion_group!(benches, bench_current_dpf);

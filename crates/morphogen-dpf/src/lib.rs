@@ -1,5 +1,7 @@
 use rand::Rng;
 
+pub mod page;
+
 pub trait DpfKey: Send + Sync {
     fn eval_bit(&self, index: usize) -> bool;
 
