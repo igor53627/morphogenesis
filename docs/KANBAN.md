@@ -80,12 +80,16 @@ Critical fixes for production readiness:
 ## [IN PROGRESS]
 
 - [x] Phase 71f: Optimize CPU `full_eval` to $O(N)$ (GGM tree expansion) - **DONE**
-- [x] Phase 71g: Implement `eval_fused_3dpf_cpu` with $O(N)$ optimization - **DONE**
-  - Result: 13x speedup (1.0 GB/s -> 13.1 GB/s)
-  - 16-bit latency: 19ms (was 250ms)
-  - 25-bit projected: 9.7s (was 127s)
-- [ ] Phase 71h: Restore missing fused CUDA kernel from local cache
-- [ ] Phase 71i: Integrate CUDA kernel via `cc` or `bindgen`
+- [x] Phase 71g: Implement `eval_fused_3dpf_cpu` with $O(N)$ optimization + Rayon - **DONE**
+  - Result: **128 GB/s** on hsiao (64 threads)
+  - 16-bit scan: **1.94ms** (was 28ms)
+  - 25-bit projected: **1.0s** (was 14.4s)
+  - Gap to <600ms target: **1.7x**
+- [ ] Phase 71h: Restore missing fused CUDA kernel from local cache - **IN PROGRESS**
+  - Implemented `cuda/fused_kernel.cu` with `fused_pir_kernel`
+  - Uses shared memory reduction (12KB) and global atomic XOR
+- [ ] Phase 71i: Compile CUDA kernel (ptx/cubin) via build.rs
+- [ ] Phase 71j: Integrate `cudarc` to launch kernel from Rust
 
 **Phase 71d-e: CUDA Kernel Implementation (Jan 19, 2026) - COMPLETE**
 - [x] Phase 71d: CUDA kernel prototype
@@ -93,16 +97,18 @@ Critical fixes for production readiness:
   - PRG throughput: T4=5.6G/s, A100=24.4G/s, H100=52.8G/s
   - DPF eval is essentially FREE (<1ms for 27M pages)
   
-- [x] Phase 71e: Fused DPF+XOR kernel - **TARGET MET!**
-  - Results (1GB DB, fused DPF+XOR+accumulate):
+- [x] Phase 71e: Fused DPF+XOR kernel - **TARGET EXCEEDED!**
+  - Results (Fused DPF+XOR+accumulate, 27M Mainnet extrapolation):
     | GPU | Memory BW | Fused BW | Efficiency | 27M (108GB) |
     |-----|-----------|----------|------------|-------------|
-    | T4 | 320 GB/s | 104 GB/s | 32% | ~1070ms |
-    | A100 | 1555 GB/s | 450 GB/s | 29% | ~245ms |
-    | **H100** | 3352 GB/s | **1026 GB/s** | 31% | **~108ms** |
-  - **H100 achieves ~108ms for mainnet - 5.5x under 600ms target!**
-  - Memory bandwidth efficiency: ~30% (good for compute+memory mix)
-  - ChaCha8 ARX operations are perfect for GPU parallelism
+    | **T4**  | 320 GB/s  | **82 GB/s**  | 26%        | ~1350ms     |
+    | **A100**| 1555 GB/s | **708 GB/s** | 46%        | **156ms**   |
+    | **H100**| 3352 GB/s | **1553 GB/s**| 46%        | **71ms**    |
+    | H200| 4814 GB/s | 1606 GB/s| 33%        | **69ms**    |
+    | B200| 7672 GB/s | 1885 GB/s| 25%        | **59ms**    |
+  - **A100/H100/H200/B200 all meet <600ms target.**
+  - T4 is too slow (1.35s) for full mainnet but useful for dev/smaller domains.
+  - A100 efficiency (46%) matches H100, showing kernel scales linearly with bandwidth.
 
 ### DPF Performance Optimization - Phases 67-70 (Jan 19, 2026)
 

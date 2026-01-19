@@ -15,12 +15,158 @@ use crate::chacha_prg::Seed128;
 use crate::dpf::ChaChaKey;
 use rayon::prelude::*;
 
+#[cfg(feature = "cuda")]
+use crate::dpf::CorrectionWord;
+#[cfg(feature = "cuda")]
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, DevicePtr, DevicePtrMut, LaunchAsync, LaunchConfig};
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
+
 /// Size of each page in bytes.
 pub const PAGE_SIZE_BYTES: usize = 4096;
 
 /// Default subtree size for kernel processing.
 /// Each block processes this many pages.
 pub const SUBTREE_SIZE: usize = 1024;
+
+/// Maximum domain bits supported by the GPU kernel.
+pub const MAX_DOMAIN_BITS: usize = 25;
+
+/// CUDA-compatible DPF key structure.
+/// Matches the struct in fused_kernel.cu.
+#[cfg(feature = "cuda")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DpfKeyGpu {
+    pub root_seed: [u32; 4],
+    pub root_t: u8,
+    pub domain_bits: u8,
+    pub _pad: [u8; 2], // Alignment
+    pub cw_seed: [[u32; 4]; MAX_DOMAIN_BITS],
+    pub cw_t_left: [u8; MAX_DOMAIN_BITS],
+    pub cw_t_right: [u8; MAX_DOMAIN_BITS],
+    pub final_cw: [u32; 4],
+}
+
+#[cfg(feature = "cuda")]
+impl DpfKeyGpu {
+    pub fn from_chacha_key(key: &ChaChaKey) -> Self {
+        let mut cw_seed = [[0u32; 4]; MAX_DOMAIN_BITS];
+        let mut cw_t_left = [0u8; MAX_DOMAIN_BITS];
+        let mut cw_t_right = [0u8; MAX_DOMAIN_BITS];
+
+        for (i, cw) in key.correction_words.iter().enumerate().take(MAX_DOMAIN_BITS) {
+            cw_seed[i] = cw.seed_cw.words;
+            cw_t_left[i] = cw.t_cw_left;
+            cw_t_right[i] = cw.t_cw_right;
+        }
+
+        Self {
+            root_seed: key.root_seed.words,
+            root_t: key.root_t,
+            domain_bits: key.domain_bits as u8,
+            _pad: [0; 2],
+            cw_seed,
+            cw_t_left,
+            cw_t_right,
+            final_cw: key.final_cw.words,
+        }
+    }
+}
+
+/// GPU implementation of the PIR scanner.
+#[cfg(feature = "cuda")]
+pub struct GpuScanner {
+    device: Arc<CudaDevice>,
+    module_name: String,
+    fused_fn: CudaFunction,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuScanner {
+    /// Create a new GpuScanner by loading the fused kernel.
+    pub fn new(device_ord: usize) -> Result<Self, cudarc::driver::DriverError> {
+        let device = CudaDevice::new(device_ord)?;
+        
+        // Load the PTX/CUBIN compiled by build.rs
+        // The build script names the library "fused_kernel"
+        let ptx_path = concat!(env!("OUT_DIR"), "/fused_kernel.ptx");
+        let ptx = std::fs::read_to_string(ptx_path).map_err(|e| {
+            eprintln!("Failed to read PTX: {}", e);
+            cudarc::driver::DriverError::MemoryAllocationFailed // Fallback error
+        })?;
+
+        let module_name = "fused_pir".to_string();
+        device.load_ptx(ptx.into(), &module_name, &["fused_pir_kernel"])?;
+        let fused_fn = device.get_func(&module_name, "fused_pir_kernel").unwrap();
+
+        Ok(Self {
+            device,
+            module_name,
+            fused_fn,
+        })
+    }
+
+    /// Execute a fused PIR scan on the GPU.
+    pub unsafe fn scan(
+        &self,
+        db_pages: &CudaSlice<u8>,
+        keys: [&ChaChaKey; 3],
+        num_pages: usize,
+    ) -> Result<PirResult, cudarc::driver::DriverError> {
+        let start = std::time::Instant::now();
+
+        // 1. Prepare keys in constant memory
+        let gpu_keys = [
+            DpfKeyGpu::from_chacha_key(keys[0]),
+            DpfKeyGpu::from_chacha_key(keys[1]),
+            DpfKeyGpu::from_chacha_key(keys[2]),
+        ];
+        
+        // Note: cudarc handles constant memory via specific APIs or symbol names
+        // In our fused_kernel.cu, it's defined as __constant__ DpfKeyGpu c_keys[3];
+        self.device.dtm().copy_host_to_symbol(&self.module_name, "c_keys", &gpu_keys)?;
+
+        // 2. Allocate output buffers on GPU
+        let mut out0 = self.device.alloc_zeros::<u8>(PAGE_SIZE_BYTES)?;
+        let mut out1 = self.device.alloc_zeros::<u8>(PAGE_SIZE_BYTES)?;
+        let mut out2 = self.device.alloc_zeros::<u8>(PAGE_SIZE_BYTES)?;
+
+        // 3. Launch Kernel
+        let cfg = LaunchConfig {
+            grid_dim: (((num_pages + SUBTREE_SIZE - 1) / SUBTREE_SIZE) as u32, 1, 1),
+            block_dim: (THREADS_PER_BLOCK as u32, 1, 1),
+            shared_mem_bytes: 12288, // 3 * 4096
+        };
+
+        let params = (
+            db_pages,
+            &mut out0,
+            &mut out1,
+            &mut out2,
+            num_pages as i32,
+        );
+        self.fused_fn.clone().launch(cfg, params)?;
+
+        // 4. Copy results back
+        let page0 = self.device.sync_reclaim(out0)?;
+        let page1 = self.device.sync_reclaim(out1)?;
+        let page2 = self.device.sync_reclaim(out2)?;
+
+        let total_ns = start.elapsed().as_nanos() as u64;
+
+        Ok(PirResult {
+            page0,
+            page1,
+            page2,
+            timing: KernelTiming {
+                dpf_eval_ns: 0,
+                xor_accumulate_ns: 0,
+                total_ns,
+            },
+        })
+    }
+}
 
 /// Timing breakdown for fused kernel execution.
 #[derive(Debug, Clone, Default)]

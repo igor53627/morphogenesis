@@ -14,9 +14,14 @@
 //! All three operations happen in a single pass over the database,
 //! minimizing memory bandwidth usage.
 
+#[cfg(feature = "cuda")]
+pub extern crate cudarc;
+
 pub mod chacha_prg;
 pub mod dpf;
 pub mod kernel;
 
 pub use chacha_prg::{ChaCha8Prg, PrgOutput};
 pub use dpf::{ChaChaKey, ChaChaParams, GpuDpfError};
+#[cfg(feature = "cuda")]
+pub use kernel::GpuScanner;
