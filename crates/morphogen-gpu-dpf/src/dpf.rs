@@ -170,7 +170,7 @@ impl ChaChaKey {
         let mut seed = self.root_seed;
         let mut t = self.root_t;
         let subtree_depth = subtree_size.trailing_zeros() as usize;
-        let root_level = self.domain_bits - subtree_depth;
+        let root_level = self.domain_bits.saturating_sub(subtree_depth);
 
         for level in 0..root_level {
             let out = ChaCha8Prg::expand(&seed);

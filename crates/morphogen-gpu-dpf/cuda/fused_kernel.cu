@@ -226,8 +226,8 @@ extern "C" __global__ void fused_pir_kernel(
         uint4 m2 = make_uint4(mask2[0], mask2[1], mask2[2], mask2[3]);
 
         // Load page data (vectorized loop)
-        // Global memory offset: global_page_idx * VECS_PER_PAGE
-        const uint4* page_ptr = &db_pages[global_page_idx * VECS_PER_PAGE];
+        // Cast to size_t to prevent 32-bit overflow for large databases (>16GB)
+        const uint4* page_ptr = &db_pages[(size_t)global_page_idx * VECS_PER_PAGE];
         
         for (int v = 0; v < VECS_PER_PAGE; v++) {
             uint4 data = page_ptr[v];

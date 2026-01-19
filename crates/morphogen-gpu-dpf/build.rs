@@ -1,7 +1,8 @@
 fn main() {
     println!("cargo:rerun-if-changed=cuda/fused_kernel.cu");
 
-    // Only compile CUDA if nvcc is available
+    // Only compile CUDA if nvcc is available AND cuda feature is enabled
+    #[cfg(feature = "cuda")]
     if std::process::Command::new("nvcc").arg("--version").output().is_ok() {
         let out_dir = std::env::var("OUT_DIR").unwrap();
         let status = std::process::Command::new("nvcc")

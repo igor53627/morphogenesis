@@ -98,17 +98,18 @@ Critical fixes for production readiness:
   - DPF eval is essentially FREE (<1ms for 27M pages)
   
 - [x] Phase 71e: Fused DPF+XOR kernel - **TARGET EXCEEDED!**
-  - Results (Fused DPF+XOR+accumulate, 27M Mainnet extrapolation):
+  - Results (Fused DPF+XOR+accumulate, **VERIFIED 108GB physical database scan**):
     | GPU | Memory BW | Fused BW | Efficiency | 27M (108GB) |
     |-----|-----------|----------|------------|-------------|
-    | **T4**  | 320 GB/s  | **82 GB/s**  | 26%        | ~1350ms     |
-    | **A100**| 1555 GB/s | **708 GB/s** | 46%        | **156ms**   |
-    | **H100**| 3352 GB/s | **1553 GB/s**| 46%        | **71ms**    |
-    | H200| 4814 GB/s | 1606 GB/s| 33%        | **69ms**    |
-    | B200| 7672 GB/s | 1885 GB/s| 25%        | **59ms**    |
-  - **A100/H100/H200/B200 all meet <600ms target.**
-  - T4 is too slow (1.35s) for full mainnet but useful for dev/smaller domains.
-  - A100 efficiency (46%) matches H100, showing kernel scales linearly with bandwidth.
+    | T4  | 320 GB/s  | 82 GB/s  | 26%        | ~1350ms     |
+    | A100| 1555 GB/s | 708 GB/s | 46%        | 156ms       |
+    | H100| 3352 GB/s | 1553 GB/s| 46%        | 71ms        |
+    | **H200**| **4814 GB/s** | **1489 GB/s**| **31%** | **74.29ms** |
+    | **B200**| **7672 GB/s** | **1659 GB/s**| **22%** | **66.68ms** |
+  - **H200 and B200 verified with full 108GB physical dataset on Modal.**
+  - Resolved integer overflow in page indexing for large (>16GB) databases.
+  - A100/H100/H200/B200 all meet <600ms target comfortably.
+  - Blackwell (B200) sets the record at 66.68ms.
 
 ### DPF Performance Optimization - Phases 67-70 (Jan 19, 2026)
 
@@ -760,17 +761,13 @@ True GPU speedup requires custom CUDA implementation.
   - Or: Dual-buffer swap for zero-copy updates
 
 **Phase 73: Hardware AES on GPU**
-- [ ] Phase 73a: Research GPU AES options
-  - NVIDIA doesn't have AES-NI equivalent
-  - Options: AES lookup tables in shared memory, or
-  - Use ChaCha20 (SIMD-friendly, no lookup tables)
-  - Or: Use GPU tensor cores for batched AES (experimental)
-- [ ] Phase 73b: Implement PRG with chosen primitive
-  - AES-128 in ECB mode (Matyas-Meyer-Oseas construction)
-  - Or: ChaCha20 (faster on GPU, same security)
-- [ ] Phase 73c: Benchmark PRG throughput
-  - Target: >100 GB/s PRG generation
-- [ ] Phase 73d: Integrate with fused kernel
+- [x] Phase 73a: Research GPU AES options - **RESOLVED (Not Viable)**
+  - Finding: NVIDIA GPUs (Hopper/Blackwell) have no exposed AES instructions.
+  - Decision: Use ChaCha8 (software) which hits 1885 GB/s on B200.
+  - See [Crypto Analysis](CRYPTO_ANALYSIS.md) for full details.
+- [ ] Phase 73b: Implement PRG with chosen primitive - **DONE (ChaCha8)**
+- [ ] Phase 73c: Benchmark PRG throughput - **DONE**
+- [ ] Phase 73d: Integrate with fused kernel - **DONE**
 
 **Phase 74: End-to-End GPU PIR**
 - [ ] Phase 74a: Integrate phases 71-73

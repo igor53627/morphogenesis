@@ -44,6 +44,8 @@ crates/
 - [EDD](docs/morphogenesis_EDD.md) - Engineering design
 - [Performance](docs/PERFORMANCE.md) - Optimization findings
 - [Profiling Guide](docs/PROFILING_GUIDE.md) - How to profile
+- [Cryptography & Core Mechanics](docs/CRYPTOGRAPHY.md) - Explaining the fused kernel and DPF logic
+- [Crypto Analysis](docs/CRYPTO_ANALYSIS.md) - Why we use ChaCha8 over AES on GPUs
 
 ## Key Concepts
 

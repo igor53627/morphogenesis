@@ -1043,11 +1043,13 @@ name = "morphogen-gpu-dpf"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "cc",
  "chacha20",
  "criterion",
  "cudarc",
  "hex",
  "rand 0.8.5",
+ "rayon",
 ]
 
 [[package]]
