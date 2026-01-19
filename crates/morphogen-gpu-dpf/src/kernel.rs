@@ -44,13 +44,13 @@ fn xor_page_masked(acc: &mut [u8], page: &[u8], mask: &Seed128) {
     debug_assert_eq!(acc.len(), PAGE_SIZE_BYTES);
     debug_assert_eq!(page.len(), PAGE_SIZE_BYTES);
 
-    let mask_bytes = mask.to_bytes();
+    // Cast slices to Seed128 for 128-bit operations
+    let acc_seeds: &mut [Seed128] = bytemuck::cast_slice_mut(acc);
+    let page_seeds: &[Seed128] = bytemuck::cast_slice(page);
 
-    // Simple byte-by-byte XOR with mask cycling
-    // Compiler optimizes this well for modern CPUs
-    for (i, (a, p)) in acc.iter_mut().zip(page.iter()).enumerate() {
-        let m = mask_bytes[i % 16];
-        *a ^= *p & m;
+    for (a, p) in acc_seeds.iter_mut().zip(page_seeds.iter()) {
+        // DPF mask acts as an AND gate: result = acc ^ (page & mask)
+        *a = a.xor(&p.and(mask));
     }
 }
 
@@ -90,27 +90,27 @@ pub fn eval_fused_3dpf_cpu(
     for tile in 0..num_tiles {
         let tile_start = tile * SUBTREE_SIZE;
         let tile_end = (tile_start + SUBTREE_SIZE).min(num_pages);
+        let current_tile_size = tile_end - tile_start;
 
         // Evaluate DPF masks for this tile
         let dpf_start = std::time::Instant::now();
 
-        // Pre-compute masks for all pages in tile
-        let mut masks0 = Vec::with_capacity(tile_end - tile_start);
-        let mut masks1 = Vec::with_capacity(tile_end - tile_start);
-        let mut masks2 = Vec::with_capacity(tile_end - tile_start);
+        // Pre-compute masks for all pages in tile using optimized O(SUBTREE_SIZE) expansion
+        let mut masks0 = vec![Seed128::ZERO; SUBTREE_SIZE];
+        let mut masks1 = vec![Seed128::ZERO; SUBTREE_SIZE];
+        let mut masks2 = vec![Seed128::ZERO; SUBTREE_SIZE];
 
-        for page_idx in tile_start..tile_end {
-            masks0.push(keys[0].eval(page_idx));
-            masks1.push(keys[1].eval(page_idx));
-            masks2.push(keys[2].eval(page_idx));
-        }
+        keys[0].eval_subtree(tile_start, &mut masks0).map_err(|_| "eval_subtree failed")?;
+        keys[1].eval_subtree(tile_start, &mut masks1).map_err(|_| "eval_subtree failed")?;
+        keys[2].eval_subtree(tile_start, &mut masks2).map_err(|_| "eval_subtree failed")?;
 
         dpf_ns += dpf_start.elapsed().as_nanos() as u64;
 
         // Apply masks and accumulate
         let xor_start = std::time::Instant::now();
 
-        for (i, page_idx) in (tile_start..tile_end).enumerate() {
+        for i in 0..current_tile_size {
+            let page_idx = tile_start + i;
             let page = pages[page_idx];
             xor_page_masked(&mut acc0, page, &masks0[i]);
             xor_page_masked(&mut acc1, page, &masks1[i]);

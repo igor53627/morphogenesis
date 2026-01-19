@@ -138,6 +138,8 @@ impl ChaChaKey {
     }
 
     /// Full domain evaluation (CPU reference implementation).
+    ///
+    /// Optimized to O(N) using GGM tree expansion.
     pub fn full_eval(&self, output: &mut [Seed128]) -> Result<(), GpuDpfError> {
         let num_pages = self.max_pages();
         if output.len() != num_pages {
@@ -147,10 +149,94 @@ impl ChaChaKey {
             });
         }
 
-        for i in 0..num_pages {
-            output[i] = self.eval(i);
-        }
+        self.expand_recursive(0, self.root_seed, self.root_t, output);
         Ok(())
+    }
+
+    /// Evaluate a subtree of the DPF tree.
+    ///
+    /// The range [start..start + output.len()] must be a valid aligned subtree
+    /// (i.e., output.len() is a power of 2 and start is a multiple of output.len()).
+    pub fn eval_subtree(&self, start: usize, output: &mut [Seed128]) -> Result<(), GpuDpfError> {
+        let subtree_size = output.len();
+        if !subtree_size.is_power_of_two() {
+            return Err(GpuDpfError::InvalidKeyFormat("Subtree size must be power of 2"));
+        }
+        if start % subtree_size != 0 {
+            return Err(GpuDpfError::InvalidKeyFormat("Start index must be aligned to subtree size"));
+        }
+
+        // Find the seed and t at the root of this subtree
+        let mut seed = self.root_seed;
+        let mut t = self.root_t;
+        let subtree_depth = subtree_size.trailing_zeros() as usize;
+        let root_level = self.domain_bits - subtree_depth;
+
+        for level in 0..root_level {
+            let out = ChaCha8Prg::expand(&seed);
+            let bit = (start >> (self.domain_bits - 1 - level)) & 1;
+            let (mut next_seed, mut next_t) = if bit == 0 {
+                (out.left_seed, out.left_t)
+            } else {
+                (out.right_seed, out.right_t)
+            };
+
+            if t == 1 {
+                let cw = &self.correction_words[level];
+                next_seed = next_seed.xor(&cw.seed_cw);
+                next_t ^= if bit == 0 { cw.t_cw_left } else { cw.t_cw_right };
+            }
+            seed = next_seed;
+            t = next_t;
+        }
+
+        // Expand the subtree
+        self.expand_recursive(root_level, seed, t, output);
+        Ok(())
+    }
+
+    fn expand_recursive(
+        &self,
+        level: usize,
+        seed: Seed128,
+        t: u8,
+        output: &mut [Seed128],
+    ) {
+        if level == self.domain_bits {
+            // Leaf reached
+            let mut final_seed = seed;
+            if t == 1 {
+                final_seed = final_seed.xor(&self.final_cw);
+            }
+            output[0] = final_seed;
+            return;
+        }
+
+        // Expand current node
+        let out = ChaCha8Prg::expand(&seed);
+        let cw = &self.correction_words[level];
+
+        // Left child
+        let mut left_seed = out.left_seed;
+        let mut left_t = out.left_t;
+        if t == 1 {
+            left_seed = left_seed.xor(&cw.seed_cw);
+            left_t ^= cw.t_cw_left;
+        }
+
+        // Right child
+        let mut right_seed = out.right_seed;
+        let mut right_t = out.right_t;
+        if t == 1 {
+            right_seed = right_seed.xor(&cw.seed_cw);
+            right_t ^= cw.t_cw_right;
+        }
+
+        let half = output.len() / 2;
+        let (left_out, right_out) = output.split_at_mut(half);
+
+        self.expand_recursive(level + 1, left_seed, left_t, left_out);
+        self.expand_recursive(level + 1, right_seed, right_t, right_out);
     }
 
     pub fn max_pages(&self) -> usize {

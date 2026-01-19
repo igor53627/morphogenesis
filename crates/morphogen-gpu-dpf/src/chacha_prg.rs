@@ -54,6 +54,17 @@ impl Seed128 {
         }
     }
 
+    pub fn and(&self, other: &Self) -> Self {
+        Self {
+            words: [
+                self.words[0] & other.words[0],
+                self.words[1] & other.words[1],
+                self.words[2] & other.words[2],
+                self.words[3] & other.words[3],
+            ],
+        }
+    }
+
     pub fn random() -> Self {
         Self {
             words: rand::random(),

@@ -79,7 +79,15 @@ Critical fixes for production readiness:
 
 ## [IN PROGRESS]
 
-### Phase 71d-e: CUDA Kernel Implementation (Jan 19, 2026) - COMPLETE
+- [x] Phase 71f: Optimize CPU `full_eval` to $O(N)$ (GGM tree expansion) - **DONE**
+- [x] Phase 71g: Implement `eval_fused_3dpf_cpu` with $O(N)$ optimization - **DONE**
+  - Result: 13x speedup (1.0 GB/s -> 13.1 GB/s)
+  - 16-bit latency: 19ms (was 250ms)
+  - 25-bit projected: 9.7s (was 127s)
+- [ ] Phase 71h: Restore missing fused CUDA kernel from local cache
+- [ ] Phase 71i: Integrate CUDA kernel via `cc` or `bindgen`
+
+**Phase 71d-e: CUDA Kernel Implementation (Jan 19, 2026) - COMPLETE**
 - [x] Phase 71d: CUDA kernel prototype
   - ChaCha8 PRG kernel benchmarked on Modal GPUs
   - PRG throughput: T4=5.6G/s, A100=24.4G/s, H100=52.8G/s
