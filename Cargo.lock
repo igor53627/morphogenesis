@@ -971,6 +971,7 @@ dependencies = [
 name = "morphogen-client"
 version = "0.1.0"
 dependencies = [
+ "fss-rs",
  "morphogen-core",
  "morphogen-dpf",
  "rand 0.8.5",

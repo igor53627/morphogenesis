@@ -361,8 +361,17 @@ Need proper 2-server FSS/DPF where keys are computationally indistinguishable.
   - Returns 404 when page_config is None (page PIR disabled)
   - Validates domain_bits matches server config
   - Returns PageQueryResponse with epoch_id and 3 page payloads (4KB each)
-- [ ] Phase 61e: Update client library for page-level queries
-- [ ] Phase 61f: Reorganize data as pages (migration)
+- [x] Phase 61e: Update client library for page-level queries
+  - Added page module to morphogen-client with PageEpochMetadata, PageQueryKeys
+  - generate_page_query(): computes page addresses from CuckooAddresser, generates key pairs
+  - aggregate_page_responses(): XORs server responses to recover plaintext pages
+  - extract_rows_from_pages(): extracts target rows from pages using row_offset
+  - Re-exports PageDpfParams, PageAddress, PAGE_SIZE_BYTES from morphogen-dpf
+- [x] Phase 61f: Reorganize data as pages (migration)
+  - No physical reorganization needed: pages are 16 consecutive rows (4KB each)
+  - Current row-contiguous storage already supports page-level access
+  - scan_pages_chunked() computes page boundaries within existing matrix chunks
+  - Added PAGE_SIZE_BYTES constant (4096) for clarity
 
 ### Vendor fss-rs for Streaming Eval (Jan 19, 2026)
 Goal: Eliminate O(N) DPF output allocation (528MB at 25-bit domain).

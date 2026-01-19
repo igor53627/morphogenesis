@@ -77,10 +77,10 @@ Client                          Server A                    Server B
 - Row index → (page_index, row_offset)
 - XOR responses, extract target row
 
-### Phase 61f: Reorganize data as pages
-- Current: rows stored contiguously
-- New: pages stored contiguously (16 rows × 256B = 4KB)
-- May need migration tool or dual-format support
+### Phase 61f: Reorganize data as pages [COMPLETE]
+- **No physical reorganization needed**: pages are 16 consecutive rows
+- Current row-contiguous storage already supports page-level access
+- `scan_pages_chunked()` computes page boundaries within existing matrix chunks
 
 ## API Design
 

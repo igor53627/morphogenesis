@@ -1,4 +1,5 @@
 pub mod fixture;
+pub mod page;
 
 use morphogen_core::{CuckooAddresser, NUM_HASH_FUNCTIONS};
 pub use morphogen_dpf::AesDpfKey;
