@@ -105,7 +105,67 @@ Random-walk insertion:
 Performance scales with CPU core count more than AVX-512 availability.
 GPU-accelerated PIR would require CUDA port to access HBM bandwidth.
 
+## Page-Level PIR Performance (Jan 19, 2026)
+
+### Overview
+Page-level PIR using fss-rs provides true 2-server computational privacy,
+unlike the insecure AesDpfKey that exposes the target index.
+
+### Chunk Size Optimization Results
+
+**18-bit domain (256K pages, 1GB data):**
+
+| Chunk Size | DPF (ms) | XOR (ms) | Total (ms) | DPF % | Speedup |
+|------------|----------|----------|------------|-------|---------|
+| 4096 | 19.7 | 17.2 | 36.9 | 53% | 1.00x |
+| 8192 | 13.7 | 17.0 | 30.7 | 45% | 1.20x |
+| 16384 | 11.2 | 17.0 | 28.3 | 40% | 1.30x |
+| 32768 | 9.4 | 16.9 | 26.3 | 36% | 1.40x |
+| **65536** | **8.7** | **16.8** | **25.5** | **34%** | **1.45x** |
+| 131072 | 8.3 | 16.8 | 25.1 | 33% | 1.47x |
+
+**Optimal chunk size: 65536** (1MB DPF buffer, 1.45x speedup)
+
+### Mainnet Projections (25-bit domain, 27M pages, 108GB)
+
+| Optimization | Latency | Gap to 600ms |
+|--------------|---------|--------------|
+| Baseline (chunk=4096) | 4.6s | 7.7x |
+| **Chunk=65536** | **3.2s** | **5.3x** |
+| + Half-tree DPF (1.5x) | ~2.1s | 3.5x |
+| + GPU (15x) | ~210ms | [PASS] |
+
+### Key Findings
+
+1. **Chunk size matters**: Larger chunks amortize DPF tree-traversal overhead
+2. **XOR is memory-bound**: ~17ms constant regardless of chunk size
+3. **DPF scales with chunk**: Drops from 54% to 33% of total time
+4. **Contiguous vs fragmented**: No difference when data fits in RAM
+5. **Compiler optimizes well**: Manual 64-bit unrolling made XOR slower
+
+### Bottleneck Analysis
+
+At optimal chunk size (65536):
+- **DPF eval**: 33% of time (tree traversal + AES)
+- **XOR accumulate**: 67% of time (memory-bound, touches all data)
+
+Even if DPF became free, XOR alone = 2.1s (3.5x over target).
+**GPU acceleration required** to parallelize both DPF and memory bandwidth.
+
+### Thread Scaling (rayon)
+
+| Threads | 16-bit Latency | Speedup |
+|---------|----------------|---------|
+| 1 | 27.3ms | 1.0x |
+| 2 | 15.9ms | 1.7x |
+| 4 | 10.8ms | 2.5x |
+| 8 | 8.0ms | 3.4x |
+| 16 | 8.2ms | 3.3x |
+
+Optimal at 8 threads; 16 threads shows slight regression (overhead).
+
 ## What's Left for Production
-1. **Delta-PIR integration** - Apply delta buffer after main scan
-2. **Epoch management** - CoW memory management for live updates
-3. **Network layer** - gRPC/HTTP API for client queries
+1. **GPU acceleration** - Required for <600ms at mainnet scale
+2. **Delta-PIR integration** - Apply delta buffer after main scan
+3. **Epoch management** - CoW memory management for live updates
+4. **Network layer** - HTTP/WebSocket API complete

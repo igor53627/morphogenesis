@@ -417,10 +417,7 @@ impl PageDpfKey {
             }
             let mask = dpf_output[page_idx].0[0];
             if mask != 0 {
-                let len = page_data.len().min(PAGE_SIZE_BYTES);
-                for i in 0..len {
-                    response[i] ^= page_data[i] & mask;
-                }
+                xor_page_masked(&mut response, page_data, mask);
             }
         }
 
@@ -483,10 +480,7 @@ impl PageDpfKey {
                 let mask = dpf_val.0[0];
                 if mask != 0 {
                     let page_data = pages[page_idx];
-                    let len = page_data.len().min(PAGE_SIZE_BYTES);
-                    for j in 0..len {
-                        response[j] ^= page_data[j] & mask;
-                    }
+                    xor_page_masked(&mut response, page_data, mask);
                 }
             }
 
@@ -495,6 +489,18 @@ impl PageDpfKey {
 
         response
     }
+}
+
+#[inline(always)]
+fn xor_page_masked(response: &mut [u8], page_data: &[u8], mask: u8) {
+    let len = page_data.len().min(PAGE_SIZE_BYTES).min(response.len());
+    for i in 0..len {
+        response[i] ^= page_data[i] & mask;
+    }
+}
+
+#[cfg(feature = "fss")]
+impl PageDpfKey {
 
     /// Instrumented version of eval_and_accumulate_chunked that returns timing breakdown.
     ///
@@ -553,10 +559,7 @@ impl PageDpfKey {
                 let mask = dpf_val.0[0];
                 if mask != 0 {
                     let page_data = pages[page_idx];
-                    let len = page_data.len().min(PAGE_SIZE_BYTES);
-                    for j in 0..len {
-                        response[j] ^= page_data[j] & mask;
-                    }
+                    xor_page_masked(&mut response, page_data, mask);
                 }
             }
             total_xor_ns += xor_start.elapsed().as_nanos() as u64;

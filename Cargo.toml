@@ -3,6 +3,7 @@
      "crates/morphogen-client",
      "crates/morphogen-core",
      "crates/morphogen-dpf",
+     "crates/morphogen-gpu-dpf",
      "crates/morphogen-storage",
      "crates/morphogen-server",
  ]

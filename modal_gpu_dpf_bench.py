@@ -121,27 +121,46 @@ def run_gpu_dpf_benchmark(gpu_name: str) -> dict:
                     dpf_instance.eval_gpu([k1])
                 torch.cuda.synchronize()
                 
-                # Benchmark
+                # Benchmark with CUDA events for accurate GPU timing
                 num_iters = 20
+                
+                # Method 1: Wall clock (includes transfer overhead)
                 start = time.perf_counter()
                 for _ in range(num_iters):
                     dpf_instance.eval_gpu([k1])
                 torch.cuda.synchronize()
-                elapsed = time.perf_counter() - start
+                elapsed_wall = time.perf_counter() - start
                 
-                avg_ms = (elapsed / num_iters) * 1000
-                throughput = n / (elapsed / num_iters) / 1e6  # M entries/sec
-                dpfs_per_sec = num_iters / elapsed
+                # Method 2: CUDA events (GPU kernel time only)
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
                 
-                print(f"  Avg time: {avg_ms:.2f} ms")
-                print(f"  Throughput: {throughput:.2f} M entries/sec")
-                print(f"  DPFs/sec: {dpfs_per_sec:.1f}")
+                gpu_times = []
+                for _ in range(num_iters):
+                    start_event.record()
+                    dpf_instance.eval_gpu([k1])
+                    end_event.record()
+                    torch.cuda.synchronize()
+                    gpu_times.append(start_event.elapsed_time(end_event))
+                
+                avg_wall_ms = (elapsed_wall / num_iters) * 1000
+                avg_gpu_ms = sum(gpu_times) / len(gpu_times)
+                transfer_overhead_ms = avg_wall_ms - avg_gpu_ms
+                
+                throughput_wall = n / (elapsed_wall / num_iters) / 1e6
+                throughput_gpu = n / (avg_gpu_ms / 1000) / 1e6
+                
+                print(f"  Wall clock:     {avg_wall_ms:.2f} ms ({throughput_wall:.1f} M/s)")
+                print(f"  GPU kernel:     {avg_gpu_ms:.2f} ms ({throughput_gpu:.1f} M/s)")
+                print(f"  Transfer overhead: {transfer_overhead_ms:.2f} ms ({transfer_overhead_ms/avg_wall_ms*100:.1f}%)")
                 
                 results[label] = {
                     "domain_size": n,
-                    "avg_ms": avg_ms,
-                    "throughput_meps": throughput,
-                    "dpfs_per_sec": dpfs_per_sec,
+                    "wall_ms": avg_wall_ms,
+                    "gpu_ms": avg_gpu_ms,
+                    "transfer_ms": transfer_overhead_ms,
+                    "throughput_wall_meps": throughput_wall,
+                    "throughput_gpu_meps": throughput_gpu,
                 }
                 
             except Exception as e:
@@ -151,13 +170,16 @@ def run_gpu_dpf_benchmark(gpu_name: str) -> dict:
                 results[label] = {"error": str(e)}
         
         # Extrapolate to mainnet (27M pages)
-        if "1M" in results and "avg_ms" in results["1M"]:
+        if "1M" in results and "gpu_ms" in results["1M"]:
             mainnet_pages = 27_000_000
             ratio = mainnet_pages / (1 << 20)
-            estimated_ms = results["1M"]["avg_ms"] * ratio
-            print(f"\n=== Mainnet Extrapolation ===")
-            print(f"27M pages estimated: {estimated_ms:.2f} ms")
-            results["mainnet_27M_estimated_ms"] = estimated_ms
+            est_wall = results["1M"]["wall_ms"] * ratio
+            est_gpu = results["1M"]["gpu_ms"] * ratio
+            print(f"\n=== Mainnet Extrapolation (27M pages) ===")
+            print(f"Wall clock estimated: {est_wall:.0f} ms")
+            print(f"GPU kernel estimated: {est_gpu:.0f} ms")
+            results["mainnet_wall_ms"] = est_wall
+            results["mainnet_gpu_ms"] = est_gpu
         
         return {"gpu": gpu_name, "results": results}
         
@@ -212,7 +234,9 @@ def print_results(result: dict):
         return
     
     print(f"\nGPU: {result['gpu']}")
-    print("-" * 40)
+    print("-" * 50)
+    print(f"{'Size':<8} {'Wall(ms)':<10} {'GPU(ms)':<10} {'Transfer%':<10}")
+    print("-" * 50)
     
     for label, data in result.get("results", {}).items():
         if label.startswith("mainnet"):
@@ -220,8 +244,9 @@ def print_results(result: dict):
         if "error" in data:
             print(f"{label}: Error - {data['error']}")
         else:
-            print(f"{label}: {data['avg_ms']:.2f} ms ({data['throughput_meps']:.1f} M/s)")
+            xfer_pct = data['transfer_ms'] / data['wall_ms'] * 100 if data['wall_ms'] > 0 else 0
+            print(f"{label:<8} {data['wall_ms']:<10.2f} {data['gpu_ms']:<10.2f} {xfer_pct:<10.1f}%")
     
-    if "mainnet_27M_estimated_ms" in result.get("results", {}):
-        est = result["results"]["mainnet_27M_estimated_ms"]
-        print(f"\n>>> Mainnet (27M pages) estimated: {est:.0f} ms")
+    results = result.get("results", {})
+    if "mainnet_wall_ms" in results and "mainnet_gpu_ms" in results:
+        print(f"\n>>> Mainnet (27M): Wall={results['mainnet_wall_ms']:.0f}ms, GPU={results['mainnet_gpu_ms']:.0f}ms")

@@ -1,5 +1,11 @@
 //! HTTP and WebSocket API implementation.
 
+/// Optimal DPF chunk size for eval_and_accumulate_chunked.
+/// Larger chunks amortize tree-traversal overhead. 65536 = 64K elements.
+/// At 16 bytes per DPF output, this uses 1MB of buffer per evaluation.
+/// Benchmarks show this is ~1.4x faster than chunk_size=4096.
+pub const OPTIMAL_DPF_CHUNK_SIZE: usize = 65536;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -336,7 +342,7 @@ pub async fn page_query_handler(
         state.global.as_ref(),
         &keys,
         PAGE_SIZE_BYTES,
-        PAGE_SIZE_BYTES, // Use page size as DPF chunk size for consistency
+        OPTIMAL_DPF_CHUNK_SIZE,
     )
     .map_err(scan_error_to_status)?;
 

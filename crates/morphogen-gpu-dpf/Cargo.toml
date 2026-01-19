@@ -1,0 +1,37 @@
+[package]
+name = "morphogen-gpu-dpf"
+version = "0.1.0"
+edition = "2021"
+description = "GPU-accelerated DPF using ChaCha8 PRG for PIR"
+
+[lib]
+name = "morphogen_gpu_dpf"
+path = "src/lib.rs"
+
+[features]
+default = []
+# cuda feature requires CUDA toolkit installed
+cuda = ["dep:cudarc"]
+
+[dependencies]
+# ChaCha for PRG (pure Rust reference implementation)
+chacha20 = "0.9"
+# Hex encoding for test vectors
+hex = "0.4"
+# Random number generation
+rand = "0.8"
+# Optional CUDA bindings
+cudarc = { version = "0.12", optional = true }
+# Bytemuck for safe transmutes
+bytemuck = { version = "1.14", features = ["derive"] }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "chacha_prg_bench"
+harness = false
+
+[[bin]]
+name = "profile_gpu_dpf"
+path = "src/bin/profile_gpu_dpf.rs"

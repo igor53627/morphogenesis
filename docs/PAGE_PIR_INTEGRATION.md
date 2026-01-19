@@ -143,9 +143,29 @@ Recommendation: Option 2 (dual endpoints) for gradual migration.
 | Metric | Row-Level | Page-Level | Delta |
 |--------|-----------|------------|-------|
 | DPF domain | 250M | 27M | 9.3x smaller |
-| DPF eval time | ~250ms (insecure) | ~840ms (fss-rs) | 3.4x slower |
+| DPF eval time | ~250ms (insecure) | ~3.2s (fss-rs optimized) | 12.8x slower |
 | Response size | 768B (3×256B) | 12KB (3×4KB) | 16x larger |
 | Client bandwidth | 768B down | 12KB down | Acceptable |
+
+### Chunk Size Optimization (Jan 19, 2026)
+
+Optimal DPF chunk size is **65536** (not 4096), providing **1.45x speedup**:
+
+| Chunk Size | DPF (ms) | XOR (ms) | Total (ms) | Speedup |
+|------------|----------|----------|------------|---------|
+| 4096 | 19.7 | 17.2 | 36.9 | 1.00x |
+| **65536** | **8.7** | **16.8** | **25.5** | **1.45x** |
+
+### Mainnet Projections (25-bit domain)
+
+| Configuration | Latency | Status |
+|--------------|---------|--------|
+| Baseline (chunk=4096) | 4.6s | 7.7x over target |
+| **Optimized (chunk=65536)** | **3.2s** | **5.3x over target** |
+| + GPU acceleration | ~210ms | [PASS] |
+
+**Conclusion**: CPU-only page PIR is viable for development/testing.
+Production mainnet requires GPU acceleration for <600ms latency.
 
 ## Security Considerations
 
