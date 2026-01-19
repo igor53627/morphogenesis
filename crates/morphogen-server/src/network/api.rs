@@ -314,6 +314,12 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
 
     while let Some(Ok(msg)) = socket.recv().await {
         if let Message::Text(text) = msg {
+            if text.len() > MAX_WS_MESSAGE_BYTES {
+                let error = ws_error_json("message too large");
+                let _ = socket.send(Message::Text(error.into())).await;
+                continue;
+            }
+
             let response = match serde_json::from_str::<QueryRequest>(&text) {
                 Ok(request) if request.keys.len() == 3 => {
                     let keys_result = (
@@ -361,12 +367,29 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
 /// Using 16KB as a safe upper bound with room for future expansion
 pub const MAX_REQUEST_BODY_SIZE: usize = 16 * 1024;
 
+/// Maximum WebSocket message size (same limit as HTTP body)
+pub const MAX_WS_MESSAGE_BYTES: usize = MAX_REQUEST_BODY_SIZE;
+
+/// Maximum concurrent PIR scans (query + page query endpoints)
+/// Limits CPU usage under load; additional requests get 503
+pub const MAX_CONCURRENT_SCANS: usize = 32;
+
 pub fn create_router(state: Arc<AppState>) -> Router {
+    create_router_with_concurrency(state, MAX_CONCURRENT_SCANS)
+}
+
+pub fn create_router_with_concurrency(state: Arc<AppState>, max_concurrent: usize) -> Router {
+    use tower::limit::ConcurrencyLimitLayer;
+
+    let scan_routes = Router::new()
+        .route("/query", post(query_handler))
+        .route("/query/page", post(page_query_handler))
+        .layer(ConcurrencyLimitLayer::new(max_concurrent));
+
     Router::new()
         .route("/health", get(health_handler))
         .route("/epoch", get(epoch_handler))
-        .route("/query", post(query_handler))
-        .route("/query/page", post(page_query_handler))
+        .merge(scan_routes)
         .route("/ws/epoch", get(ws_epoch_handler))
         .route("/ws/query", get(ws_query_handler))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_SIZE))

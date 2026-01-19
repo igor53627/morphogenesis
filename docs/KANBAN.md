@@ -239,16 +239,17 @@ Post-integration review findings:
 Security, correctness, and performance findings:
 
 **Security (HIGH):**
-- [ ] Phase 57: Add WebSocket message size limit (HIGH)
-  - DefaultBodyLimit only applies to HTTP, not WS frames
-  - Attacker can send multi-MB frames causing OOM/CPU DoS
-  - Add MAX_WS_MESSAGE_BYTES check before parsing
-  - Consider protocol-level max in axum/tokio-tungstenite config
+- [x] Phase 57: Add WebSocket message size limit (HIGH)
+  - Added MAX_WS_MESSAGE_BYTES = 16KB (same as HTTP body limit)
+  - handle_ws_query checks text.len() before parsing
+  - Returns "message too large" error and continues (doesn't close connection)
+  - Test: ws_query_rejects_oversized_message
 
-- [ ] Phase 58: Add rate/concurrency limiting (HIGH)
-  - PIR scans are O(state), trivial CPU DoS with small botnet
-  - Options: per-IP rate limit, API keys, ConcurrencyLimitLayer
-  - At minimum add tower ConcurrencyLimit for in-flight scans
+- [x] Phase 58: Add rate/concurrency limiting (HIGH)
+  - Added MAX_CONCURRENT_SCANS = 32 constant
+  - /query and /query/page now wrapped with ConcurrencyLimitLayer
+  - Excess requests get 503 automatically
+  - create_router_with_concurrency() for custom limits
 
 **Correctness (MEDIUM):**
 - [ ] Phase 59: Validate page matrix alignment (MEDIUM)

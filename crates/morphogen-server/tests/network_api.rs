@@ -839,4 +839,43 @@ mod websocket_query {
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert!(json["error"].is_string());
     }
+
+    #[tokio::test]
+    async fn ws_query_rejects_oversized_message() {
+        use morphogen_server::network::MAX_WS_MESSAGE_BYTES;
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = create_router(test_state());
+
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/query"))
+            .await
+            .unwrap();
+
+        // Send message larger than MAX_WS_MESSAGE_BYTES
+        let oversized = "x".repeat(MAX_WS_MESSAGE_BYTES + 1);
+        socket
+            .send(tungstenite::Message::text(oversized))
+            .await
+            .unwrap();
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
+            .await
+            .expect("timeout")
+            .expect("stream ended")
+            .expect("websocket error");
+
+        let text = match msg {
+            tungstenite::Message::Text(t) => t,
+            tungstenite::Message::Close(_) => return, // Also acceptable
+            other => panic!("expected text or close, got {:?}", other),
+        };
+
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("too large"));
+    }
 }
