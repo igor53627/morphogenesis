@@ -759,10 +759,9 @@ True GPU speedup requires custom CUDA implementation.
 - [ ] Phase 73c: Benchmark PRG throughput - **DONE**
 - [ ] Phase 73d: Integrate with fused kernel - **DONE**
 
-**Phase 74: End-to-End GPU PIR**
-- [ ] Phase 74a: Integrate phases 71-73
+**Phase 74: End-to-End GPU PIR (Jan 19, 2026) - IN PROGRESS**
+- [x] Phase 74a: Integrate phases 71-73 (API endpoint, GPU scanner, EpochManager integration)
 - [ ] Phase 74b: Benchmark at 25-bit domain (27M pages)
-  - Target: <600ms per query
 - [ ] Phase 74c: Multi-query batching for throughput
 - [ ] Phase 74d: Production hardening (error handling, monitoring)
 

@@ -123,6 +123,14 @@ pub struct PageQueryResponse {
     pub pages: Vec<Vec<u8>>,
 }
 
+/// GPU-based Page PIR query request.
+#[derive(Deserialize)]
+pub struct GpuPageQueryRequest {
+    /// Serialized ChaChaKey (one of the pair)
+    #[serde(with = "hex_bytes_vec")]
+    pub keys: Vec<Vec<u8>>,
+}
+
 #[allow(dead_code)]
 mod hex_bytes {
     use serde::{self, Deserialize, Deserializer, Serializer};
@@ -356,6 +364,67 @@ pub async fn page_query_handler(
     }))
 }
 
+pub async fn page_query_gpu_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<GpuPageQueryRequest>,
+) -> Result<Json<PageQueryResponse>, StatusCode> {
+    use morphogen_gpu_dpf::dpf::ChaChaKey;
+
+    if request.keys.len() != 3 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let keys: [ChaChaKey; 3] = match (
+        ChaChaKey::from_bytes(&request.keys[0]),
+        ChaChaKey::from_bytes(&request.keys[1]),
+        ChaChaKey::from_bytes(&request.keys[2]),
+    ) {
+        (Ok(k0), Ok(k1), Ok(k2)) => [k0, k1, k2],
+        _ => return Err(StatusCode::BAD_REQUEST),
+    };
+
+    #[cfg(feature = "cuda")]
+    if let (Some(scanner), Some(matrix_mutex)) = (&state.gpu_scanner, &state.gpu_matrix) {
+        let matrix_guard = matrix_mutex
+            .lock()
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Some(matrix) = matrix_guard.as_ref() {
+            let snapshot = state.global.load();
+            let result = unsafe { scanner.scan(matrix, [&keys[0], &keys[1], &keys[2]]) }
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            return Ok(Json(PageQueryResponse {
+                epoch_id: snapshot.epoch_id,
+                pages: vec![result.page0, result.page1, result.page2],
+            }));
+        }
+    }
+
+    // CPU Fallback (or if CUDA is disabled)
+    let snapshot = state.global.load();
+    let num_pages = snapshot.matrix.total_size_bytes() / morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+    
+    // We need to collect pages from the ChunkedMatrix
+    // This is slow on CPU but provides a reference implementation
+    let mut pages_refs = Vec::with_capacity(num_pages);
+    for i in 0..num_pages {
+        let start = i * morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+        let (chunk_idx, chunk_offset) = (start / snapshot.matrix.chunk_size_bytes(), start % snapshot.matrix.chunk_size_bytes());
+        let chunk = snapshot.matrix.chunk(chunk_idx);
+        pages_refs.push(&chunk.as_slice()[chunk_offset..chunk_offset + morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES]);
+    }
+
+    let result = morphogen_gpu_dpf::kernel::eval_fused_3dpf_cpu(
+        [&keys[0], &keys[1], &keys[2]],
+        &pages_refs,
+    ).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(PageQueryResponse {
+        epoch_id: snapshot.epoch_id,
+        pages: vec![result.page0, result.page1, result.page2],
+    }))
+}
+
 const WS_INTERNAL_ERROR: &str = r#"{"error":"internal server error","code":"internal_error"}"#;
 
 fn ws_error_json(error: &str, code: &str) -> String {
@@ -451,6 +520,7 @@ pub fn create_router_with_concurrency(state: Arc<AppState>, max_concurrent: usiz
     let scan_routes = Router::new()
         .route("/query", post(query_handler))
         .route("/query/page", post(page_query_handler))
+        .route("/query/page/gpu", post(page_query_gpu_handler))
         .layer(ConcurrencyLimitLayer::new(max_concurrent));
 
     Router::new()
