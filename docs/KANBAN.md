@@ -355,7 +355,11 @@ Oracle recommendation: Vendor for streaming only, defer half-tree until bottlene
 - [x] Phase 62d: Document vendoring rationale in vendor/fss-rs/VENDORING.md
 
 **Phase 63: Implement streaming/chunked eval API**
-- [ ] Phase 63a: Add `eval_range(start_idx, &mut [G])` to DpfImpl (chunked eval)
+- [x] Phase 63a: Add `eval_range(start_idx, &mut [G])` to DpfImpl (chunked eval)
+  - Added eval_range() to Dpf trait and DpfImpl
+  - Uses eval_range_layer() that only descends into overlapping subtrees
+  - Supports rayon parallelism when multi-thread feature enabled
+  - Tests verify correctness at boundaries and match full_eval output
 - [ ] Phase 63b: Add `full_eval_callback(f: impl FnMut(usize, G))` (true streaming)
 - [ ] Phase 63c: Refactor internal tree traversal to emit leaves incrementally
 - [ ] Phase 63d: Add tests for eval_range correctness at chunk boundaries
