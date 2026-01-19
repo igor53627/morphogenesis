@@ -291,22 +291,88 @@ Need proper 2-server FSS/DPF where keys are computationally indistinguishable.
 - Supports AVX2/AVX-512 and ARM crypto extensions
 - Overhead estimate: ~log(n) AES rounds per row evaluation
 
-**Option B: Page/Bucket PIR (privacy tradeoff)**
-- Leak which 4KB page, hide which row within page
-- 16 rows/page at 256B/row -> 16x smaller domain
-- DPF depth: log2(250M/16) = 24 instead of 28
-- Client downloads page, extracts target row locally
-- Acceptable if "which page" leakage is tolerable
+**Option B: Page-Level PIR (RECOMMENDED)**
+- Use fss-rs DPF at page granularity (no privacy loss!)
+- 16 rows/page at 256B/row = 4KB pages
+- Domain: 368M accounts / 16 = 27M pages (vs 433M rows)
+- Client downloads 4KB page, extracts target row locally
+- Servers learn NOTHING about which page (proper 2-server DPF)
+- Aligns with UBT Merkle tree page boundaries
 
 **Tasks:**
 - [x] Phase 57: Add fss-rs dependency and basic integration test
   - Added fss-rs v0.6 with "stable" feature
   - Tests verify DPF pair XOR to point function
   - Tests verify full_eval correctness (256 rows)
-- [ ] Phase 58: Benchmark fss-rs full_eval vs current AesDpfKey
-- [ ] Phase 59: Measure overhead at different domain sizes (100K, 1M, 10M)
-- [ ] Phase 60: Design page/bucket fallback if fss-rs too slow
+  - Added benchmark skeleton in benches/dpf_bench.rs
+- [x] Phase 58: Benchmark fss-rs full_eval vs current AesDpfKey (COMPLETE)
+  - Results show massive overhead: 57-428x slower than AesDpfKey
+  - 256 rows: 165ns vs 70.8µs (428x)
+  - 1K rows: 590ns vs 114µs (193x)
+  - 4K rows: 2.35µs vs 228µs (97x)
+  - 16K rows: 9.4µs vs 639µs (68x)
+  - 64K rows: 37.7µs vs 2.14ms (57x)
+  - fss-rs throughput: ~30 Melem/s vs AesDpfKey: ~1.7 Gelem/s
+  - Conclusion: fss-rs too slow for full-domain eval at 250M rows
+  - Estimated 250M latency: ~8 seconds (vs 143ms AesDpfKey)
+  - Page/bucket PIR fallback required for production
+- [x] Phase 59: Page-level PIR performance analysis (COMPLETE)
+  - Benchmarked fss-rs at 1M domain: 31ms (vs AesDpfKey 620µs = 50x overhead)
+  - Mainnet extrapolation (27M pages): ~840ms with fss-rs page-level
+  - With half-tree optimization (1.5x): ~560ms
+  - With GPU acceleration (15x): ~56ms
+  - Conclusion: Page-level PIR viable for mainnet
+
+- [ ] Phase 60: Implement page-level PIR with fss-rs
+  - Reorganize matrix: each "row" = 4KB page (16 × 256B original rows)
+  - Use DpfImpl<3, 16, _> for 3-byte domain (up to 16M pages)
+  - Client receives 4KB, extracts target row locally
+  - True 2-server privacy (servers learn nothing)
+
 - [ ] Phase 61: Integration plan for replacing AesDpfKey
+
+### DPF Optimization Research (Jan 19, 2026)
+Literature review findings from Semantic Scholar search:
+
+**Key Papers:**
+1. **Half-Tree DPF** (Guo et al. 2022) - eprint.iacr.org/2022/1431
+   - Halves AES calls for full-domain eval (1.5N vs 2N)
+   - Halves communication and round complexity
+   - Security: Random Permutation Model (vs PRG for standard)
+   - Trade-off: Slightly stronger assumption, same key size
+   
+2. **Ternary-Tree DPF** (sachaservan/tri-dpf)
+   - Ternary instead of binary tree = flatter tree = fewer levels
+   - log3(N) vs log2(N) depth = ~1.58x fewer levels
+   - Batched AES for better CPU utilization
+   
+3. **GPU-DPF** (Facebook Research) - arxiv.org/abs/2301.10904
+   - Based on BGI 2014 DPF (same as fss-rs)
+   - 200x speedup over single-threaded CPU, 15-20x over 32-thread
+   - Memory-bounded tree traversal (optimal work + low memory)
+   - Operator fusion: DPF eval + matrix multiply in single pass
+   - V100: 923 DPFs/sec at 1M entries
+   - Modal benchmark script created: modal_gpu_dpf_bench.py
+   
+4. **Programmable DPF** (Boyle et al. 2022) - eprint.iacr.org/2022/1060
+   - Short offline key reusable for many queries
+   - Only practical for small domains (poly-size)
+
+**Mainnet Performance Projection (368M accounts, 27M pages):**
+
+| Implementation | Latency | Notes |
+|----------------|---------|-------|
+| AesDpfKey (insecure) | ~250ms | Servers see target |
+| fss-rs row-level | ~13.4s | Too slow |
+| **fss-rs page-level** | **~840ms** | Viable! |
+| + Half-tree (1.5x) | ~560ms | Under 600ms target |
+| + GPU (15x) | ~56ms | Best case |
+
+**Optimization Roadmap:**
+- [ ] Phase 62: Prototype fss-rs page-level PIR
+- [ ] Phase 63: Benchmark Facebook GPU-DPF on Modal (script ready)
+- [ ] Phase 64: Implement half-tree optimization if needed (1.5x)
+- [ ] Phase 65: GPU port for production (15-20x)
 
 ---
 
