@@ -14,7 +14,7 @@
 
  [dependencies]
  rand = "0.8"
- fss-rs = { path = "vendor/fss-rs", optional = true, features = ["stable"] }
+ fss-rs = { path = "vendor/fss-rs", optional = true, features = ["stable", "multi-thread"] }
 
  [dev-dependencies]
  criterion = "0.5"
@@ -22,3 +22,7 @@
  [[bench]]
  name = "dpf_bench"
  harness = false
+
+ [[bin]]
+ name = "profile_dpf"
+ required-features = ["fss"]

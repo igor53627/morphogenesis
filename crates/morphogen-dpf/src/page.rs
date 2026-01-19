@@ -24,6 +24,17 @@ pub const ROWS_PER_PAGE: usize = 16;
 pub const ROW_SIZE_BYTES: usize = 256;
 pub const PAGE_SIZE_BYTES: usize = ROWS_PER_PAGE * ROW_SIZE_BYTES; // 4096 = 4KB
 
+/// Timing breakdown for DPF evaluation and accumulation.
+#[derive(Debug, Clone)]
+pub struct EvalTiming {
+    /// Time spent evaluating the DPF (in nanoseconds)
+    pub dpf_eval_ns: u64,
+    /// Time spent XOR-accumulating pages (in nanoseconds)
+    pub xor_accumulate_ns: u64,
+    /// The resulting response page
+    pub response: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageAddress {
     pub page_index: usize,
@@ -420,7 +431,7 @@ impl PageDpfKey {
     /// Uses O(chunk_size) memory instead of O(N) for the DPF output buffer.
     ///
     /// # Arguments
-    /// * `pages` - Iterator over page data (must be indexed: impl ExactSizeIterator or Vec)
+    /// * `pages` - Slice of page data references (indexed by page number)
     /// * `chunk_size` - Number of DPF evaluations per chunk (e.g., 4096)
     ///
     /// Returns a response page where only the target page's data survives the masking.
@@ -483,6 +494,81 @@ impl PageDpfKey {
         }
 
         response
+    }
+
+    /// Instrumented version of eval_and_accumulate_chunked that returns timing breakdown.
+    ///
+    /// Use this to measure bottleneck split between DPF evaluation and XOR accumulation.
+    pub fn eval_and_accumulate_chunked_timed<'a>(
+        &self,
+        pages: &[&'a [u8]],
+        chunk_size: usize,
+    ) -> EvalTiming {
+        use fss_rs::dpf::Dpf;
+        use fss_rs::group::Group;
+        use std::time::Instant;
+
+        let num_pages = self.params.max_pages().min(pages.len());
+        let mut response = vec![0u8; PAGE_SIZE_BYTES];
+        let chunk_size = chunk_size.max(1);
+
+        let mut dpf_chunk = vec![ByteGroup::zero(); chunk_size];
+        let mut total_dpf_ns: u64 = 0;
+        let mut total_xor_ns: u64 = 0;
+
+        let mut chunk_start = 0;
+        while chunk_start < num_pages {
+            let chunk_end = (chunk_start + chunk_size).min(num_pages);
+            let this_chunk_len = chunk_end - chunk_start;
+
+            let output = &mut dpf_chunk[..this_chunk_len];
+            for g in output.iter_mut() {
+                *g = ByteGroup::zero();
+            }
+
+            let dpf_start = Instant::now();
+            match self.params.input_bytes() {
+                1 => {
+                    let dpf = self.params.create_dpf_1byte();
+                    dpf.eval_range(self.is_party1, &self.share, chunk_start, output);
+                }
+                2 => {
+                    let dpf = self.params.create_dpf_2byte();
+                    dpf.eval_range(self.is_party1, &self.share, chunk_start, output);
+                }
+                3 => {
+                    let dpf = self.params.create_dpf_3byte();
+                    dpf.eval_range(self.is_party1, &self.share, chunk_start, output);
+                }
+                _ => {
+                    let dpf = self.params.create_dpf_4byte();
+                    dpf.eval_range(self.is_party1, &self.share, chunk_start, output);
+                }
+            }
+            total_dpf_ns += dpf_start.elapsed().as_nanos() as u64;
+
+            let xor_start = Instant::now();
+            for (i, dpf_val) in output.iter().enumerate() {
+                let page_idx = chunk_start + i;
+                let mask = dpf_val.0[0];
+                if mask != 0 {
+                    let page_data = pages[page_idx];
+                    let len = page_data.len().min(PAGE_SIZE_BYTES);
+                    for j in 0..len {
+                        response[j] ^= page_data[j] & mask;
+                    }
+                }
+            }
+            total_xor_ns += xor_start.elapsed().as_nanos() as u64;
+
+            chunk_start = chunk_end;
+        }
+
+        EvalTiming {
+            dpf_eval_ns: total_dpf_ns,
+            xor_accumulate_ns: total_xor_ns,
+            response,
+        }
     }
 
     /// Serialize the key to bytes.
@@ -1094,6 +1180,71 @@ mod fss_page_tests {
                 chunk_size
             );
         }
+    }
+
+    #[test]
+    fn page_dpf_eval_timing_breakdown_16bit() {
+        let params = PageDpfParams::new(16).unwrap();
+        let num_pages = params.max_pages(); // 65536
+        let target_page = 12345;
+        let (k0, _) = generate_page_dpf_keys(&params, target_page).unwrap();
+
+        let mut pages_data = vec![vec![0u8; PAGE_SIZE_BYTES]; num_pages];
+        for (i, page) in pages_data.iter_mut().enumerate() {
+            page[0] = (i & 0xFF) as u8;
+            page[1] = ((i >> 8) & 0xFF) as u8;
+        }
+        let page_refs: Vec<&[u8]> = pages_data.iter().map(|p| p.as_slice()).collect();
+
+        let timing = k0.eval_and_accumulate_chunked_timed(&page_refs, 4096);
+
+        assert!(timing.dpf_eval_ns > 0, "DPF eval time should be > 0");
+        assert!(timing.xor_accumulate_ns > 0, "XOR accumulate time should be > 0");
+        assert_eq!(timing.response.len(), PAGE_SIZE_BYTES);
+
+        let total = timing.dpf_eval_ns + timing.xor_accumulate_ns;
+        let dpf_pct = (timing.dpf_eval_ns as f64 / total as f64) * 100.0;
+        println!(
+            "16-bit domain (64K pages, 256MB): DPF={:.1}% ({:.2}ms), XOR={:.1}% ({:.2}ms), Total={:.2}ms",
+            dpf_pct,
+            timing.dpf_eval_ns as f64 / 1_000_000.0,
+            100.0 - dpf_pct,
+            timing.xor_accumulate_ns as f64 / 1_000_000.0,
+            total as f64 / 1_000_000.0
+        );
+    }
+
+    #[test]
+    #[ignore] // Takes ~4GB memory and ~1 second
+    fn page_dpf_eval_timing_breakdown_20bit() {
+        let params = PageDpfParams::new(20).unwrap();
+        let num_pages = params.max_pages(); // 1M pages = 4GB
+        let target_page = 500_000;
+        let (k0, _) = generate_page_dpf_keys(&params, target_page).unwrap();
+
+        let mut pages_data = vec![vec![0u8; PAGE_SIZE_BYTES]; num_pages];
+        for (i, page) in pages_data.iter_mut().enumerate() {
+            page[0] = (i & 0xFF) as u8;
+            page[1] = ((i >> 8) & 0xFF) as u8;
+        }
+        let page_refs: Vec<&[u8]> = pages_data.iter().map(|p| p.as_slice()).collect();
+
+        let timing = k0.eval_and_accumulate_chunked_timed(&page_refs, 4096);
+
+        assert!(timing.dpf_eval_ns > 0, "DPF eval time should be > 0");
+        assert!(timing.xor_accumulate_ns > 0, "XOR accumulate time should be > 0");
+        assert_eq!(timing.response.len(), PAGE_SIZE_BYTES);
+
+        let total = timing.dpf_eval_ns + timing.xor_accumulate_ns;
+        let dpf_pct = (timing.dpf_eval_ns as f64 / total as f64) * 100.0;
+        println!(
+            "20-bit domain (1M pages, 4GB): DPF={:.1}% ({:.2}ms), XOR={:.1}% ({:.2}ms), Total={:.2}ms",
+            dpf_pct,
+            timing.dpf_eval_ns as f64 / 1_000_000.0,
+            100.0 - dpf_pct,
+            timing.xor_accumulate_ns as f64 / 1_000_000.0,
+            total as f64 / 1_000_000.0
+        );
     }
 
     #[test]

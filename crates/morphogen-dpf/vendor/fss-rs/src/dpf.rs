@@ -165,8 +165,12 @@ where
             return;
         }
 
-        let domain_size = 1usize << self.filter_bitn;
-        let end_idx = start_idx + ys.len();
+        let domain_size = 1usize
+            .checked_shl(self.filter_bitn as u32)
+            .expect("eval_range: domain_size overflow (filter_bitn too large)");
+        let end_idx = start_idx
+            .checked_add(ys.len())
+            .expect("eval_range: end_idx overflow");
         assert!(
             end_idx <= domain_size,
             "eval_range: end_idx {} exceeds domain_size {}",
@@ -274,8 +278,16 @@ where
     ) where
         G: Group<OUT_BLEN>,
     {
+        debug_assert!(range_start < range_end, "empty range passed to eval_range_layer");
+        debug_assert_eq!(
+            ys.len(),
+            range_end - range_start,
+            "ys.len() must equal range size"
+        );
+
         let subtree_size = subtree_end - subtree_start;
         if subtree_size == 1 {
+            debug_assert_eq!(ys.len(), 1, "leaf node but ys.len() != 1");
             ys[0] =
                 (Into::<G>::into(s) + if t { k.cw_np1.clone() } else { G::zero() }).neg_if(b);
             return;
