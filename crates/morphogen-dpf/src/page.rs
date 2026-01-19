@@ -62,6 +62,11 @@ pub enum PageDpfError {
         actual: usize,
     },
     FssError(String),
+    InvalidKeyFormat(&'static str),
+    CorrectionWordCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl std::fmt::Display for PageDpfError {
@@ -98,6 +103,16 @@ impl std::fmt::Display for PageDpfError {
                 )
             }
             Self::FssError(msg) => write!(f, "FSS error: {}", msg),
+            Self::InvalidKeyFormat(reason) => {
+                write!(f, "Invalid key format: {}", reason)
+            }
+            Self::CorrectionWordCountMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "Correction word count mismatch: expected {}, got {}",
+                    expected, actual
+                )
+            }
         }
     }
 }
@@ -461,6 +476,128 @@ impl PageDpfKey {
 
         response
     }
+
+    /// Serialize the key to bytes.
+    ///
+    /// Format:
+    /// - 1 byte: domain_bits
+    /// - 32 bytes: prg_keys (2 × 16 bytes)
+    /// - 1 byte: is_party1 (0 or 1)
+    /// - 16 bytes: s0 seed
+    /// - 16 bytes: cw_np1 (ByteGroup)
+    /// - For each of domain_bits correction words:
+    ///   - 16 bytes: s
+    ///   - 1 byte: (tl as u8) | ((tr as u8) << 1)
+    ///
+    /// Total size: 66 + 17 * domain_bits bytes
+    /// For 25-bit domain: 66 + 17 * 25 = 491 bytes
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let n = self.params.domain_bits;
+        let size = 66 + 17 * n;
+        let mut out = Vec::with_capacity(size);
+
+        out.push(n as u8);
+
+        out.extend_from_slice(&self.params.prg_keys[0]);
+        out.extend_from_slice(&self.params.prg_keys[1]);
+
+        out.push(self.is_party1 as u8);
+
+        out.extend_from_slice(&self.share.s0s[0]);
+
+        out.extend_from_slice(&self.share.cw_np1.0);
+
+        for cw in &self.share.cws {
+            out.extend_from_slice(&cw.s);
+            let flags = (cw.tl as u8) | ((cw.tr as u8) << 1);
+            out.push(flags);
+        }
+
+        out
+    }
+
+    /// Deserialize a key from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PageDpfError> {
+        use fss_rs::group::Group;
+        use fss_rs::Cw;
+
+        if bytes.is_empty() {
+            return Err(PageDpfError::InvalidKeyFormat("empty input"));
+        }
+
+        let domain_bits = bytes[0] as usize;
+        if domain_bits == 0 || domain_bits > 32 {
+            return Err(PageDpfError::InvalidDomainBits {
+                domain_bits,
+                reason: "must be 1-32",
+            });
+        }
+
+        let expected_size = 66 + 17 * domain_bits;
+        if bytes.len() != expected_size {
+            return Err(PageDpfError::InvalidKeyLength {
+                expected: expected_size,
+                actual: bytes.len(),
+            });
+        }
+
+        let mut pos = 1;
+
+        let mut prg_keys = [[0u8; 16]; 2];
+        prg_keys[0].copy_from_slice(&bytes[pos..pos + 16]);
+        pos += 16;
+        prg_keys[1].copy_from_slice(&bytes[pos..pos + 16]);
+        pos += 16;
+
+        let is_party1 = bytes[pos] != 0;
+        pos += 1;
+
+        let mut s0 = [0u8; 16];
+        s0.copy_from_slice(&bytes[pos..pos + 16]);
+        pos += 16;
+
+        let mut cw_np1_bytes = [0u8; 16];
+        cw_np1_bytes.copy_from_slice(&bytes[pos..pos + 16]);
+        let cw_np1 = ByteGroup(cw_np1_bytes);
+        pos += 16;
+
+        let mut cws = Vec::with_capacity(domain_bits);
+        for _ in 0..domain_bits {
+            let mut s = [0u8; 16];
+            s.copy_from_slice(&bytes[pos..pos + 16]);
+            pos += 16;
+
+            let flags = bytes[pos];
+            pos += 1;
+
+            let tl = (flags & 1) != 0;
+            let tr = (flags & 2) != 0;
+
+            cws.push(Cw {
+                s,
+                v: ByteGroup::zero(),
+                tl,
+                tr,
+            });
+        }
+
+        let params = PageDpfParams { prg_keys, domain_bits };
+
+        Ok(Self {
+            share: Share {
+                s0s: vec![s0],
+                cws,
+                cw_np1,
+            },
+            is_party1,
+            params,
+        })
+    }
+
+    /// Returns the serialized key size for a given domain_bits.
+    pub fn serialized_size(domain_bits: usize) -> usize {
+        66 + 17 * domain_bits
+    }
 }
 
 pub fn extract_row_from_page(page: &[u8], row_offset: usize) -> Option<&[u8]> {
@@ -578,6 +715,79 @@ mod fss_page_tests {
         assert!(matches!(
             result,
             Err(PageDpfError::PageIndexTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn page_dpf_key_serialization_roundtrip() {
+        let params = PageDpfParams::new(10).unwrap();
+        let (k0, k1) = generate_page_dpf_keys(&params, 500).unwrap();
+
+        let bytes0 = k0.to_bytes();
+        let bytes1 = k1.to_bytes();
+
+        assert_eq!(bytes0.len(), PageDpfKey::serialized_size(10));
+        assert_eq!(bytes1.len(), PageDpfKey::serialized_size(10));
+        assert_eq!(bytes0.len(), 66 + 17 * 10); // 236 bytes
+
+        let restored0 = PageDpfKey::from_bytes(&bytes0).unwrap();
+        let restored1 = PageDpfKey::from_bytes(&bytes1).unwrap();
+
+        assert_eq!(restored0.is_party1(), k0.is_party1());
+        assert_eq!(restored1.is_party1(), k1.is_party1());
+        assert_eq!(restored0.domain_bits(), k0.domain_bits());
+        assert_eq!(restored1.domain_bits(), k1.domain_bits());
+
+        let num_pages = params.max_pages();
+        let mut orig0 = vec![ByteGroup::zero(); num_pages];
+        let mut orig1 = vec![ByteGroup::zero(); num_pages];
+        let mut rest0 = vec![ByteGroup::zero(); num_pages];
+        let mut rest1 = vec![ByteGroup::zero(); num_pages];
+
+        k0.full_eval(&mut orig0).unwrap();
+        k1.full_eval(&mut orig1).unwrap();
+        restored0.full_eval(&mut rest0).unwrap();
+        restored1.full_eval(&mut rest1).unwrap();
+
+        assert_eq!(orig0, rest0, "party0 eval mismatch after roundtrip");
+        assert_eq!(orig1, rest1, "party1 eval mismatch after roundtrip");
+    }
+
+    #[test]
+    fn page_dpf_key_serialization_25bit() {
+        let params = PageDpfParams::new(25).unwrap();
+        let (k0, _) = generate_page_dpf_keys(&params, 1_000_000).unwrap();
+
+        let bytes = k0.to_bytes();
+        assert_eq!(bytes.len(), 66 + 17 * 25); // 491 bytes
+
+        let restored = PageDpfKey::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.domain_bits(), 25);
+        assert!(!restored.is_party1());
+    }
+
+    #[test]
+    fn page_dpf_key_from_bytes_rejects_invalid() {
+        assert!(matches!(
+            PageDpfKey::from_bytes(&[]),
+            Err(PageDpfError::InvalidKeyFormat(_))
+        ));
+
+        assert!(matches!(
+            PageDpfKey::from_bytes(&[0]),
+            Err(PageDpfError::InvalidDomainBits { .. })
+        ));
+
+        assert!(matches!(
+            PageDpfKey::from_bytes(&[33]),
+            Err(PageDpfError::InvalidDomainBits { .. })
+        ));
+
+        let mut short = vec![8u8]; // domain_bits = 8
+        short.extend_from_slice(&[0u8; 50]); // too short
+        assert!(matches!(
+            PageDpfKey::from_bytes(&short),
+            Err(PageDpfError::InvalidKeyLength { .. })
         ));
     }
 

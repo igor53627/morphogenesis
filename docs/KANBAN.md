@@ -342,7 +342,16 @@ Need proper 2-server FSS/DPF where keys are computationally indistinguishable.
   - Streaming API avoids separate O(N) DPF output allocation during page scan
   - 24 tests pass including new boundary and streaming tests
 
-- [ ] Phase 61: Integration plan for replacing AesDpfKey
+- [x] Phase 61a: Add PageDpfKey serialization (COMPLETE)
+  - to_bytes()/from_bytes() with format: 66 + 17*domain_bits bytes
+  - 25-bit domain (mainnet): 491 bytes per key
+  - Roundtrip tests verify full_eval produces identical output
+  - Created docs/PAGE_PIR_INTEGRATION.md with full migration plan
+- [ ] Phase 61b: Create page-level query types (PageQueryRequest/Response)
+- [ ] Phase 61c: Add page-level scan function (scan_pages_chunked)
+- [ ] Phase 61d: Wire up page query handler (POST /query/page)
+- [ ] Phase 61e: Update client library for page-level queries
+- [ ] Phase 61f: Reorganize data as pages (migration)
 
 ### Vendor fss-rs for Streaming Eval (Jan 19, 2026)
 Goal: Eliminate O(N) DPF output allocation (528MB at 25-bit domain).
