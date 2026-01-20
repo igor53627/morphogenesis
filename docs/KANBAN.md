@@ -761,8 +761,9 @@ True GPU speedup requires custom CUDA implementation.
 
 **Phase 74: End-to-End GPU PIR (Jan 19, 2026) - COMPLETE**
 - [x] Phase 74a: Integrate phases 71-73 (API endpoint, GPU scanner, EpochManager integration)
-  - Result: **VERIFIED on Modal T4 GPU**
+  - Result: **VERIFIED on Modal T4, H100, and H200 GPUs**
   - Full pipeline (Client -> API -> GPU Scanner -> CUDA Kernel) functional.
+  - Native Hopper (`sm_90`) and Turing (`sm_75`) support verified.
 - [ ] Phase 74b: Benchmark at 25-bit domain (27M pages)
 - [ ] Phase 74c: Multi-query batching for throughput
 - [ ] Phase 74d: Production hardening (error handling, monitoring)
