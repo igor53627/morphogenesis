@@ -159,6 +159,12 @@ impl<V: Clone> CuckooTable<V> {
     pub fn load_factor(&self) -> f64 {
         self.len() as f64 / self.num_buckets as f64
     }
+
+    pub fn iter_enumerated(&self) -> impl Iterator<Item = (usize, &Vec<u8>, &V)> {
+        self.buckets.iter().enumerate().filter_map(|(i, b)| {
+            b.as_ref().map(|(k, v)| (i, k, v))
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

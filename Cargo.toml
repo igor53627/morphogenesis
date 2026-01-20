@@ -6,5 +6,6 @@
      "crates/morphogen-gpu-dpf",
      "crates/morphogen-storage",
      "crates/morphogen-server",
+     "crates/ubt-exex",
  ]
  resolver = "2"

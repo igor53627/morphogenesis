@@ -764,6 +764,12 @@ True GPU speedup requires custom CUDA implementation.
   - Result: **VERIFIED on Modal T4, H100, and H200 GPUs**
   - Full pipeline (Client -> API -> GPU Scanner -> CUDA Kernel) functional.
   - Native Hopper (`sm_90`) and Turing (`sm_75`) support verified.
+**Phase 76: Reth Integration & Data Extraction (Jan 20, 2026) - IN PROGRESS**
+- [x] Scaffold `ubt-exex` crate for Reth integration.
+- [x] Implement `reth_dump` tool for flat matrix extraction.
+- [ ] Implement live update streaming via Reth ExEx.
+- [ ] Implement UBT Merkle tree generation in `ubt-exex`.
+
 **Phase 75: Privacy Hardening (Cuckoo Seed Rotation) (Jan 19, 2026) - IN PROGRESS**
 - [x] Design "Major Epoch" architecture (`docs/design/ROTATION_AND_UBT.md`).
 - [x] Implement `EpochManager::submit_snapshot` API stub.
