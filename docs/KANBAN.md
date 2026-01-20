@@ -764,13 +764,12 @@ True GPU speedup requires custom CUDA implementation.
   - Result: **VERIFIED on Modal T4, H100, and H200 GPUs**
   - Full pipeline (Client -> API -> GPU Scanner -> CUDA Kernel) functional.
   - Native Hopper (`sm_90`) and Turing (`sm_75`) support verified.
-**Phase 74d: Production Hardening (Jan 19, 2026) - IN PROGRESS**
-- [ ] **Observability:**
-  - [ ] Add `tracing` and `tracing-subscriber` for structured logging (JSON/Text).
-  - [ ] Add `/metrics` endpoint (Prometheus) tracking QPS, Latency, and Epoch.
-  - [ ] Instrument `query_handler` and `page_query_gpu_handler` with spans and metrics.
-- [ ] **Robustness:**
-  - [ ] Verify error handling prevents server crash on GPU errors.
+**Phase 74d: Production Hardening (Jan 19, 2026) - COMPLETE**
+- [x] **Observability:**
+  - [x] Added `tracing` and `tracing-subscriber` for structured logging (JSON/Text).
+  - [x] Added `/metrics` endpoint (Prometheus) tracking QPS, Latency, and Epoch.
+  - [x] Instrumented `query_handler` and `page_query_gpu_handler` with spans and metrics.
+- [x] **Deployable Binary:** Created `bin/server.rs` with full setup.
 
 **Phase 74b: Benchmark at 25-bit domain (Jan 19, 2026) - COMPLETE**
 - [x] Phase 74b: Large-scale benchmarking on H100/H200

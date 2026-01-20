@@ -18,6 +18,10 @@
  serde_json = { version = "1", optional = true }
  hex = { version = "0.4", optional = true }
  tower = { version = "0.5", features = ["limit"], optional = true }
+ tracing = { version = "0.1", optional = true }
+ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+ metrics = { version = "0.24", optional = true }
+ metrics-exporter-prometheus = { version = "0.16", optional = true }
 
  [dev-dependencies]
  morphogen-client = { path = "../morphogen-client" }
@@ -35,8 +39,17 @@
  profiling = []
  streaming_stores = []
  parallel = []
- network = ["axum", "tokio", "serde", "serde_json", "hex", "tower"]
+ network = ["axum", "tokio", "serde", "serde_json", "hex", "tower", "tracing", "tracing-subscriber", "metrics", "metrics-exporter-prometheus"]
 
  [lib]
  name = "morphogen_server"
  path = "src/lib.rs"
+
+ [[bin]]
+ name = "bench_scan"
+ path = "src/bin/bench_scan.rs"
+
+ [[bin]]
+ name = "server"
+ path = "src/bin/server.rs"
+ required-features = ["network"]

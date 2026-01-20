@@ -16,6 +16,11 @@ use axum::{
     routing::{get, post},
     Router,
 };
+#[cfg(feature = "tracing")]
+use tracing::{info, error, instrument};
+#[cfg(feature = "metrics")]
+use metrics::{counter, histogram};
+
 use morphogen_core::GlobalState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -238,10 +243,14 @@ fn scan_error_to_status(e: crate::scan::ScanError) -> StatusCode {
     }
 }
 
+#[cfg_attr(feature = "tracing", instrument(skip(state, request)))]
 pub async fn query_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, StatusCode> {
+    #[cfg(feature = "metrics")]
+    counter!("pir_query_count_total", "type" => "row").increment(1);
+
     use crate::scan::scan_consistent;
     use morphogen_dpf::AesDpfKey;
 
@@ -312,10 +321,14 @@ pub async fn ws_query_handler(
     ws.on_upgrade(move |socket| handle_ws_query(socket, state))
 }
 
+#[cfg_attr(feature = "tracing", instrument(skip(state, request)))]
 pub async fn page_query_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<PageQueryRequest>,
 ) -> Result<Json<PageQueryResponse>, StatusCode> {
+    #[cfg(feature = "metrics")]
+    counter!("pir_query_count_total", "type" => "page").increment(1);
+
     use crate::scan::scan_pages_consistent;
     use morphogen_dpf::page::{PageDpfKey, PAGE_SIZE_BYTES};
 
@@ -364,10 +377,14 @@ pub async fn page_query_handler(
     }))
 }
 
+#[cfg_attr(feature = "tracing", instrument(skip(state, request)))]
 pub async fn page_query_gpu_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<GpuPageQueryRequest>,
 ) -> Result<Json<PageQueryResponse>, StatusCode> {
+    #[cfg(feature = "metrics")]
+    counter!("pir_query_count_total", "type" => "gpu").increment(1);
+
     use morphogen_gpu_dpf::dpf::ChaChaKey;
 
     if request.keys.len() != 3 {
@@ -511,10 +528,21 @@ pub const MAX_WS_MESSAGE_BYTES: usize = MAX_REQUEST_BODY_SIZE;
 pub const MAX_CONCURRENT_SCANS: usize = 32;
 
 pub fn create_router(state: Arc<AppState>) -> Router {
-    create_router_with_concurrency(state, MAX_CONCURRENT_SCANS)
+    #[cfg(feature = "metrics")]
+    {
+        create_router_with_concurrency(state, MAX_CONCURRENT_SCANS, None)
+    }
+    #[cfg(not(feature = "metrics"))]
+    {
+        create_router_with_concurrency(state, MAX_CONCURRENT_SCANS)
+    }
 }
 
-pub fn create_router_with_concurrency(state: Arc<AppState>, max_concurrent: usize) -> Router {
+pub fn create_router_with_concurrency(
+    state: Arc<AppState>, 
+    max_concurrent: usize,
+    #[cfg(feature = "metrics")] metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+) -> Router {
     use tower::limit::ConcurrencyLimitLayer;
 
     let scan_routes = Router::new()
@@ -523,14 +551,21 @@ pub fn create_router_with_concurrency(state: Arc<AppState>, max_concurrent: usiz
         .route("/query/page/gpu", post(page_query_gpu_handler))
         .layer(ConcurrencyLimitLayer::new(max_concurrent));
 
-    Router::new()
+    let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/epoch", get(epoch_handler))
         .merge(scan_routes)
         .route("/ws/epoch", get(ws_epoch_handler))
         .route("/ws/query", get(ws_query_handler))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_SIZE))
-        .with_state(state)
+        .with_state(state);
+
+    #[cfg(feature = "metrics")]
+    if let Some(handle) = metrics_handle {
+        app = app.route("/metrics", get(move || async move { handle.render() }));
+    }
+    
+    app
 }
 
 #[cfg(test)]
