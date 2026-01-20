@@ -103,4 +103,13 @@ impl ChunkedMatrix {
         let len = data.len().min(row_size);
         slice[offset_in_chunk..offset_in_chunk + len].copy_from_slice(&data[..len]);
     }
+
+    pub fn write_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+        for chunk in &self.chunks {
+            file.write_all(chunk.as_slice())?;
+        }
+        Ok(())
+    }
 }

@@ -16,8 +16,8 @@ clap = { version = "4.4", features = ["derive"] }
 eyre = "0.6"
 futures-util = "0.3"
 reth-db = { git = "https://github.com/paradigmxyz/reth", optional = true }
-reth-primitives = { git = "https://github.com/paradigmxyz/reth", optional = true }
+alloy-primitives = { version = "0.8", optional = true }
 
 [features]
 default = []
-reth = ["dep:reth-db", "dep:reth-primitives"]
+reth = ["dep:reth-db", "dep:alloy-primitives"]

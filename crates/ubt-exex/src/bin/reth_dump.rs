@@ -1,6 +1,5 @@
 use clap::Parser;
-use ubt_exex::{AccountSource, build_matrix};
-use std::path::PathBuf;
+use ubt_exex::{AccountSource, build_matrix, RowScheme};
 
 #[derive(Parser)]
 struct Args {
@@ -12,13 +11,13 @@ struct Args {
     #[arg(short, long, default_value = "matrix.bin")]
     output: PathBuf,
 
+    /// Row scheme (compact=32B, full=64B)
+    #[arg(short, long, value_enum, default_value_t = RowScheme::Compact)]
+    scheme: RowScheme,
+
     /// Number of rows in Cuckoo table
     #[arg(short, long, default_value_t = 27000000)]
     rows: usize,
-
-    /// Row size in bytes (256 or 2048)
-    #[arg(short, long, default_value_t = 256)]
-    size: usize,
 
     /// Build with UBT proofs (Trustless mode)
     #[arg(short, long)]
@@ -27,6 +26,10 @@ struct Args {
     /// Estimate optimal table size instead of extracting
     #[arg(short, long)]
     estimate: bool,
+
+    /// Sample data to analyze compression potential
+    #[arg(long)]
+    sample: bool,
 }
 
 fn main() {
@@ -35,23 +38,36 @@ fn main() {
     println!("=== Morphogenesis Reth Extraction Tool ===");
     println!("DB Path: {:?}", args.db);
 
+    if args.sample {
+        println!("Mode: SAMPLE");
+        #[cfg(feature = "reth")]
+        {
+            let source = ubt_exex::RethSource::new(args.db.to_str().unwrap());
+            source.sample_data(10); // Sample 10 items
+        }
+        #[cfg(not(feature = "reth"))]
+        {
+            println!("Error: Compile with --features reth for sampling.");
+        }
+        return;
+    }
+
     if args.estimate {
         println!("Mode: ESTIMATE");
         #[cfg(feature = "reth")]
         {
-            // let mut source = ubt_exex::RethSource::new(args.db.to_str().unwrap());
-            // let count = source.count_all();
-            // let recommended = (count as f64 / 0.85).ceil() as usize;
-            // println!("Found {} accounts.", count);
-            // println!("Recommended --rows: {}", recommended);
-            println!("Reth estimation would run here.");
+            let mut source = ubt_exex::RethSource::new(args.db.to_str().unwrap());
+            let count = source.count_all();
+            let recommended = (count as f64 / 0.85).ceil() as usize;
+            println!("Found {} items (Accounts + Storage).", count);
+            println!("Recommended --rows: {}", recommended);
         }
         #[cfg(not(feature = "reth"))]
         {
             println!("Error: Compile with --features reth for real estimation.");
             let count = (args.rows as f64 * 0.8) as usize; // Demo count
             let recommended = (count as f64 / 0.85).ceil() as usize;
-            println!("Found {} accounts (synthetic).", count);
+            println!("Found {} items (synthetic).", count);
             println!("Recommended --rows: {}", recommended);
         }
         return;
@@ -59,15 +75,24 @@ fn main() {
 
     println!("Mode: EXTRACT");
     println!("Output: {:?}", args.output);
+    println!("Scheme: {:?}", args.scheme);
     println!("Target Rows: {}", args.rows);
-    println!("Row Size: {}", args.size);
 
     #[cfg(feature = "reth")]
     {
-        // let mut source = ubt_exex::RethSource::new(args.db.to_str().unwrap());
-        // let (matrix, seeds) = build_matrix(&mut source, args.rows, args.size, args.trustless);
-        // matrix.write_to_file(args.output).unwrap();
-        println!("Reth extraction logic would run here.");
+        let (matrix, manifest) = ubt_exex::dump_reth_to_matrix(
+            args.db.to_str().unwrap(), 
+            args.rows, 
+            args.scheme, 
+            args.trustless
+        );
+        println!("Saving matrix to {:?}...", args.output);
+        matrix.write_to_file(&args.output).unwrap();
+        
+        let manifest_path = args.output.with_extension("json");
+        let file = std::fs::File::create(manifest_path).unwrap();
+        serde_json::to_writer_pretty(file, &manifest).unwrap();
+        println!("Extraction complete.");
     }
 
     #[cfg(not(feature = "reth"))]
@@ -75,8 +100,10 @@ fn main() {
         println!("Error: This binary must be compiled with --features reth to use RethSource.");
         println!("Running with SyntheticSource for demo...");
         let mut source = ubt_exex::SyntheticSource::new((args.rows as f64 * 0.8) as usize);
-        let (matrix, seeds) = build_matrix(&mut source, args.rows, args.size, args.trustless);
-        // matrix.write_to_file(args.output).unwrap();
-        println!("Synthetic matrix generated. Seeds: {:x?}", seeds);
+        let (_matrix, manifest) = build_matrix(&mut source, args.rows, args.scheme, args.trustless);
+        
+        let manifest_path = args.output.with_extension("json");
+        println!("Writing manifest to {:?}", manifest_path);
+        println!("Manifest: {}", serde_json::to_string_pretty(&manifest).unwrap());
     }
 }
