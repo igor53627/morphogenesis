@@ -82,8 +82,6 @@ impl DpfKeyGpu {
 }
 
 /// GPU implementation of the PIR scanner.
-use std::collections::HashMap;
-
 #[cfg(feature = "cuda")]
 pub struct GpuScanner {
     pub device: Arc<CudaDevice>,
