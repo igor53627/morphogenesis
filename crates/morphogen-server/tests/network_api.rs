@@ -56,6 +56,10 @@ fn test_state() -> Arc<AppState> {
         state_root: [0xAB; 32],
         epoch_rx: rx,
         page_config: None,
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
     })
 }
 
@@ -426,6 +430,10 @@ mod websocket_epoch {
             state_root: [0xAB; 32],
             epoch_rx: rx,
             page_config: None,
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
         });
         (state, tx)
     }
@@ -669,6 +677,10 @@ mod page_query {
             state_root: [0xAB; 32],
             epoch_rx: rx,
             page_config: Some(page_config),
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
         });
         (state, params)
     }
