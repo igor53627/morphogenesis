@@ -764,17 +764,22 @@ True GPU speedup requires custom CUDA implementation.
   - Result: **VERIFIED on Modal T4, H100, and H200 GPUs**
   - Full pipeline (Client -> API -> GPU Scanner -> CUDA Kernel) functional.
   - Native Hopper (`sm_90`) and Turing (`sm_75`) support verified.
-- [ ] Phase 74b: Benchmark at 25-bit domain (27M pages)
 - [ ] Phase 74c: Multi-query batching for throughput
 - [ ] Phase 74d: Production hardening (error handling, monitoring)
 
-**Hardware Requirements (Updated with Phase 71e benchmarks):**
-| Config | GPU Memory | DB Capacity | Est. Latency |
-|--------|------------|-------------|--------------|
-| 1x H100 | 80GB | 80GB (19M pages) | **~65ms** |
-| 2x H100 | 160GB | 108GB (27M pages) | **~108ms** |
-| 1x A100 | 40GB | 40GB (10M pages) | ~100ms |
-| 2x A100 | 80GB | 80GB (19M pages) | ~200ms |
+**Phase 74b: Benchmark at 25-bit domain (Jan 19, 2026) - COMPLETE**
+- [x] Phase 74b: Large-scale benchmarking on H100/H200
+  - **H100 (24-bit, 69GB):** 42.5 ms latency @ 1,618 GB/s
+  - **H200 (25-bit, 137GB):** 87.3 ms latency @ 1,574 GB/s
+  - **Mainnet Projection (108GB):** ~67-68ms (Target: <600ms)
+  - **Result:** 8.9x faster than target. Single H200 can serve Mainnet state entirely from VRAM.
+
+**Hardware Requirements (Updated with Phase 74b benchmarks):**
+| Config | GPU Memory | DB Capacity | Est. Latency | Status |
+|--------|------------|-------------|--------------|--------|
+| 1x H100 | 80GB | 69GB (16M pages) | **42.5ms** | VERIFIED |
+| 1x H200 | 141GB | 137GB (33M pages) | **87.3ms** | VERIFIED |
+| 2x A100 | 80GB | 80GB (19M pages) | ~200ms | EST |
 
 **Alternative: Tiered Memory**
 - Hot 20% of pages in GPU (22GB) = instant

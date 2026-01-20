@@ -18,29 +18,29 @@ image = (
     )
 )
 
-def run_bench(gpu_type: str, arch: str):
+def run_bench(gpu_type: str, arch: str, domain_bits: int):
     import subprocess
     import os
     
     os.chdir("/root/morphogen")
     os.environ["CUDA_ARCH"] = arch
     
-    print(f"--- Benchmarking on {gpu_type} ({arch}) ---")
+    print(f"--- Benchmarking on {gpu_type} ({arch}) - Domain: {domain_bits} bits ---")
     
     # Run the benchmark binary with --gpu flag
     # Note: We use --release for peak performance
     subprocess.run(
-        ["cargo", "run", "--release", "--package", "morphogen-gpu-dpf", "--bin", "bench_25bit", "--features", "cuda", "--", "--gpu"],
+        ["cargo", "run", "--release", "--package", "morphogen-gpu-dpf", "--bin", "bench_25bit", "--features", "cuda", "--", "--gpu", "--domain", str(domain_bits)],
         check=True
     )
 
 @app.function(image=image, gpu="H100", timeout=1800, memory=131072) # Need 128GB host RAM
 def bench_h100():
-    run_bench("H100", "sm_90")
+    run_bench("H100", "sm_90", 24)
 
 @app.function(image=image, gpu="H200", timeout=1800, memory=131072)
 def bench_h200():
-    run_bench("H200", "sm_90")
+    run_bench("H200", "sm_90", 25)
 
 @app.local_entrypoint()
 def main():
