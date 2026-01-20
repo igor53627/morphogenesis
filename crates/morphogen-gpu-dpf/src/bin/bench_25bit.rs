@@ -16,19 +16,27 @@ use morphogen_gpu_dpf::storage::GpuPageMatrix;
 fn main() {
     let args: Vec<String> = env::args().collect();
     let use_gpu = args.iter().any(|arg| arg == "--gpu");
-    let domain_bits: usize = 25; // Mainnet scale
-
-    println!("=== Morphogenesis PIR Mainnet Benchmark (25-bit) ===");
-    println!("Pages: {} (2^25)", 1usize << domain_bits);
-    println!("Data Size: 108.00 GB");
-    println!("Mode: {}", if use_gpu { "GPU (CUDA)" } else { "CPU (Rayon)" });
+    
+    let mut domain_bits = 25;
+    if let Some(idx) = args.iter().position(|arg| arg == "--domain") {
+        if let Some(val) = args.get(idx + 1) {
+            domain_bits = val.parse().expect("Invalid domain bits");
+        }
+    }
 
     let params = ChaChaParams::new(domain_bits).unwrap();
     let num_pages = params.max_pages();
     let total_size = num_pages * PAGE_SIZE_BYTES;
+    let size_gb = total_size as f64 / 1_000_000_000.0; // Decimal GB
+
+    println!("=== Morphogenesis PIR Scale Benchmark ===");
+    println!("Domain: {} bits", domain_bits);
+    println!("Pages: {}", num_pages);
+    println!("Data Size: {:.2} GB", size_gb);
+    println!("Mode: {}", if use_gpu { "GPU (CUDA)" } else { "CPU (Rayon)" });
 
     // 1. Database Setup
-    println!("\nAllocating 108GB synthetic database...");
+    println!("\nAllocating {:.2}GB synthetic database...", size_gb);
     let start = Instant::now();
     // Use a simpler pattern to avoid slow random/mapped initialization
     let db_data = vec![0u8; total_size]; 
@@ -36,9 +44,9 @@ fn main() {
 
     // 2. Query Setup
     let targets = [1337, num_pages / 2, num_pages - 1];
-    let (k0_0, k0_1) = generate_chacha_dpf_keys(&params, targets[0]).unwrap();
-    let (k1_0, k1_1) = generate_chacha_dpf_keys(&params, targets[1]).unwrap();
-    let (k2_0, k2_1) = generate_chacha_dpf_keys(&params, targets[2]).unwrap();
+    let (k0_0, _k0_1) = generate_chacha_dpf_keys(&params, targets[0]).unwrap();
+    let (k1_0, _k1_1) = generate_chacha_dpf_keys(&params, targets[1]).unwrap();
+    let (k2_0, _k2_1) = generate_chacha_dpf_keys(&params, targets[2]).unwrap();
 
     // 3. Execution
     if use_gpu {
@@ -48,12 +56,13 @@ fn main() {
             let scanner = GpuScanner::new(0).expect("Failed to create GpuScanner");
             let device = scanner.device.clone();
             
-            println!("Uploading 108GB to GPU (this will take a while over PCIe)...");
+            println!("Uploading {:.2}GB to GPU (this will take a while over PCIe)...", size_gb);
             let upload_start = Instant::now();
             let gpu_db = GpuPageMatrix::new(device, &db_data).expect("Failed to upload to GPU");
+            let upload_s = upload_start.elapsed().as_secs_f64();
             println!("Upload took {:.2}s ({:.2} GB/s)", 
-                upload_start.elapsed().as_secs_f64(),
-                108.0 / upload_start.elapsed().as_secs_f64()
+                upload_s,
+                size_gb / upload_s
             );
 
             println!("\n=== Starting GPU Timed Runs (5 iterations) ===");
@@ -61,10 +70,11 @@ fn main() {
                 let start = Instant::now();
                 let _result = unsafe { scanner.scan(&gpu_db, [&k0_0, &k1_0, &k2_0]) }.expect("GPU scan failed");
                 let elapsed = start.elapsed();
+                let ms = elapsed.as_secs_f64() * 1000.0;
                 println!("Iter {}: {:.2} ms ({:.2} GB/s)", 
                     i, 
-                    elapsed.as_secs_f64() * 1000.0,
-                    108.0 / elapsed.as_secs_f64()
+                    ms,
+                    size_gb / elapsed.as_secs_f64()
                 );
             }
         }
@@ -81,10 +91,11 @@ fn main() {
             let start = Instant::now();
             let _result = eval_fused_3dpf_cpu([&k0_0, &k1_0, &k2_0], &pages).expect("CPU scan failed");
             let elapsed = start.elapsed();
+            let ms = elapsed.as_secs_f64() * 1000.0;
             println!("Iter {}: {:.2} ms ({:.2} GB/s)", 
                 i, 
-                elapsed.as_secs_f64() * 1000.0,
-                108.0 / elapsed.as_secs_f64()
+                ms,
+                size_gb / elapsed.as_secs_f64()
             );
         }
     }
