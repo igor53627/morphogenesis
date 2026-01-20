@@ -116,7 +116,7 @@ impl GpuScanner {
         let mut kernels = HashMap::new();
         for (i, &name) in [1, 2, 4, 8, 16].iter().zip(kernel_names.iter()) {
             let func = device.get_func(&module_name, name).unwrap();
-            kernels.insert(i, func);
+            kernels.insert(*i, func);
         }
 
         Ok(Self {
