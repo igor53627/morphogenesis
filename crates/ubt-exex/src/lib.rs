@@ -16,6 +16,15 @@ pub struct Account {
 
 pub trait AccountSource {
     fn next_account(&mut self) -> Option<Account>;
+    
+    /// Consume the source to count total accounts.
+    fn count_all(&mut self) -> usize {
+        let mut count = 0;
+        while self.next_account().is_some() {
+            count += 1;
+        }
+        count
+    }
 }
 
 #[cfg(feature = "reth")]
@@ -80,6 +89,10 @@ impl AccountSource for SyntheticSource {
             nonce: seed,
             code_hash: [0u8; 32],
         })
+    }
+
+    fn count_all(&mut self) -> usize {
+        if self.count >= self.total { 0 } else { self.total - self.count }
     }
 }
 
