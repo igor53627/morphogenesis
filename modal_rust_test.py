@@ -18,12 +18,14 @@ image = (
     )
 )
 
-@app.function(image=image, gpu="T4", timeout=600)
+@app.function(image=image, gpu="H200", timeout=600)
 def test_gpu_integration():
     import subprocess
     import os
     
     os.chdir("/root/morphogen")
+    # Set architecture for H200
+    os.environ["CUDA_ARCH"] = "sm_90"
     
     print("--- Checking nvcc ---")
     subprocess.run(["nvcc", "--version"], check=True)

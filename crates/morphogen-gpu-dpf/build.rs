@@ -5,10 +5,14 @@ fn main() {
     #[cfg(feature = "cuda")]
     if std::process::Command::new("nvcc").arg("--version").output().is_ok() {
         let out_dir = std::env::var("OUT_DIR").unwrap();
+        let arch = std::env::var("CUDA_ARCH").unwrap_or_else(|_| "sm_75".to_string());
+        
+        println!("cargo:warning=Compiling for CUDA architecture: {}", arch);
+
         let status = std::process::Command::new("nvcc")
             .arg("-ptx")
             .arg("-O3")
-            .arg("-arch=sm_75") // T4 compatible (also runs on A100/H100)
+            .arg(format!("-arch={}", arch))
             .arg("cuda/fused_kernel.cu")
             .arg("-o")
             .arg(format!("{}/fused_kernel.ptx", out_dir))
