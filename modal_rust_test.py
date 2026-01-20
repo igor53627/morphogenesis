@@ -18,7 +18,7 @@ image = (
     )
 )
 
-@app.function(image=image, gpu="H200", timeout=600)
+@app.function(image=image, gpu="H100", timeout=600)
 def test_gpu_integration():
     import subprocess
     import os
