@@ -104,8 +104,9 @@ impl GpuScanner {
         })?;
 
         let module_name = "fused_pir".to_string();
-        device.load_ptx(ptx.into(), &module_name, &["fused_pir_kernel"])?;
-        let fused_fn = device.get_func(&module_name, "fused_pir_kernel").unwrap();
+        let kernel_name = "fused_batch_pir_kernel";
+        device.load_ptx(ptx.into(), &module_name, &[kernel_name])?;
+        let fused_fn = device.get_func(&module_name, kernel_name).unwrap();
 
         Ok(Self {
             device,
