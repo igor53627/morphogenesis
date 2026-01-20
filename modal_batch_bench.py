@@ -32,6 +32,20 @@ def bench_batch_h100():
         check=True
     )
 
+@app.function(image=image, gpu="B200", timeout=1200, memory=131072)
+def bench_batch_b200():
+    import subprocess
+    import os
+    
+    os.chdir("/root/morphogen")
+    os.environ["CUDA_ARCH"] = "sm_90" # Use sm_90 for compatibility with CUDA 12.4
+    
+    print("--- Running Batch Benchmark on B200 (24-bit domain) ---")
+    subprocess.run(
+        ["cargo", "run", "--release", "--package", "morphogen-gpu-dpf", "--bin", "bench_batch", "--features", "cuda", "--", "--gpu", "--domain", "24"],
+        check=True
+    )
+
 @app.local_entrypoint()
 def main():
-    bench_batch_h100.remote()
+    bench_batch_b200.remote()
