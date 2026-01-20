@@ -8,7 +8,7 @@ fn main() {
         let status = std::process::Command::new("nvcc")
             .arg("-ptx")
             .arg("-O3")
-            .arg("-arch=sm_80") // A100+
+            .arg("-arch=sm_75") // T4 compatible (also runs on A100/H100)
             .arg("cuda/fused_kernel.cu")
             .arg("-o")
             .arg(format!("{}/fused_kernel.ptx", out_dir))
