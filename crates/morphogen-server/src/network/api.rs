@@ -402,19 +402,66 @@ pub async fn page_query_gpu_handler(
 
     #[cfg(feature = "cuda")]
     if let (Some(scanner), Some(matrix_mutex)) = (&state.gpu_scanner, &state.gpu_matrix) {
-        let matrix_guard = matrix_mutex
-            .lock()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        if let Some(matrix) = matrix_guard.as_ref() {
-            let snapshot = state.global.load();
-            let result = unsafe { scanner.scan(matrix, [&keys[0], &keys[1], &keys[2]]) }
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        use crate::scan::scan_delta_for_gpu;
+        use morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
 
-            return Ok(Json(PageQueryResponse {
-                epoch_id: snapshot.epoch_id,
-                pages: vec![result.page0, result.page1, result.page2],
-            }));
+        for _ in 0..10 {
+            let snapshot1 = state.global.load();
+            // We need to pass the delta buffer ref to scan_delta_for_gpu, but checking consistency manually first
+            // Actually scan_delta_for_gpu calls snapshot().
+            // We should use snapshot_with_epoch to be safe.
+            // But scan_delta_for_gpu takes &DeltaBuffer.
+            // Let's implement the retry logic around the calls.
+            
+            // 1. Get GPU lock and matrix
+            let matrix_guard = matrix_mutex
+                .lock()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            
+            // 2. Check epochs
+            if let Some(matrix) = matrix_guard.as_ref() {
+                let pending_epoch = state.pending.pending_epoch(); // Relaxed check
+                if pending_epoch != snapshot1.epoch_id {
+                    drop(matrix_guard);
+                    std::thread::yield_now();
+                    continue;
+                }
+
+                // 3. Scan GPU
+                let mut results = unsafe { scanner.scan(matrix, [&keys[0], &keys[1], &keys[2]]) }
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                
+                // 4. Scan Delta
+                let delta_results = scan_delta_for_gpu(&state.pending, &[keys[0], keys[1], keys[2]], PAGE_SIZE_BYTES)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                
+                // 5. Verify consistency after scan
+                let snapshot2 = state.global.load();
+                let pending_epoch_after = state.pending.pending_epoch();
+                
+                if snapshot1.epoch_id == snapshot2.epoch_id && pending_epoch_after == snapshot1.epoch_id {
+                    // Merge results
+                    for k in 0..3 {
+                        let gpu_page = match k {
+                            0 => &mut results.page0,
+                            1 => &mut results.page1,
+                            _ => &mut results.page2,
+                        };
+                        for (i, b) in delta_results[k].iter().enumerate() {
+                            gpu_page[i] ^= *b;
+                        }
+                    }
+
+                    return Ok(Json(PageQueryResponse {
+                        epoch_id: snapshot1.epoch_id,
+                        pages: vec![results.page0, results.page1, results.page2],
+                    }));
+                }
+            }
+            drop(matrix_guard);
+            std::thread::yield_now();
         }
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
     // CPU Fallback (or if CUDA is disabled)

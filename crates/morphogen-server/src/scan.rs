@@ -338,16 +338,52 @@ pub fn scan_pages_consistent_with_max_retries(
     })
 }
 
-#[cfg(feature = "parallel")]
-pub fn scan_consistent_parallel<K: DpfKey + Sync>(
-    global: &GlobalState,
-    pending: &DeltaBuffer,
-    keys: &[K; 3],
-    row_size_bytes: usize,
-) -> Result<([Vec<u8>; 3], u64), ScanError> {
-    scan_consistent_parallel_with_max_retries(
-        global,
-        pending,
+#[cfg(feature = "cuda")]
+pub fn scan_delta_for_gpu(
+    delta: &DeltaBuffer,
+    keys: &[morphogen_gpu_dpf::dpf::ChaChaKey; 3],
+    page_size_bytes: usize,
+) -> Result<[Vec<u8>; 3], ScanError> {
+    let entries = delta.snapshot().map_err(|_| ScanError::LockPoisoned)?;
+    
+    let mut results = [
+        vec![0u8; page_size_bytes],
+        vec![0u8; page_size_bytes],
+        vec![0u8; page_size_bytes],
+    ];
+
+    if entries.is_empty() {
+        return Ok(results);
+    }
+
+    let row_size = delta.row_size_bytes();
+    if row_size == 0 {
+        return Ok(results); // Should probably be error, but safe
+    }
+    let rows_per_page = page_size_bytes / row_size;
+
+    for entry in entries {
+        let page_idx = entry.row_idx / rows_per_page;
+        let row_offset_in_page = (entry.row_idx % rows_per_page) * row_size;
+        
+        // Ensure we don't write out of bounds
+        if row_offset_in_page + row_size > page_size_bytes {
+            continue; // Should not happen if invariants hold
+        }
+
+        for k in 0..3 {
+            let mask_seed = keys[k].eval(page_idx);
+            let mask_bytes = mask_seed.to_bytes(); // 16 bytes
+
+            let target_slice = &mut results[k][row_offset_in_page..row_offset_in_page + row_size];
+            for (i, byte) in entry.diff.iter().enumerate() {
+                // Mask is repeated every 16 bytes (block size of ChaCha/uint4)
+                target_slice[i] ^= byte & mask_bytes[i % 16];
+            }
+        }
+    }
+    Ok(results)
+}
         keys,
         row_size_bytes,
         DEFAULT_MAX_RETRIES,
