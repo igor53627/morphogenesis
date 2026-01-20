@@ -764,11 +764,27 @@ True GPU speedup requires custom CUDA implementation.
   - Result: **VERIFIED on Modal T4, H100, and H200 GPUs**
   - Full pipeline (Client -> API -> GPU Scanner -> CUDA Kernel) functional.
   - Native Hopper (`sm_90`) and Turing (`sm_75`) support verified.
-**Phase 76: Reth Integration & Data Extraction (Jan 20, 2026) - IN PROGRESS**
+**Phase 76: Reth Integration & Data Extraction (Jan 20, 2026) - COMPLETE**
 - [x] Scaffold `ubt-exex` crate for Reth integration.
-- [x] Implement `reth_dump` tool for flat matrix extraction.
-- [ ] Implement live update streaming via Reth ExEx.
-- [ ] Implement UBT Merkle tree generation in `ubt-exex`.
+- [x] Implement `reth_dump` tool with `Compact` (32B) and `Full` (64B) schemas.
+- [x] Verify data fit: 100% of accounts fit in 128-bit balance.
+- [x] Start full mainnet extraction on `hsiao`.
+
+**Phase 77: Code Serving & Full Integration (Next Steps)**
+- [ ] **Code Extraction:**
+  - [ ] Extend `reth_dump` to export `code_dictionary.bin` (Map: ID -> Hash).
+  - [ ] Implement bytecode extraction: Dump actual contract code to `code_store/` (CAS).
+- [ ] **Code Serving:**
+  - [ ] Create simple HTTP service: `GET /code/{id}` -> returns bytecode.
+  - [ ] Alternatively, serve via IPFS/CDN using `CodeHash`.
+- [ ] **Client Integration:**
+  - [ ] Update `morphogen-client` to parse 32-byte rows.
+  - [ ] Implement "Hybrid Query": PIR for Balance + HTTP for Code.
+- [ ] **End-to-End Verification:**
+  - [ ] Load `mainnet_compact.bin` into `morphogen-server` on B200.
+  - [ ] Query a known contract (e.g. WETH).
+  - [ ] Verify Balance matches Etherscan.
+  - [ ] Verify CodeHash matches.
 
 **Phase 75: Privacy Hardening (Cuckoo Seed Rotation) (Jan 19, 2026) - IN PROGRESS**
 - [x] Design "Major Epoch" architecture (`docs/design/ROTATION_AND_UBT.md`).
