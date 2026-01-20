@@ -50,7 +50,10 @@ fn main() {
         let gpu_db = GpuPageMatrix::new(device, &db_data).expect("Failed to upload to GPU");
 
         // Test batch sizes
-        let batch_sizes = [1, 2, 4, 8, 16];
+        // Limited to 4 because default shared memory per block is 48KB.
+        // Batch 4 requires 4 * 3 * 4096 = 48KB.
+        // To go higher (8, 16), we need to set CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES.
+        let batch_sizes = [1, 2, 4];
         
         println!("\n{:<10} {:<15} {:<15} {:<15}", "Batch", "Avg Latency", "Throughput", "Mem BW");
         println!("{:-<60}", "");
