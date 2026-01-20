@@ -158,14 +158,17 @@ pub fn dump_reth_to_matrix(
     db_path: &str,
     num_rows: usize,
     scheme: RowScheme,
-    trustless: bool,
+    _trustless: bool,
 ) -> (ChunkedMatrix, Manifest, CodeIndexer) {
     use reth_db::Database;
+    use reth_db::cursor::DbCursorRO;
+    use reth_db::table::Table;
     
+    type AccTable = reth_db::tables::PlainAccountState;
+    type StorageTable = reth_db::tables::PlainStorageState;
+
     let db = Arc::new(reth_db::open_db_read_only(std::path::Path::new(db_path), Default::default()).unwrap());
-    let tx = db.tx().expect("Failed to start transaction");
     let mut indexer = CodeIndexer::new();
-    
     let row_size = match scheme {
         RowScheme::Compact => 32,
         RowScheme::Full => 64,
@@ -175,38 +178,110 @@ pub fn dump_reth_to_matrix(
     let seeds = [0x1234_5678, 0x9ABC_DEF0, 0xFEDC_BA98];
     let mut table = CuckooTable::<Vec<u8>>::with_seeds(num_rows, seeds);
 
-    // 2. Stream Accounts
+    // 2. Stream Accounts (Batching)
     println!("Streaming Accounts...");
-    let mut acc_cursor = tx.cursor_read::<reth_db::tables::PlainAccountState>().expect("Cursor failed");
-    while let Some((addr, acc)) = acc_cursor.next().unwrap() {
-        let key = addr.to_vec();
-        // Convert reth account to our Account struct
-        let my_acc = Account {
-            address: addr.into(),
-            balance: acc.balance.to::<u128>(),
-            nonce: acc.nonce,
-            code_hash: acc.bytecode_hash.map(|h| h.0).unwrap_or([0u8; 32]),
-        };
-        let p = serialize_account(&my_acc, scheme, &mut indexer);
-        if let Err(_) = table.insert(key, p) {
-            break;
+    let mut last_addr: Option<<AccTable as Table>::Key> = None;
+    let mut account_count = 0;
+    
+    loop {
+        let tx = db.tx().expect("Failed to start transaction");
+        let mut acc_cursor = tx.cursor_read::<AccTable>().expect("Cursor failed");
+        
+        let mut batch_count = 0;
+        let mut found_any = false;
+
+        let mut it: Box<dyn Iterator<Item = Result<(<AccTable as Table>::Key, <AccTable as Table>::Value), _>>> = 
+            if let Some(last) = last_addr {
+                Box::new(acc_cursor.walk_range(last..).expect("Walk failed"))
+            } else {
+                Box::new(acc_cursor.walk(None).expect("Walk failed"))
+            };
+
+        // If we sought to last_addr, skip it
+        if last_addr.is_some() {
+            it.next(); 
         }
+
+        while let Some(result) = it.next() {
+            let (addr, acc): (<AccTable as Table>::Key, <AccTable as Table>::Value) = result.expect("Read failed");
+            found_any = true;
+            last_addr = Some(addr);
+            
+            let key = addr.to_vec();
+            let my_acc = Account {
+                address: addr.into(),
+                balance: acc.balance.to::<u128>(),
+                nonce: acc.nonce,
+                code_hash: acc.bytecode_hash.map(|h| h.0).unwrap_or([0u8; 32]),
+            };
+            let p = serialize_account(&my_acc, scheme, &mut indexer);
+            if let Err(_) = table.insert(key, p) {
+                println!("Table Full!");
+                break;
+            }
+            
+            account_count += 1;
+            batch_count += 1;
+            if account_count % 1_000_000 == 0 {
+                println!("  Processed {} accounts...", account_count);
+            }
+            
+            if batch_count >= 5_000_000 { break; } // Refresh TX
+        }
+        
+        if !found_any || batch_count < 5_000_000 { break; }
     }
 
-    // 3. Stream Storage
+    // 3. Stream Storage (Batching)
     println!("Streaming Storage...");
-    let mut storage_cursor = tx.cursor_read::<reth_db::tables::PlainStorageState>().expect("Cursor failed");
-    while let Some((addr, entry)) = storage_cursor.next().unwrap() {
-        let mut k = Vec::with_capacity(52);
-        k.extend_from_slice(addr.as_slice());
-        k.extend_from_slice(entry.key.as_slice());
+    let mut last_storage_addr: Option<<StorageTable as Table>::Key> = None;
+    let mut storage_count = 0;
+
+    loop {
+        let tx = db.tx().expect("Failed to start transaction");
+        let mut storage_cursor = tx.cursor_read::<StorageTable>().expect("Cursor failed");
         
-        let mut p = vec![0u8; row_size];
-        p[0..32].copy_from_slice(entry.value.to_be_bytes::<32>().as_slice());
-        
-        if let Err(_) = table.insert(k, p) {
-            break;
+        let mut batch_count = 0;
+        let mut found_any = false;
+
+        let mut it: Box<dyn Iterator<Item = Result<(<StorageTable as Table>::Key, <StorageTable as Table>::Value), _>>> = 
+            if let Some(last) = last_storage_addr {
+                Box::new(storage_cursor.walk_range(last..).expect("Walk failed"))
+            } else {
+                Box::new(storage_cursor.walk(None).expect("Walk failed"))
+            };
+
+        if last_storage_addr.is_some() {
+            it.next();
         }
+
+        while let Some(result) = it.next() {
+            let (addr, entry): (<StorageTable as Table>::Key, <StorageTable as Table>::Value) = result.expect("Read failed");
+            found_any = true;
+            last_storage_addr = Some(addr);
+            
+            let mut k = Vec::with_capacity(52);
+            k.extend_from_slice(addr.as_slice());
+            k.extend_from_slice(entry.key.as_slice());
+            
+            let mut p = vec![0u8; row_size];
+            p[0..32].copy_from_slice(entry.value.to_be_bytes::<32>().as_slice());
+            
+            if let Err(_) = table.insert(k, p) {
+                println!("Table Full (Storage)!");
+                break;
+            }
+            
+            storage_count += 1;
+            batch_count += 1;
+            if storage_count % 10_000_000 == 0 {
+                println!("  Processed {} storage slots...", storage_count);
+            }
+            
+            if batch_count >= 5_000_000 { break; }
+        }
+        
+        if !found_any || batch_count < 5_000_000 { break; }
     }
 
     // 4. Flatten to Matrix

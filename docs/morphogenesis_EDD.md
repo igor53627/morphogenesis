@@ -6,19 +6,18 @@
 
 ## 0. Query Modes
 
-The system supports two security modes with different row sizes:
+The system currently focuses on the **Privacy-Only** mode to maximize performance on available hardware.
 
 ```rust
 pub enum QueryMode {
-    PrivacyOnly,  // 256-byte rows, no UBT proof
-    Trustless,    // 2KB rows, includes UBT Merkle proof
+    PrivacyOnly,  // 256-byte or 32-byte rows
+    // Trustless, // MOVED TO ICEBOX: Requires 2KB rows and multi-GPU cluster
 }
 ```
 
 | Mode | Row Size | Trust Model | Use Case |
 |------|----------|-------------|----------|
-| **Privacy-Only** (default) | 256 bytes | Honest-but-curious | Fast queries, trusted operators |
-| **Trustless** | 2 KB | Fully adversarial | Full verification against block headers |
+| **Privacy-Only** | 32-64 bytes | Honest-but-curious | Fast queries, trusted operators |
 
 ### 0.1 Client Addressing Requirements
 
@@ -29,11 +28,14 @@ pub struct EpochMetadata {
     pub epoch_id: u64,
     pub num_rows: usize,                        // Cuckoo table size
     pub seeds: [u64; 3],                        // Hash function seeds
-    pub block_root: B256,                       // For Trustless mode verification
+    pub block_root: B256,                       // For consistency checking
 }
 ```
 
 **Stash handling:** At build-time, the server rehashes with new seeds until stash is empty (guaranteed at 85% load). Runtime additions (new accounts) go to Delta buffer at their first candidate position ($h_1$), which Delta-PIR scans automatically.
+
+### 0.2 Icebox: Trustless Mode
+**Trustless Mode** (2KB rows with Merkle Proofs) has been moved to the project Icebox due to the hardware requirement of an 8-GPU cluster to hold the ~850GB dataset in VRAM. It remains a valid future direction for fully adversarial environments.
 
 ## 1. Core Data Structures
 

@@ -784,9 +784,21 @@ True GPU speedup requires custom CUDA implementation.
   - [ ] Load `mainnet_compact.bin` into `morphogen-server` on B200.
   - [ ] Query a known contract (e.g. WETH).
   - [ ] Verify Balance matches Etherscan.
-  - [ ] Verify CodeHash matches.
 
 **Phase 75: Privacy Hardening (Cuckoo Seed Rotation) (Jan 19, 2026) - IN PROGRESS**
+- [x] Design "Major Epoch" architecture (`docs/design/ROTATION_AND_UBT.md`).
+- [x] Implement `EpochManager::submit_snapshot` API stub.
+- [ ] Implement `GpuPageMatrix` loading from `ChunkedMatrix`.
+- [ ] Expose administrative API endpoint.
+
+**Icebox: Trustless Mode (Future Work)**
+- [ ] **Data Structure:**
+  - [ ] Implement UBT (Unified Binary Tree) construction in `ubt-exex`.
+  - [ ] Generate Merkle Proofs for 2KB payload rows.
+- [ ] **Hardware:**
+  - [ ] Acquire 8-GPU cluster (H200/B200) to host ~3.7 TB matrix.
+- [ ] **Client:**
+  - [ ] Integrate Helios light client for Merkle verification.
 - [x] Design "Major Epoch" architecture (`docs/design/ROTATION_AND_UBT.md`).
 - [x] Implement `EpochManager::submit_snapshot` API stub.
 - [ ] Implement `GpuPageMatrix` loading from `ChunkedMatrix`.
