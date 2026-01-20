@@ -772,14 +772,15 @@ True GPU speedup requires custom CUDA implementation.
 
 **Phase 77: Code Serving & Full Integration (Next Steps)**
 - [ ] **Code Extraction:**
-  - [ ] Extend `reth_dump` to export `code_dictionary.bin` (Map: ID -> Hash).
-  - [ ] Implement bytecode extraction: Dump actual contract code to `code_store/` (CAS).
-- [ ] **Code Serving:**
-  - [ ] Create simple HTTP service: `GET /code/{id}` -> returns bytecode.
-  - [ ] Alternatively, serve via IPFS/CDN using `CodeHash`.
+  - [ ] Implement `reth_dump --extract-code` to dump bytecode to `code_store/`.
+  - [ ] Generate `mapping_v1.bin` (Flat list of 32B hashes).
+- [ ] **Code Serving (Static CAS):**
+  - [ ] **Design:** `docs/design/CODE_SERVING.md` (COMPLETE).
+  - [ ] Deploy `mapping.bin` and `code_store/` to S3/R2.
+  - [ ] Implement Range Request logic in client for `CodeID` resolution.
 - [ ] **Client Integration:**
   - [ ] Update `morphogen-client` to parse 32-byte rows.
-  - [ ] Implement "Hybrid Query": PIR for Balance + HTTP for Code.
+  - [ ] Implement `get_code(address)` via CAS lookup.
 - [ ] **End-to-End Verification:**
   - [ ] Load `mainnet_compact.bin` into `morphogen-server` on B200.
   - [ ] Query a known contract (e.g. WETH).
