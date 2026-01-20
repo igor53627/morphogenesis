@@ -19,6 +19,16 @@
 ### Key Insight: HBM-Resident Fused Kernel
 The transition from CPU to GPU provided a **100x+ improvement** by bypassing the PCIe/Memory bus bottleneck. Our custom CUDA kernel fuses DPF evaluation, page masking, and XOR reduction into a single pass, utilizing the massive HBM bandwidth (up to 4.8 TB/s on H200) directly.
 
+## Hybrid CPU/GPU Architecture
+
+To maintain **<100ms latency** while supporting **12s block updates**, we employ a hybrid split:
+
+1.  **Main Matrix (GPU HBM):** Stores the 108GB base snapshot (Epoch $N$). Read-only during queries. Scanned in ~60ms.
+2.  **Delta Buffer (CPU RAM):** Accumulates live updates (<100MB) for Epoch $N$. Scanned in <1ms.
+3.  **Merge:** The server XORs the GPU result and CPU result before responding.
+
+This architecture decouples the massive read bandwidth requirement (handled by GPU) from the low-latency write requirement (handled by CPU), allowing **zero-downtime updates**.
+
 ## Cuckoo Hash Table Optimization
 ...
 

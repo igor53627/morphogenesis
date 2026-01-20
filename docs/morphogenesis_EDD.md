@@ -90,11 +90,10 @@ pub struct EpochSnapshot {
 }
 ```
 
-## 2. The JIT Interference Engine (Unsafe Kernel)
+## 2. The Scan Engines
 
-This is the critical path. We bypass safe iterators to manually unroll loops and manage registers directly.
-
-
+### 2.1 CPU JIT Engine (AVX-512)
+This is the fallback path. We bypass safe iterators to manually unroll loops and manage registers directly.
 
 **Logic:**
 1.  Load 64 bytes (512 bits) of Matrix Data.
@@ -104,44 +103,15 @@ This is the critical path. We bypass safe iterators to manually unroll loops and
 
 ```rust
 #[target_feature(enable = "avx512f,avx512vl,vaes")]
-pub unsafe fn scan_kernel(
-    matrix_ptr: *const u8,
-    num_rows: usize,
-    keys: &[DpfKey; 3] // The 3 queries
-) -> [u8; 1024] { // Returns 3 x 1KB payloads
-    
-    // 1. Initialize Accumulators (Zeroed ZMM registers)
-    let mut acc_1 = _mm512_setzero_si512();
-    let mut acc_2 = _mm512_setzero_si512();
-    let mut acc_3 = _mm512_setzero_si512();
-
-    // 2. The Hot Loop (Unrolled)
-    // We process the matrix in 64-byte strides
-    for i in (0..num_rows).step_by(64) {
-        // A. Load Data (Bottleneck)
-        let data_vec = _mm512_load_si512(matrix_ptr.add(i) as *const _);
-
-        // B. AES Expansion (Pipelined)
-        // Note: Actual AES-NI logic omitted for brevity, but happens here.
-        // We generate 512 bits of pseudorandomness for each key.
-        let stream_1 = aes_expand(keys[0], i); 
-        let stream_2 = aes_expand(keys[1], i);
-        let stream_3 = aes_expand(keys[2], i);
-
-        // C. Conditional Accumulation (AND + XOR)
-        // If the stream bit is 1, we XOR the data.
-        acc_1 = _mm512_xor_si512(acc_1, _mm512_and_si512(data_vec, stream_1));
-        acc_2 = _mm512_xor_si512(acc_2, _mm512_and_si512(data_vec, stream_2));
-        acc_3 = _mm512_xor_si512(acc_3, _mm512_and_si512(data_vec, stream_3));
-    }
-
-    // 3. Finalize
-    // Write registers back to stack-allocated buffer
-    let mut result = [0u8; 1024];
-    // ... store logic ...
-    result
-}
+pub unsafe fn scan_kernel(...)
 ```
+
+### 2.2 GPU Fused Kernel (CUDA)
+This is the primary production path for scale. The entire DPF evaluation, masking, and XOR reduction is fused into a single CUDA kernel to maximize HBM bandwidth utilization.
+
+- **Throughput:** ~1.8 TB/s (on H200/B200).
+- **Latency:** ~60ms for 108GB.
+- **Batching:** Supports processing multiple queries (up to 16) in a single pass.
 
 ## 3. The Delta-PIR Implementation
 
@@ -165,7 +135,24 @@ pub fn scan_delta(&self, keys: &[DpfKey; 3], partial_results: &mut [u8]) {
 }
 ```
 
-## 4. Memory Management: Striped Copy-on-Write (CoW)
+## 4. Hybrid CPU/GPU Architecture
+
+To support high-frequency updates (12s block time) without rebuilding the massive 108GB GPU database constantly, we use a hybrid approach:
+
+1.  **Main Matrix (GPU HBM):**
+    *   Holds the "Base Snapshot" (Epoch $N$).
+    *   Read-only during queries.
+    *   Size: ~108 GB.
+2.  **Delta Buffer (CPU RAM):**
+    *   Accumulates live updates (writes) for Epoch $N$.
+    *   Size: Small (<100 MB).
+3.  **Query Execution Flow:**
+    *   **Step A (GPU):** `GpuScanner` scans the 108GB Main Matrix. Latency: ~60ms.
+    *   **Step B (CPU):** Server scans the `DeltaBuffer`. Latency: <1ms.
+    *   **Step C (Merge):** Server XORs the GPU results with the CPU Delta results.
+    *   **Consistency:** The `EpochManager` ensures the CPU Delta and GPU Snapshot correspond to the same Epoch ID using optimistic concurrency control.
+
+## 5. Memory Management: Striped Copy-on-Write (CoW)
 
 Instead of relying on OS `fork()` or complex `mmap` hacks, we implement a **Chunked Matrix** in userspace.
 
