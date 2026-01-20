@@ -21,6 +21,8 @@ use crate::storage::GpuPageMatrix;
 use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig, DriverError};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
+#[cfg(feature = "cuda")]
+use std::collections::HashMap;
 
 /// Size of each page in bytes.
 pub const PAGE_SIZE_BYTES: usize = 4096;
