@@ -80,10 +80,12 @@ impl DpfKeyGpu {
 }
 
 /// GPU implementation of the PIR scanner.
+use std::collections::HashMap;
+
 #[cfg(feature = "cuda")]
 pub struct GpuScanner {
     pub device: Arc<CudaDevice>,
-    pub fused_fn: CudaFunction,
+    kernels: HashMap<usize, CudaFunction>,
 }
 
 #[cfg(feature = "cuda")]
@@ -93,24 +95,33 @@ impl GpuScanner {
         let device = CudaDevice::new(device_ord)?;
         
         // Load the PTX/CUBIN compiled by build.rs
-        // The build script names the library "fused_kernel"
         let ptx_path = concat!(env!("OUT_DIR"), "/fused_kernel.ptx");
         let ptx = std::fs::read_to_string(ptx_path).map_err(|e| {
             eprintln!("Failed to read PTX: {}", e);
-            // We don't have easy access to CUresult here, so we wrap a custom error or panic
-            // But DriverError wraps CUresult.
-            // For now, let's panic as this is a build artifact issue.
             panic!("Failed to read PTX: {}", e);
         })?;
 
         let module_name = "fused_pir".to_string();
-        let kernel_name = "fused_batch_pir_kernel";
-        device.load_ptx(ptx.into(), &module_name, &[kernel_name])?;
-        let fused_fn = device.get_func(&module_name, kernel_name).unwrap();
+        // Load all specialized kernels
+        let kernel_names = [
+            "fused_batch_pir_kernel_1",
+            "fused_batch_pir_kernel_2",
+            "fused_batch_pir_kernel_4",
+            "fused_batch_pir_kernel_8",
+            "fused_batch_pir_kernel_16",
+        ];
+        
+        device.load_ptx(ptx.into(), &module_name, &kernel_names)?;
+        
+        let mut kernels = HashMap::new();
+        for (i, &name) in [1, 2, 4, 8, 16].iter().zip(kernel_names.iter()) {
+            let func = device.get_func(&module_name, name).unwrap();
+            kernels.insert(i, func);
+        }
 
         Ok(Self {
             device,
-            fused_fn,
+            kernels,
         })
     }
 
@@ -129,60 +140,73 @@ impl GpuScanner {
 
         let num_pages = db.num_pages();
         let db_pages = db.as_slice();
-        let batch_size = queries.len();
+        let total_queries = queries.len();
         let start = std::time::Instant::now();
 
-        // 1. Prepare keys (flattened: [q0_k0, q0_k1, q0_k2, q1_k0, ...])
-        let mut gpu_keys = Vec::with_capacity(batch_size * 3);
-        for query in queries {
-            gpu_keys.push(DpfKeyGpu::from_chacha_key(&query[0]));
-            gpu_keys.push(DpfKeyGpu::from_chacha_key(&query[1]));
-            gpu_keys.push(DpfKeyGpu::from_chacha_key(&query[2]));
-        }
-        
-        let keys_slice: CudaSlice<u8> = self.device.htod_sync_copy(bytemuck::cast_slice(&gpu_keys))?;
-
-        // 2. Allocate output buffers (flattened: [q0_p0, q0_p1, q0_p2, q1_p0, ...])
-        // Size: batch_size * 3 * PAGE_SIZE_BYTES
-        let total_output_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
+        // Flatten all keys first? 
+        // No, we process in chunks. We allocate output for ALL queries at once to minimize host overhead?
+        // Or allocate per chunk?
+        // Allocating one big output buffer is better.
+        let total_output_bytes = total_queries * 3 * PAGE_SIZE_BYTES;
         let mut out_accumulators = self.device.alloc_zeros::<u8>(total_output_bytes)?;
 
-        // 3. Launch Kernel
-        // Shared memory: batch_size * 3 * 4096 bytes
-        // Limit batch size based on device capabilities? 
-        // For now, we assume batch_size fits in shared mem (e.g. <= 16 on H100).
-        // A smarter implementation would chunk the batch loop.
-        // Let's assume the caller respects limits or we implement chunking here.
-        // Given Phase 74c is about batching, let's implement chunking if needed, 
-        // but for now let's pass it through.
-        
-        // Dynamic shared memory size
-        let shared_mem_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
-        
-        let cfg = LaunchConfig {
-            grid_dim: (((num_pages + SUBTREE_SIZE - 1) / SUBTREE_SIZE) as u32, 1, 1),
-            block_dim: (THREADS_PER_BLOCK as u32, 1, 1),
-            shared_mem_bytes: shared_mem_bytes as u32,
-        };
+        let mut processed = 0;
+        while processed < total_queries {
+            let remaining = total_queries - processed;
+            
+            // Greedily pick largest batch size
+            let batch_size = if remaining >= 16 { 16 }
+            else if remaining >= 8 { 8 }
+            else if remaining >= 4 { 4 }
+            else if remaining >= 2 { 2 }
+            else { 1 };
 
-        let params = (
-            db_pages,
-            &keys_slice,
-            &mut out_accumulators,
-            num_pages as i32,
-            batch_size as i32,
-        );
-        self.fused_fn.clone().launch(cfg, params)?;
+            // Prepare keys for this batch
+            let mut gpu_keys = Vec::with_capacity(batch_size * 3);
+            for i in 0..batch_size {
+                let q = &queries[processed + i];
+                gpu_keys.push(DpfKeyGpu::from_chacha_key(&q[0]));
+                gpu_keys.push(DpfKeyGpu::from_chacha_key(&q[1]));
+                gpu_keys.push(DpfKeyGpu::from_chacha_key(&q[2]));
+            }
+            let keys_slice: CudaSlice<u8> = self.device.htod_sync_copy(bytemuck::cast_slice(&gpu_keys))?;
+
+            // Get slice of output buffer for this batch
+            let out_offset = processed * 3 * PAGE_SIZE_BYTES;
+            let out_len = batch_size * 3 * PAGE_SIZE_BYTES;
+            let mut out_slice = out_accumulators.slice_mut(out_offset..out_offset + out_len);
+
+            // Launch kernel
+            let func = self.kernels.get(&batch_size).expect("Kernel not found");
+            let shared_mem_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
+            
+            let cfg = LaunchConfig {
+                grid_dim: (((num_pages + SUBTREE_SIZE - 1) / SUBTREE_SIZE) as u32, 1, 1),
+                block_dim: (THREADS_PER_BLOCK as u32, 1, 1),
+                shared_mem_bytes: shared_mem_bytes as u32,
+            };
+
+            let params = (
+                db_pages,
+                &keys_slice,
+                &mut out_slice,
+                num_pages as i32,
+                batch_size as i32, // Passed but unused in template (except for validation if needed)
+            );
+            func.clone().launch(cfg, params)?;
+
+            processed += batch_size;
+        }
 
         // 4. Copy results back
         let flat_results = self.device.sync_reclaim(out_accumulators)?;
         
         let total_ns = start.elapsed().as_nanos() as u64;
-        let avg_ns = total_ns / batch_size as u64;
+        let avg_ns = total_ns / total_queries as u64;
 
         // 5. Unflatten results
-        let mut results = Vec::with_capacity(batch_size);
-        for i in 0..batch_size {
+        let mut results = Vec::with_capacity(total_queries);
+        for i in 0..total_queries {
             let base = i * 3 * PAGE_SIZE_BYTES;
             let p0 = flat_results[base..base + PAGE_SIZE_BYTES].to_vec();
             let p1 = flat_results[base + PAGE_SIZE_BYTES..base + 2 * PAGE_SIZE_BYTES].to_vec();
@@ -195,7 +219,7 @@ impl GpuScanner {
                 timing: KernelTiming {
                     dpf_eval_ns: 0,
                     xor_accumulate_ns: 0,
-                    total_ns: avg_ns, // Amortized time
+                    total_ns: avg_ns, 
                 },
             });
         }

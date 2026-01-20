@@ -780,6 +780,11 @@ True GPU speedup requires custom CUDA implementation.
   - Batch 4: 16.9 QPS (237ms latency)
   - **Result:** 1.4x throughput increase. Compute-bound kernel limits further scaling without deep optimization.
 
+**Phase 74c-opt: Kernel Template Specialization (IN PROGRESS)**
+- [ ] Implement C++ templates for `fused_batch_pir_kernel<N>` to reduce register pressure.
+- [ ] Verify latency restoration (target ~43ms for 68GB on H100).
+- [ ] Verify sharded scaling (target ~45ms for 137GB on 2x H100).
+
 **Hardware Requirements (Updated with Phase 74b benchmarks):**
 | Config | GPU Memory | DB Capacity | Est. Latency | Status |
 |--------|------------|-------------|--------------|--------|
