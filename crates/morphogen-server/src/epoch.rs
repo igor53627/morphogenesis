@@ -604,10 +604,10 @@ pub async fn spawn_merge_worker_with_callback<F>(
 mod tests {
     use super::{
         build_next_snapshot, dirty_chunks, dirty_chunks_vec, try_build_next_snapshot,
-        try_dirty_chunks, try_dirty_chunks_vec, EpochHandle, EpochManager, EpochManagerError,
+        try_dirty_chunks, try_dirty_chunks_vec, EpochManager, EpochManagerError,
         MergeError,
     };
-    use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
+    use morphogen_core::{EpochSnapshot, GlobalState};
     use morphogen_storage::ChunkedMatrix;
     use std::sync::Arc;
 

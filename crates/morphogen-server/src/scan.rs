@@ -154,19 +154,6 @@ pub fn try_scan<K: DpfKey>(
     Ok(results)
 }
 
-/// Deprecated: Use `try_scan` instead to handle lock poisoning gracefully.
-#[cfg(test)]
-#[deprecated(since = "0.1.0", note = "use try_scan instead")]
-#[allow(deprecated)]
-pub fn scan<K: DpfKey>(
-    matrix: &ChunkedMatrix,
-    delta: &DeltaBuffer,
-    keys: &[K; 3],
-    row_size_bytes: usize,
-) -> [Vec<u8>; 3] {
-    try_scan(matrix, delta, keys, row_size_bytes).expect("scan: lock poisoned")
-}
-
 pub fn scan_consistent<K: DpfKey>(
     global: &GlobalState,
     pending: &DeltaBuffer,

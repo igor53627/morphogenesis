@@ -58,8 +58,9 @@ fn e2e_pir_with_delta_buffer() {
 
     let delta_a = DeltaBuffer::new(ROW_SIZE);
     let delta_b = DeltaBuffer::new(ROW_SIZE);
-    delta_a.push(target_row, delta_diff.clone());
-    delta_b.push(target_row, delta_diff.clone());
+    // Push update to both servers
+    delta_a.push(target_row, delta_diff.clone()).unwrap();
+    delta_b.push(target_row, delta_diff.clone()).unwrap();
 
     let mut rng = rand::thread_rng();
     let (key0_a, key0_b) = AesDpfKey::generate_pair(&mut rng, target_row);
