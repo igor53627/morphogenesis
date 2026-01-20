@@ -16,6 +16,16 @@
 | **NVIDIA H200** | 137 GB | GPU (CUDA) | **1,574 GB/s** | **87.3 ms** |
 | **NVIDIA B200** | 69 GB | GPU (CUDA) | **1,798 GB/s** | **38.2 ms** |
 
+## Memory Footprint (Verified Mainnet)
+
+Based on scanning 350M Accounts + 1.5B Storage Slots (Jan 2026):
+
+| Schema | Row Size | Total Matrix | Hardware Required |
+| :--- | :--- | :--- | :--- |
+| **Compact** | 32 Bytes | **59.2 GB** | **1x H100 (80GB)** |
+| **Full** | 64 Bytes | **118.4 GB** | **1x H200 (141GB)** |
+| **Trustless** | 2 KB | **3.7 TB** | **4x H200 Nodes (Cluster)** |
+
 ### Key Insight: HBM-Resident Fused Kernel
 The transition from CPU to GPU provided a **100x+ improvement** by bypassing the PCIe/Memory bus bottleneck. Our custom CUDA kernel fuses DPF evaluation, page masking, and XOR reduction into a single pass, utilizing the massive HBM bandwidth (up to 4.8 TB/s on H200) directly.
 

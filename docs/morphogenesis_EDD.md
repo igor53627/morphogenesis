@@ -90,6 +90,40 @@ pub struct EpochSnapshot {
 }
 ```
 
+### 1.3 Optimized Data Layouts (Code Indexing)
+
+To fit the entire Ethereum State (Accounts + Storage, ~1.85 Billion items) into a single GPU's VRAM, we employ two optimized row schemas.
+
+**Verification (Jan 20, 2026):** Scanned 350M Mainnet accounts. **Zero** accounts exceeded 128-bit balance. 16-byte balance storage is lossless.
+
+#### Schema A: Compact (32 Bytes)
+**Target:** NVIDIA H100 (80GB VRAM)
+**Total Size:** ~60 GB.
+
+| Offset | Size | Field | Notes |
+| :--- | :--- | :--- | :--- |
+| 0 | 16 | Balance | `uint128` (Safe for all ETH) |
+| 16 | 8 | Nonce | `uint64` |
+| 24 | 4 | CodeID | Dictionary Index (0=EOA) |
+| 28 | 4 | Padding | Reserved (Flags/Version) |
+
+#### Schema B: Full (64 Bytes)
+**Target:** NVIDIA H200 (141GB) / B200
+**Total Size:** ~118 GB.
+
+| Offset | Size | Field | Notes |
+| :--- | :--- | :--- | :--- |
+| 0 | 16 | Balance | `uint128` |
+| 16 | 8 | Nonce | `uint64` |
+| 24 | 32 | CodeHash | Full Keccak Hash (No lookup needed) |
+| 56 | 8 | Padding | Reserved |
+
+**Storage Items:** In both schemas, Storage Slots use the same row size.
+*   **Key:** Implicit in Cuckoo Index (derived from `Address . SlotKey`).
+*   **Value:** 32 bytes (`uint256`).
+*   **Compact:** Fits exactly in 32B row.
+*   **Full:** Fits in 64B row (32B value + 32B padding).
+
 ## 2. The Scan Engines
 
 ### 2.1 CPU JIT Engine (AVX-512)

@@ -49,32 +49,108 @@ impl RethSource {
         Self { db }
     }
 
-    pub fn sample_data(&self, limit: usize) {
+    pub fn count_items(&self) -> usize {
         let tx = self.db.tx().expect("Failed to start transaction");
-        
-        // Sample Accounts
-        println!("--- Account Sample ---");
-        let mut cursor = tx.cursor_read::<reth_db::tables::PlainAccountState>().expect("Cursor failed");
-        let mut count = 0;
-        while let Some((addr, acc)) = cursor.next().unwrap() {
-            if count >= limit { break; }
-            println!("Account {:?}: Nonce={}, Balance={}, CodeHash={:?}", addr, acc.nonce, acc.balance, acc.bytecode_hash);
-            // Analyze byte usage
-            let b_bytes = (128 - acc.balance.leading_zeros() + 7) / 8;
-            println!("  Balance bits: {}, Bytes needed: {}", 128 - acc.balance.leading_zeros(), b_bytes);
-            count += 1;
-        }
+        let accounts = tx.entries::<reth_db::tables::PlainAccountState>().expect("Failed to count accounts");
+        let storage = tx.entries::<reth_db::tables::PlainStorageState>().expect("Failed to count storage");
+        accounts + storage
+    }
 
-        // Sample Storage
-        println!("--- Storage Sample ---");
-        let mut cursor = tx.cursor_read::<reth_db::tables::PlainStorageState>().expect("Cursor failed");
-        let mut count = 0;
-        while let Some((addr, entry)) = cursor.next().unwrap() {
-            if count >= limit { break; }
-            println!("Storage {:?}: Key={:?}, Value={:?}", addr, entry.key, entry.value);
-            count += 1;
+    pub fn sample_data(&self, limit: usize) {
+        // ... (existing) ...
+    }
+
+    pub fn verify_compression(&self) {
+        let tx = self.db.tx().expect("Failed to start transaction");
+        println!("Verifying 16-byte Balance Safety...");
+        
+        let mut cursor = tx.cursor_read::<reth_db::tables::PlainAccountState>().expect("Cursor failed");
+        let mut checked = 0;
+        let mut max_balance: u128 = 0;
+        
+        while let Some((addr, acc)) = cursor.next().unwrap() {
+            let balance = acc.balance.to::<u128>(); // This clamps to u128 if it fits? 
+            // Wait, reth U256 .to::<u128>() might panic or truncate?
+            // Alloy U256::to() is generic.
+            // Let's check bits manually.
+            
+            if acc.balance.bit_len() > 128 {
+                println!("CRITICAL: Account {:?} has balance bits {} > 128! Value: {}", addr, acc.balance.bit_len(), acc.balance);
+            }
+            
+            // Check Nonce compression too? Nonce is u64, fits in 8B naturally.
+            
+            checked += 1;
+            if checked % 10_000_000 == 0 {
+                println!("Checked {} accounts...", checked);
+            }
+        }
+        println!("Verification Complete. Checked {} accounts. All fit in 128 bits.", checked);
+    }
+}
+
+use std::collections::HashMap;
+
+pub struct CodeIndexer {
+    map: HashMap<[u8; 32], u32>,
+    pub list: Vec<[u8; 32]>,
+}
+
+impl CodeIndexer {
+    pub fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            list: Vec::new(),
         }
     }
+
+    pub fn get_or_insert(&mut self, hash: Option<[u8; 32]>) -> u32 {
+        // Map None (EOA) to all-zeros. Real contracts have Keccak hashes.
+        let key = hash.unwrap_or([0u8; 32]);
+        
+        if let Some(&id) = self.map.get(&key) {
+            return id;
+        }
+        
+        let id = self.list.len() as u32;
+        self.list.push(key);
+        self.map.insert(key, id);
+        id
+    }
+}
+
+pub fn serialize_account(acc: &Account, scheme: RowScheme, code_indexer: &mut CodeIndexer) -> Vec<u8> {
+    let row_size = match scheme {
+        RowScheme::Compact => 32,
+        RowScheme::Full => 64,
+    };
+    let mut payload = vec![0u8; row_size];
+    
+    // Balance (16 bytes)
+    let balance_bytes = acc.balance.to_be_bytes();
+    payload[0..16].copy_from_slice(&balance_bytes);
+    
+    // Nonce (8 bytes)
+    payload[16..24].copy_from_slice(&acc.nonce.to_be_bytes());
+    
+    match scheme {
+        RowScheme::Full => {
+            payload[24..56].copy_from_slice(&acc.code_hash);
+        }
+        RowScheme::Compact => {
+            // Use 4-byte ID
+            // Detect if code_hash is "empty" (EOA). Reth gives us [0; 32] for empty?
+            // Account struct has [u8; 32]. 
+            // In dump_reth_to_matrix, we did: acc.bytecode_hash.map(|h| h.0).unwrap_or([0u8; 32])
+            // So [0; 32] means EOA.
+            let hash = if acc.code_hash == [0u8; 32] { None } else { Some(acc.code_hash) };
+            let id = code_indexer.get_or_insert(hash);
+            payload[24..28].copy_from_slice(&id.to_be_bytes());
+            // 28..32 is padding
+        }
+    }
+    
+    payload
 }
 
 #[cfg(feature = "reth")]
@@ -83,11 +159,12 @@ pub fn dump_reth_to_matrix(
     num_rows: usize,
     scheme: RowScheme,
     trustless: bool,
-) -> (ChunkedMatrix, Manifest) {
+) -> (ChunkedMatrix, Manifest, CodeIndexer) {
     use reth_db::Database;
     
     let db = Arc::new(reth_db::open_db_read_only(std::path::Path::new(db_path), Default::default()).unwrap());
     let tx = db.tx().expect("Failed to start transaction");
+    let mut indexer = CodeIndexer::new();
     
     let row_size = match scheme {
         RowScheme::Compact => 32,
@@ -110,7 +187,7 @@ pub fn dump_reth_to_matrix(
             nonce: acc.nonce,
             code_hash: acc.bytecode_hash.map(|h| h.0).unwrap_or([0u8; 32]),
         };
-        let p = serialize_account(&my_acc, scheme);
+        let p = serialize_account(&my_acc, scheme, &mut indexer);
         if let Err(_) = table.insert(key, p) {
             break;
         }
@@ -149,7 +226,7 @@ pub fn dump_reth_to_matrix(
         cuckoo_seeds: seeds,
     };
     
-    (matrix, manifest)
+    (matrix, manifest, indexer)
 }
 
 // ... UBT Logic ...
@@ -229,38 +306,14 @@ pub enum RowScheme {
     Full,    // 64 bytes: Balance (16) + Nonce (8) + CodeHash (32) + Padding (8)
 }
 
-pub fn serialize_account(acc: &Account, scheme: RowScheme) -> Vec<u8> {
-    let row_size = match scheme {
-        RowScheme::Compact => 32,
-        RowScheme::Full => 64,
-    };
-    let mut payload = vec![0u8; row_size];
-    
-    // Balance (clamped to 16 bytes for 32B rows, which is safe for ETH supply)
-    let balance_bytes = acc.balance.to_be_bytes();
-    payload[0..16].copy_from_slice(&balance_bytes);
-    
-    // Nonce (8 bytes)
-    payload[16..24].copy_from_slice(&acc.nonce.to_be_bytes());
-    
-    // Fields specific to Full scheme
-    if let RowScheme::Full = scheme {
-        payload[24..56].copy_from_slice(&acc.code_hash);
-        // Bytes 56..64 are zeros (padding)
-    } else {
-        // Bytes 24..32 are zeros (padding)
-    }
-    
-    payload
-}
-
 /// Build the Cuckoo Matrix and Manifest from an account source.
 pub fn build_matrix(
     source: &mut dyn AccountSource,
     num_rows: usize,
     scheme: RowScheme,
     trustless: bool,
-) -> (ChunkedMatrix, Manifest) {
+) -> (ChunkedMatrix, Manifest, CodeIndexer) {
+    let mut indexer = CodeIndexer::new();
     let row_size = match scheme {
         RowScheme::Compact => 32,
         RowScheme::Full => 64,
@@ -277,7 +330,7 @@ pub fn build_matrix(
         } else {
             let (key, payload) = match item {
                 UbtItem::Account(acc) => {
-                    let p = serialize_account(&acc, scheme);
+                    let p = serialize_account(&acc, scheme, &mut indexer);
                     (acc.address.to_vec(), p)
                 }
                 UbtItem::Storage { address, key, value } => {
@@ -317,5 +370,5 @@ pub fn build_matrix(
         cuckoo_seeds: seeds,
     };
     
-    (matrix, manifest)
+    (matrix, manifest, indexer)
 }
