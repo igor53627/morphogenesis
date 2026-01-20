@@ -566,13 +566,18 @@ mod tests {
             seeds: [0x1234, 0x5678, 0x9ABC],
             block_number: 12345678,
             state_root: [0xAB; 32],
-            epoch_rx: rx,
-            page_config: None,
-        })
-    }
-
-    #[test]
-    fn app_state_has_pending_buffer() {
+                    epoch_rx: rx,
+                    page_config: None,
+                    #[cfg(feature = "cuda")]
+                    gpu_scanner: None,
+                    #[cfg(feature = "cuda")]
+                    gpu_matrix: None,
+                })
+            }
+            
+                #[test]
+                fn app_state_has_pending_buffer() {
+            
         let state = test_state();
         assert!(state.pending.is_empty().unwrap());
         assert_eq!(state.row_size_bytes, 256);
