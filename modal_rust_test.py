@@ -36,10 +36,10 @@ def test_gpu_integration():
         check=True
     )
 
-    print("\n--- Running morphogen-server tests (CUDA feature enabled) ---")
+    print("\n--- Running morphogen-server tests (CUDA + Network features enabled) ---")
     # This validates that the server compiles with cuda feature and fallback logic works
     subprocess.run(
-        ["cargo", "test", "-p", "morphogen-server", "--features", "cuda", "--", "--nocapture"],
+        ["cargo", "test", "-p", "morphogen-server", "--features", "cuda,network", "--", "--nocapture"],
         check=True
     )
 

@@ -455,4 +455,38 @@ mod tests {
 
         assert_eq!(recovered, pages_data[target]);
     }
+
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    fn gpu_fused_3dpf_recovers_all_targets() {
+        let scanner = GpuScanner::new(0).expect("Failed to create GpuScanner");
+        let device = scanner.device.clone();
+        
+        let params = crate::dpf::ChaChaParams::new(8).unwrap();
+        let targets = [10, 100, 200];
+
+        let (k0_0, k0_1) = crate::dpf::generate_chacha_dpf_keys(&params, targets[0]).unwrap();
+        let (k1_0, k1_1) = crate::dpf::generate_chacha_dpf_keys(&params, targets[1]).unwrap();
+        let (k2_0, k2_1) = crate::dpf::generate_chacha_dpf_keys(&params, targets[2]).unwrap();
+
+        let num_pages = 256;
+        let pages_data = make_test_pages(num_pages);
+        let mut pages_flat = Vec::with_capacity(num_pages * PAGE_SIZE_BYTES);
+        for p in &pages_data {
+            pages_flat.extend_from_slice(p);
+        }
+        
+        let db = GpuPageMatrix::new(device, &pages_flat).expect("Failed to create GpuPageMatrix");
+
+        let result0 = unsafe { scanner.scan(&db, [&k0_0, &k1_0, &k2_0]) }.expect("Scan 0 failed");
+        let result1 = unsafe { scanner.scan(&db, [&k0_1, &k1_1, &k2_1]) }.expect("Scan 1 failed");
+
+        // XOR to recover and verify
+        for i in 0..PAGE_SIZE_BYTES {
+            assert_eq!(result0.page0[i] ^ result1.page0[i], pages_data[targets[0]][i], "Target 0 mismatch at byte {}", i);
+            assert_eq!(result0.page1[i] ^ result1.page1[i], pages_data[targets[1]][i], "Target 1 mismatch at byte {}", i);
+            assert_eq!(result0.page2[i] ^ result1.page2[i], pages_data[targets[2]][i], "Target 2 mismatch at byte {}", i);
+        }
+        println!("GPU fused scan verified successfully!");
+    }
 }
