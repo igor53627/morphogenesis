@@ -35,6 +35,10 @@ struct Args {
     /// Verify 16-byte balance compression safety
     #[arg(long)]
     verify: bool,
+
+    /// Extract bytecode using dictionary (pass path to .dict file)
+    #[arg(long)]
+    extract_code: Option<PathBuf>,
 }
 
 fn main() {
@@ -42,6 +46,20 @@ fn main() {
 
     println!("=== Morphogenesis Reth Extraction Tool ===");
     println!("DB Path: {:?}", args.db);
+
+    if let Some(dict_path) = args.extract_code {
+        println!("Mode: EXTRACT CODE");
+        let out_dir = args.output; // Reuse output as directory
+        #[cfg(feature = "reth")]
+        {
+            reth_adapter::extract_code_from_dict(args.db.to_str().unwrap(), &dict_path, &out_dir);
+        }
+        #[cfg(not(feature = "reth"))]
+        {
+            println!("Error: Compile with --features reth for code extraction.");
+        }
+        return;
+    }
 
     if args.verify {
         println!("Mode: VERIFY COMPRESSION");

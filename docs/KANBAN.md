@@ -764,33 +764,29 @@ True GPU speedup requires custom CUDA implementation.
   - Result: **VERIFIED on Modal T4, H100, and H200 GPUs**
   - Full pipeline (Client -> API -> GPU Scanner -> CUDA Kernel) functional.
   - Native Hopper (`sm_90`) and Turing (`sm_75`) support verified.
-**Phase 76: Reth Integration & Data Extraction (Jan 20, 2026) - COMPLETE**
-- [x] Scaffold `ubt-exex` crate for Reth integration.
-- [x] Implement `reth_dump` tool with `Compact` (32B) and `Full` (64B) schemas.
-- [x] Verify data fit: 100% of accounts fit in 128-bit balance.
-- [x] Start full mainnet extraction on `hsiao`.
+**Phase 77: Client Code Resolution (Next Step)**
+- [ ] **Client Logic:**
+  - [ ] Implement `resolve_code_hash(code_id)` using HTTP Range Requests to `mainnet_compact.dict` on R2.
+  - [ ] Implement `fetch_bytecode(code_hash)` using direct GET to `pir/cas/{shard}/{hash}.bin`.
+- [ ] **End-to-End Test:**
+  - [ ] Verify that `client.get_code(address)` works for a known contract.
 
-**Phase 77: Code Serving & Full Integration (Next Steps)**
-- [ ] **Code Extraction:**
-  - [ ] Implement `reth_dump --extract-code` to dump bytecode to `code_store/`.
-  - [ ] Generate `mapping_v1.bin` (Flat list of 32B hashes).
-- [ ] **Code Serving (Static CAS):**
-  - [ ] **Design:** `docs/design/CODE_SERVING.md` (COMPLETE).
-  - [ ] Deploy `mapping.bin` and `code_store/` to S3/R2.
-  - [ ] Implement Range Request logic in client for `CodeID` resolution.
-- [ ] **Client Integration:**
-  - [ ] Update `morphogen-client` to parse 32-byte rows.
-  - [ ] Implement `get_code(address)` via CAS lookup.
-- [ ] **End-to-End Verification:**
-  - [ ] Load `mainnet_compact.bin` into `morphogen-server` on B200.
-  - [ ] Query a known contract (e.g. WETH).
-  - [ ] Verify Balance matches Etherscan.
+**Phase 78: Full Mainnet GPU Benchmark (ASAP)**
+- [ ] **Modal Setup:**
+  - [ ] Update `modal_mainnet_bench.py` to pull `mainnet_compact.bin` from R2 (instead of generating synthetic).
+- [ ] **Execution:**
+  - [ ] Run PIR benchmark on NVIDIA B200 (192GB) with full 60GB dataset.
+  - [ ] Verify <100ms latency target.
+
+**Phase 76: Reth Integration & Data Extraction (Jan 20, 2026) - COMPLETE**
+- [x] Scaffold `reth-adapter` crate.
+- [x] Implement `reth_dump` with Compact (32B) schema and Code Indexing.
+- [x] **Full Mainnet Extraction:** Extracted 1.85B items (Account+Storage) to `mainnet_compact.bin` (60GB).
+- [x] **Code Extraction:** Extracted 2M unique contracts to sharded `code_store/`.
+- [x] **Deployment:** Uploaded Matrix (64GB) and Metadata to R2. CAS upload running in background.
 
 **Phase 75: Privacy Hardening (Cuckoo Seed Rotation) (Jan 19, 2026) - IN PROGRESS**
-- [x] Design "Major Epoch" architecture (`docs/design/ROTATION_AND_UBT.md`).
-- [x] Implement `EpochManager::submit_snapshot` API stub.
-- [ ] Implement `GpuPageMatrix` loading from `ChunkedMatrix`.
-- [ ] Expose administrative API endpoint.
+
 
 **Icebox: Trustless Mode (Future Work)**
 - [ ] **Data Structure:**

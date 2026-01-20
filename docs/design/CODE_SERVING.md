@@ -21,7 +21,9 @@ Since uploading a 1.6GB file every block (12s) is impossible, we split the mappi
 
 ### 2. The Bytecode Store (`/blob/`)
 Content Addressable Storage (CAS) keyed by the hash.
-*   Path: `/blob/{hash_hex}.bin` (or sharded `/blob/ab/cd/{hash}.bin`).
+To handle 2M+ files efficiently, the store is **sharded** by the first two bytes of the hash.
+*   Path: `/blob/{aa}/{bb}/{hash}.bin`
+*   Example: `0xabcd...` -> `/blob/ab/cd/0xabcd...bin`
 *   **Immutability:** Contract code never changes. Once written, it is cacheable forever.
 
 ## Client Retrieval Logic (Pseudocode)

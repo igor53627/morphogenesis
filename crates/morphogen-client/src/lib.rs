@@ -80,6 +80,34 @@ pub fn aggregate_responses(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountData {
+    pub nonce: u64,
+    pub balance: u128,
+    pub code_hash: Option<[u8; 32]>,
+    pub code_id: Option<u32>,
+}
+
+impl AccountData {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() == 32 {
+            // Compact Scheme: [Balance(16) | Nonce(8) | CodeID(4) | Padding(4)]
+            let balance = u128::from_be_bytes(bytes[0..16].try_into().ok()?);
+            let nonce = u64::from_be_bytes(bytes[16..24].try_into().ok()?);
+            let code_id = u32::from_be_bytes(bytes[24..28].try_into().ok()?);
+            Some(Self { nonce, balance, code_hash: None, code_id: Some(code_id) })
+        } else if bytes.len() == 64 {
+            // Full Scheme: [Balance(16) | Nonce(8) | CodeHash(32) | Padding(8)]
+            let balance = u128::from_be_bytes(bytes[0..16].try_into().ok()?);
+            let nonce = u64::from_be_bytes(bytes[16..24].try_into().ok()?);
+            let code_hash: [u8; 32] = bytes[24..56].try_into().ok()?;
+            Some(Self { nonce, balance, code_hash: Some(code_hash), code_id: None })
+        } else {
+            None
+        }
+    }
+}
+
 pub fn generate_query<R: Rng>(
     rng: &mut R,
     account_key: &[u8],
@@ -374,5 +402,39 @@ mod tests {
 
         let result = aggregate_responses(&response_a, &response_b).unwrap();
         assert_eq!(result.payloads[0], expected);
+    }
+
+    #[test]
+    fn account_data_parses_compact_row() {
+        let mut row = vec![0u8; 32];
+        // Balance = 1
+        row[15] = 1;
+        // Nonce = 2
+        row[23] = 2;
+        // CodeID = 0xDEADBEEF
+        row[24] = 0xDE; row[25] = 0xAD; row[26] = 0xBE; row[27] = 0xEF;
+        
+        let data = AccountData::from_bytes(&row).unwrap();
+        assert_eq!(data.balance, 1);
+        assert_eq!(data.nonce, 2);
+        assert_eq!(data.code_id, Some(0xDEADBEEF));
+        assert!(data.code_hash.is_none());
+    }
+
+    #[test]
+    fn account_data_parses_full_row() {
+        let mut row = vec![0u8; 64];
+        row[15] = 100;
+        row[23] = 5;
+        // CodeHash = all 0xAA
+        for i in 24..56 {
+            row[i] = 0xAA;
+        }
+        
+        let data = AccountData::from_bytes(&row).unwrap();
+        assert_eq!(data.balance, 100);
+        assert_eq!(data.nonce, 5);
+        assert_eq!(data.code_hash, Some([0xAA; 32]));
+        assert!(data.code_id.is_none());
     }
 }

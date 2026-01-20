@@ -444,7 +444,7 @@ pub fn build_matrix(
     for (idx, _key, val) in table.iter_enumerated() {
         matrix.write_row(idx, row_size, val);
     }
-    
+
     let manifest = Manifest {
         block_number: 0, 
         state_root: [0u8; 32],
@@ -453,4 +453,75 @@ pub fn build_matrix(
     };
     
     (matrix, manifest, indexer)
+}
+
+#[cfg(feature = "reth")]
+pub fn extract_code_from_dict(
+    db_path: &str,
+    dict_path: &std::path::Path,
+    out_dir: &std::path::Path,
+) {
+    use std::io::Read;
+    use std::io::Write;
+    use reth_db::Database;
+    use reth_db::cursor::DbCursorRO;
+    
+    // 1. Load Dictionary
+    let mut file = std::fs::File::open(dict_path).expect("Failed to open dictionary");
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).expect("Failed to read dictionary");
+    
+    if buffer.len() % 32 != 0 {
+        panic!("Dictionary size not multiple of 32 bytes");
+    }
+    let num_hashes = buffer.len() / 32;
+    println!("Loaded {} hashes from dictionary.", num_hashes);
+
+    // 2. Open DB
+    let db = Arc::new(reth_db::open_db_read_only(std::path::Path::new(db_path), Default::default()).unwrap());
+    let tx = db.tx().expect("Failed to start transaction");
+    let mut cursor = tx.cursor_read::<reth_db::tables::Bytecodes>().expect("Cursor failed");
+
+    std::fs::create_dir_all(out_dir).expect("Failed to create output dir");
+
+    // 3. Iterate hashes and fetch code
+    let mut found = 0;
+    for i in 0..num_hashes {
+        let start = i * 32;
+        let hash_slice = &buffer[start..start+32];
+        let hash = alloy_primitives::B256::from_slice(hash_slice);
+        
+        if hash == alloy_primitives::B256::ZERO {
+            continue; 
+        }
+
+        if let Ok(Some((_, code))) = cursor.seek_exact(hash) {
+            let hex_name = hex::encode(hash);
+            
+            // Sharding: out_dir/aa/bb/aabb...bin
+            let shard1 = &hex_name[0..2];
+            let shard2 = &hex_name[2..4];
+            let shard_dir = out_dir.join(shard1).join(shard2);
+            
+            if i % 1000 == 0 {
+                std::fs::create_dir_all(&shard_dir).expect("Failed to create shard dir");
+            }
+
+            let path = shard_dir.join(format!("{}.bin", hex_name));
+            if !path.exists() {
+                // Double check dir exists (less frequent)
+                if !shard_dir.exists() {
+                    std::fs::create_dir_all(&shard_dir).expect("Failed to create shard dir");
+                }
+                let mut f = std::fs::File::create(path).unwrap();
+                f.write_all(code.original_bytes().as_ref()).unwrap();
+            }
+            found += 1;
+        }
+        
+        if i % 100_000 == 0 {
+            println!("Processed {}/{} hashes...", i, num_hashes);
+        }
+    }
+    println!("Extracted {}/{} contracts.", found, num_hashes);
 }
