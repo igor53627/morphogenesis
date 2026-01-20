@@ -158,13 +158,16 @@ __device__ void dpf_eval_point_inline(
 // Fused Batch Kernel Template
 // ----------------------------------------------------------------------------
 template<int BATCH_SIZE>
-__global__ void fused_batch_pir_kernel_tmpl(
+__device__ void fused_batch_pir_kernel_tmpl(
     const uint4* __restrict__ db_pages,
     const DpfKeyGpu* __restrict__ keys, // [batch_size * 3]
     uint4* __restrict__ out_accumulators, // [batch_size * 3 * VECS_PER_PAGE]
     int num_pages,
-    int batch_size_arg // Unused in template logic but kept for ABI
+    int batch_size_arg
 ) {
+    // Avoid unused variable warning
+    (void)batch_size_arg;
+
     extern __shared__ uint4 s_mem[];
     // Layout: s_mem[query_idx * 3 + key_idx][vec_idx]
     
@@ -187,7 +190,6 @@ __global__ void fused_batch_pir_kernel_tmpl(
         const uint4* page_ptr = &db_pages[(size_t)global_page_idx * VECS_PER_PAGE];
 
         // Compute masks for all queries in batch for this page.
-        // Array size is constant per template instantiation -> optimized registers.
         uint4 local_masks[BATCH_SIZE * 3]; 
         
         #pragma unroll
@@ -242,21 +244,3 @@ extern "C" __global__ void fused_batch_pir_kernel_2(const uint4* d, const DpfKey
 extern "C" __global__ void fused_batch_pir_kernel_4(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<4>(d, k, o, n, b); }
 extern "C" __global__ void fused_batch_pir_kernel_8(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<8>(d, k, o, n, b); }
 extern "C" __global__ void fused_batch_pir_kernel_16(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<16>(d, k, o, n, b); }
-
-// Fallback dynamic kernel (using loop and potentially higher register usage or spilling)
-extern "C" __global__ void fused_batch_pir_kernel_dynamic(
-    const uint4* __restrict__ db_pages,
-    const DpfKeyGpu* __restrict__ keys,
-    uint4* __restrict__ out_accumulators,
-    int num_pages,
-    int batch_size
-) {
-    // Re-use the previous dynamic logic if needed, but for now we rely on specializations.
-    // If batch_size > 16, we should chunk on host.
-    // Implementing a dynamic loop with limited local array to avoid explosion.
-    
-    // For now, let's just error or cap? 
-    // The previous implementation was essentially dynamic but forced to compile for MAX_BATCH.
-    // Let's reuse the logic but with a loop for the masks if needed.
-    // But since host chunks, we just need to ensure host respects 1/2/4/8/16.
-}
