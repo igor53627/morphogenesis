@@ -208,9 +208,6 @@ impl GpuScanner {
         db: &GpuPageMatrix,
         keys: [&ChaChaKey; 3],
     ) -> Result<PirResult, DriverError> {
-        let batch = vec![*keys]; // Copy array of references? No, keys is array of refs.
-        // Wait, keys is [&ChaChaKey; 3].
-        // We need [ChaChaKey; 3].
         let query = [keys[0].clone(), keys[1].clone(), keys[2].clone()];
         let results = self.scan_batch(db, &[query])?;
         Ok(results.into_iter().next().unwrap())
