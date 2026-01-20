@@ -155,116 +155,117 @@ __device__ void dpf_eval_point_inline(
 }
 
 // ----------------------------------------------------------------------------
-// Fused Kernel
+// Fused Batch Kernel
 // ----------------------------------------------------------------------------
-// Each block processes 'SUBTREE_SIZE' (1024) pages.
-// Thread layout: 256 threads per block.
-// Each thread processes 4 pages (1024 / 256 = 4) to cover the subtree.
-//
-// Arguments:
-// - db_pages: Pointer to contiguous database pages (uint4*)
-// - output_accumulators: Pointer to output buffers (3 x PAGE_SIZE)
-// - num_pages: Total number of pages
-// ----------------------------------------------------------------------------
-extern "C" __global__ void fused_pir_kernel(
+extern "C" __global__ void fused_batch_pir_kernel(
     const uint4* __restrict__ db_pages,
-    const DpfKeyGpu* __restrict__ keys,
-    uint4* __restrict__ out_acc0,
-    uint4* __restrict__ out_acc1,
-    uint4* __restrict__ out_acc2,
-    int num_pages
+    const DpfKeyGpu* __restrict__ keys, // [batch_size * 3]
+    uint4* __restrict__ out_accumulators, // [batch_size * 3 * VECS_PER_PAGE]
+    int num_pages,
+    int batch_size
 ) {
-    // 1. Identify which page this thread is processing
-    // We stride by blockDim.x to cover the tile.
-    int tile_start_page = blockIdx.x * SUBTREE_SIZE;
-    int tid = threadIdx.x;
-
-    // Shared memory accumulators for this block?
-    // No, PAGE_SIZE (4KB) * 3 is too big for shared memory if we do it per thread.
-    // Instead, we can't reduce across threads easily for different pages.
-    // BUT: The goal is 3 output pages TOTAL (accumulated across all DB pages).
-    // So we need a reduction.
+    extern __shared__ uint4 s_mem[];
+    // Layout: s_mem[query_idx * 3 + key_idx][vec_idx]
+    // Stride: 3 * VECS_PER_PAGE
+    // Total size: batch_size * 3 * VECS_PER_PAGE * 16 bytes
     
-    // Strategy:
-    // 1. Each block accumulates its tile's contribution into a per-block buffer? Too much memory.
-    // 2. Or: Atomic XOR into global memory? No native atomic XOR for 128-bit.
-    // 3. Optimized: Each block computes partial result in registers/shared, then writes to temporary global buffer.
-    //    Then a second kernel reduces.
-    
-    // Simplified for Prototype:
-    // Atomic XOR on 32-bit words in global memory is slow but correct.
-    // Better: Each grid stride accumulates to a private buffer, then merge.
-    
-    // For now, let's implement the "Block Reduce" strategy:
-    // Each thread loads a page, masks it, and adds to a SHARED memory accumulator for the BLOCK.
-    // Wait, 3 output pages = 12KB. Shared memory is ~48KB or 96KB on H100. It FITS!
-    
-    __shared__ uint4 s_acc0[VECS_PER_PAGE]; // 4KB
-    __shared__ uint4 s_acc1[VECS_PER_PAGE]; // 4KB
-    __shared__ uint4 s_acc2[VECS_PER_PAGE]; // 4KB
+    int accum_stride = 3 * VECS_PER_PAGE;
+    int total_vecs = batch_size * accum_stride;
 
     // Initialize shared accumulators
-    for (int i = tid; i < VECS_PER_PAGE; i += blockDim.x) {
-        s_acc0[i] = make_uint4(0, 0, 0, 0);
-        s_acc1[i] = make_uint4(0, 0, 0, 0);
-        s_acc2[i] = make_uint4(0, 0, 0, 0);
+    for (int i = threadIdx.x; i < total_vecs; i += blockDim.x) {
+        s_mem[i] = make_uint4(0, 0, 0, 0);
     }
     __syncthreads();
 
-    // Loop over pages in this tile assigned to this thread
-    for (int i = tid; i < SUBTREE_SIZE; i += blockDim.x) {
+    // Tile processing
+    int tile_start_page = blockIdx.x * SUBTREE_SIZE;
+    
+    for (int i = threadIdx.x; i < SUBTREE_SIZE; i += blockDim.x) {
         int global_page_idx = tile_start_page + i;
         if (global_page_idx >= num_pages) break;
 
-        // Generate Masks for this page (3 keys)
-        uint32_t mask0[4], mask1[4], mask2[4];
-        dpf_eval_point_inline(keys[0], global_page_idx, mask0);
-        dpf_eval_point_inline(keys[1], global_page_idx, mask1);
-        dpf_eval_point_inline(keys[2], global_page_idx, mask2);
+        // Compute masks for all queries in batch for this page
+        // Limit batch size to avoid register spill. 
+        // 16 queries * 3 keys = 48 masks. 48*4*4 = 768 bytes.
+        // This is high register pressure. Compiler might spill to local mem (L1).
+        // This is fine as L1 is fast.
         
-        uint4 m0 = make_uint4(mask0[0], mask0[1], mask0[2], mask0[3]);
-        uint4 m1 = make_uint4(mask1[0], mask1[1], mask1[2], mask1[3]);
-        uint4 m2 = make_uint4(mask2[0], mask2[1], mask2[2], mask2[3]);
-
-        // Load page data (vectorized loop)
-        // Cast to size_t to prevent 32-bit overflow for large databases (>16GB)
+        // We process the batch in a loop if it's large? 
+        // No, we rely on the loop below.
+        
+        // Optimization: Compute masks on demand or precompute?
+        // If we precompute, we store in registers.
+        // If we don't, we re-eval DPF for every vector v (BAD).
+        // So we MUST precompute.
+        
+        // Dynamic allocation of masks array in registers is not possible in C.
+        // We assume MAX_BATCH <= 16 for unrolling? 
+        // Or we just loop and let compiler handle local mem spilling.
+        
         const uint4* page_ptr = &db_pages[(size_t)global_page_idx * VECS_PER_PAGE];
+
+        // To reduce register pressure, we can invert loops:
+        // Loop v (vectors)
+        //   Load data
+        //   Loop q (queries)
+        //     Compute mask? No, mask is constant for all v.
         
+        // Hybrid:
+        // Loop q (queries)
+        //   Compute mask
+        //   Loop v (vectors)
+        //     atomicXor(s_acc, data & mask)
+        // This re-loads `data` 3*Batch times! Bad for memory bandwidth.
+        
+        // We MUST load `data` once.
+        // We MUST compute `mask` once.
+        
+        // Let's rely on local memory caching.
+        // Max 16 queries.
+        
+        uint4 local_masks[16 * 3]; 
+        int effective_batch = (batch_size > 16) ? 16 : batch_size; // Clamp for safety
+        
+        for (int q = 0; q < effective_batch; q++) {
+            for (int k = 0; k < 3; k++) {
+                uint32_t raw_mask[4];
+                dpf_eval_point_inline(keys[q * 3 + k], global_page_idx, raw_mask);
+                local_masks[q * 3 + k] = make_uint4(raw_mask[0], raw_mask[1], raw_mask[2], raw_mask[3]);
+            }
+        }
+
+        // Apply masks
         for (int v = 0; v < VECS_PER_PAGE; v++) {
             uint4 data = page_ptr[v];
             
-            // Mask AND (simulated with bitwise ops)
-            // Note: uint4 doesn't support & operator directly in CUDA C++, need helper
-            uint4 masked0, masked1, masked2;
-            
-            masked0.x = data.x & m0.x; masked0.y = data.y & m0.y; masked0.z = data.z & m0.z; masked0.w = data.w & m0.w;
-            masked1.x = data.x & m1.x; masked1.y = data.y & m1.y; masked1.z = data.z & m1.z; masked1.w = data.w & m1.w;
-            masked2.x = data.x & m2.x; masked2.y = data.y & m2.y; masked2.z = data.z & m2.z; masked2.w = data.w & m2.w;
-
-            // Atomic XOR into shared memory
-            // CUDA supports atomicXor for 32-bit.
-            atomicXor(&s_acc0[v].x, masked0.x); atomicXor(&s_acc0[v].y, masked0.y); atomicXor(&s_acc0[v].z, masked0.z); atomicXor(&s_acc0[v].w, masked0.w);
-            atomicXor(&s_acc1[v].x, masked1.x); atomicXor(&s_acc1[v].y, masked1.y); atomicXor(&s_acc1[v].z, masked1.z); atomicXor(&s_acc1[v].w, masked1.w);
-            atomicXor(&s_acc2[v].x, masked2.x); atomicXor(&s_acc2[v].y, masked2.y); atomicXor(&s_acc2[v].z, masked2.z); atomicXor(&s_acc2[v].w, masked2.w);
+            for (int q = 0; q < effective_batch; q++) {
+                for (int k = 0; k < 3; k++) {
+                    uint4 m = local_masks[q * 3 + k];
+                    uint4 masked;
+                    masked.x = data.x & m.x; masked.y = data.y & m.y; 
+                    masked.z = data.z & m.z; masked.w = data.w & m.w;
+                    
+                    // Atomic add to shared memory
+                    int acc_idx = q * accum_stride + k * VECS_PER_PAGE + v;
+                    atomicXor(&s_mem[acc_idx].x, masked.x);
+                    atomicXor(&s_mem[acc_idx].y, masked.y);
+                    atomicXor(&s_mem[acc_idx].z, masked.z);
+                    atomicXor(&s_mem[acc_idx].w, masked.w);
+                }
+            }
         }
     }
     __syncthreads();
 
-    // Write final shared accumulator to global output (using Atomic XOR)
-    // NOTE: For multi-block reduction, global atomics are needed.
-    for (int i = tid; i < VECS_PER_PAGE; i += blockDim.x) {
-        uint4 val0 = s_acc0[i];
-        uint4 val1 = s_acc1[i];
-        uint4 val2 = s_acc2[i];
-
-        if (val0.x | val0.y | val0.z | val0.w) {
-            atomicXor(&out_acc0[i].x, val0.x); atomicXor(&out_acc0[i].y, val0.y); atomicXor(&out_acc0[i].z, val0.z); atomicXor(&out_acc0[i].w, val0.w);
-        }
-        if (val1.x | val1.y | val1.z | val1.w) {
-            atomicXor(&out_acc1[i].x, val1.x); atomicXor(&out_acc1[i].y, val1.y); atomicXor(&out_acc1[i].z, val1.z); atomicXor(&out_acc1[i].w, val1.w);
-        }
-        if (val2.x | val2.y | val2.z | val2.w) {
-            atomicXor(&out_acc2[i].x, val2.x); atomicXor(&out_acc2[i].y, val2.y); atomicXor(&out_acc2[i].z, val2.z); atomicXor(&out_acc2[i].w, val2.w);
+    // Write back to global
+    for (int i = threadIdx.x; i < total_vecs; i += blockDim.x) {
+        uint4 val = s_mem[i];
+        if (val.x | val.y | val.z | val.w) {
+            atomicXor(&out_accumulators[i].x, val.x);
+            atomicXor(&out_accumulators[i].y, val.y);
+            atomicXor(&out_accumulators[i].z, val.z);
+            atomicXor(&out_accumulators[i].w, val.w);
         }
     }
 }

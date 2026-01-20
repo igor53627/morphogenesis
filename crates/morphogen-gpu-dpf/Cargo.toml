@@ -43,3 +43,7 @@ path = "src/bin/profile_gpu_dpf.rs"
 [[bin]]
 name = "bench_25bit"
 path = "src/bin/bench_25bit.rs"
+
+[[bin]]
+name = "bench_batch"
+path = "src/bin/bench_batch.rs"
