@@ -47,3 +47,7 @@ path = "src/bin/bench_25bit.rs"
 [[bin]]
 name = "bench_batch"
 path = "src/bin/bench_batch.rs"
+
+[[bin]]
+name = "bench_sharded"
+path = "src/bin/bench_sharded.rs"
