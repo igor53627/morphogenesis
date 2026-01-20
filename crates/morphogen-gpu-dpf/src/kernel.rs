@@ -82,8 +82,8 @@ impl DpfKeyGpu {
 /// GPU implementation of the PIR scanner.
 #[cfg(feature = "cuda")]
 pub struct GpuScanner {
-    device: Arc<CudaDevice>,
-    fused_fn: CudaFunction,
+    pub device: Arc<CudaDevice>,
+    pub fused_fn: CudaFunction,
 }
 
 #[cfg(feature = "cuda")]
