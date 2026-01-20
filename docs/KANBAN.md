@@ -764,15 +764,21 @@ True GPU speedup requires custom CUDA implementation.
   - Result: **VERIFIED on Modal T4, H100, and H200 GPUs**
   - Full pipeline (Client -> API -> GPU Scanner -> CUDA Kernel) functional.
   - Native Hopper (`sm_90`) and Turing (`sm_75`) support verified.
-- [ ] Phase 74c: Multi-query batching for throughput
 - [ ] Phase 74d: Production hardening (error handling, monitoring)
 
 **Phase 74b: Benchmark at 25-bit domain (Jan 19, 2026) - COMPLETE**
 - [x] Phase 74b: Large-scale benchmarking on H100/H200
-  - **H100 (24-bit, 69GB):** 42.5 ms latency @ 1,618 GB/s
+  - **H100 (24-bit, 69GB):** 42.5 ms latency @ 1,618 GB/s (Best case)
   - **H200 (25-bit, 137GB):** 87.3 ms latency @ 1,574 GB/s
   - **Mainnet Projection (108GB):** ~67-68ms (Target: <600ms)
   - **Result:** 8.9x faster than target. Single H200 can serve Mainnet state entirely from VRAM.
+
+**Phase 74c: Multi-query batching (Jan 19, 2026) - COMPLETE**
+- [x] Implemented `scan_batch` in `GpuScanner` and `fused_batch_pir_kernel`.
+- [x] Benchmarked on H100 (24-bit domain):
+  - Batch 1: 11.9 QPS (84ms latency)
+  - Batch 4: 16.9 QPS (237ms latency)
+  - **Result:** 1.4x throughput increase. Compute-bound kernel limits further scaling without deep optimization.
 
 **Hardware Requirements (Updated with Phase 74b benchmarks):**
 | Config | GPU Memory | DB Capacity | Est. Latency | Status |
