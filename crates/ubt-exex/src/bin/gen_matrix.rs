@@ -14,7 +14,7 @@ fn main() {
 
     let mut source = SyntheticSource::new(num_accounts);
 
-    let (matrix, seeds) = build_matrix(&mut source, num_rows, row_size);
+    let (matrix, seeds) = build_matrix(&mut source, num_rows, row_size, false);
     
     println!("Generation Complete.");
     println!("Matrix Size: {} bytes", matrix.total_size_bytes());

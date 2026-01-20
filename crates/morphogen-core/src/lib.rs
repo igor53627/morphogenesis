@@ -1,6 +1,6 @@
 mod constants;
-mod cuckoo;
-mod delta;
+pub mod cuckoo;
+pub mod delta;
 mod epoch;
 
 pub use constants::{QueryMode, ROW_SIZE_BYTES, ROW_SIZE_PRIVACY_ONLY, ROW_SIZE_TRUSTLESS};

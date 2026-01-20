@@ -51,6 +51,7 @@ impl UbtTree {
 }
 
 // ... SyntheticSource ...
+pub struct SyntheticSource {
     count: usize,
     total: usize,
 }
@@ -77,6 +78,7 @@ impl AccountSource for SyntheticSource {
             address: addr,
             balance: seed as u128 * 1000,
             nonce: seed,
+            code_hash: [0u8; 32],
         })
     }
 }
