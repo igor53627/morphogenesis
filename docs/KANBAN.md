@@ -776,14 +776,14 @@ True GPU speedup requires custom CUDA implementation.
 **Phase 74c: Multi-query batching (Jan 19, 2026) - COMPLETE**
 - [x] Implemented `scan_batch` in `GpuScanner` and `fused_batch_pir_kernel`.
 - [x] Benchmarked on H100 (24-bit domain):
-  - Batch 1: 11.9 QPS (84ms latency)
-  - Batch 4: 16.9 QPS (237ms latency)
-  - **Result:** 1.4x throughput increase. Compute-bound kernel limits further scaling without deep optimization.
+  - Batch 1: **26.1 QPS** (38ms latency) - **OPTIMAL**
+  - Batch 4: 22.6 QPS (177ms latency)
+  - **Result:** Batching degrades throughput due to compute-bound kernel (ChaCha8). Single-query processing is the most efficient strategy.
 
 **Phase 74c-opt: Kernel Template Specialization (Jan 19, 2026) - COMPLETE**
 - [x] Implement C++ templates for `fused_batch_pir_kernel<N>` to reduce register pressure.
-- [x] Verify latency restoration: **45.77ms** for 68GB on H100 (matches baseline).
-- [x] Verify sharded scaling: **74.01ms** max latency for 137GB on 2x H100 (exceeds single H200).
+- [x] Verify latency restoration: **38.30ms** for 68GB on H100 (10% faster than baseline).
+- [x] Verify sharded scaling: **74.01ms** max latency for 137GB on 2x H100.
 
 **Hardware Requirements (Updated with Phase 74b benchmarks):**
 | Config | GPU Memory | DB Capacity | Est. Latency | Status |
