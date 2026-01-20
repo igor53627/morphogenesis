@@ -230,6 +230,10 @@ mod epoch {
                     domain_bits: 10,
                     prg_keys: [[0x11; 16], [0x22; 16]],
                 }),
+                #[cfg(feature = "cuda")]
+                gpu_scanner: None,
+                #[cfg(feature = "cuda")]
+                gpu_matrix: None,
             })
         };
 
@@ -368,6 +372,10 @@ mod query {
             state_root: [0; 32],
             epoch_rx: rx,
             page_config: None,
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
         });
         let app = create_router(state);
         let (_keys, body) = test_dpf_keys();
@@ -853,6 +861,10 @@ mod page_query {
             state_root: [0xAB; 32],
             epoch_rx: rx,
             page_config: Some(page_config),
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
         });
 
         // Client generates keys with DIFFERENT PRG keys
