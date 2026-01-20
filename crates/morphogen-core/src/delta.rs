@@ -292,6 +292,18 @@ impl DeltaBuffer {
         }
         Ok(())
     }
+
+    /// Atomically clears all entries and sets the pending epoch.
+    ///
+    /// Used during major epoch transitions (seed rotation) where the previous
+    /// delta history is invalidated by a full matrix replacement.
+    pub fn reset_with_epoch(&self, new_epoch: u64) -> Result<(), DeltaError> {
+        let mut guard = self.entries.write().map_err(|_| DeltaError::LockPoisoned)?;
+        guard.clear();
+        // SAFETY: pending_epoch modification while holding write lock
+        self.pending_epoch.store(new_epoch, Ordering::Release);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

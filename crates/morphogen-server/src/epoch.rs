@@ -348,6 +348,52 @@ impl EpochManager {
         Ok(())
     }
 
+    /// Submit a full snapshot for a major epoch transition (e.g. seed rotation).
+    ///
+    /// This replaces the current matrix entirely and resets the delta buffer.
+    /// Returns the new epoch ID.
+    ///
+    /// # Warning
+    /// This operation acquires the merge lock and blocks updates.
+    /// On GPU-enabled builds, this may involve significant data transfer time.
+    pub fn submit_snapshot(
+        &self,
+        new_matrix: ChunkedMatrix,
+        _new_seeds: [u64; 3],
+    ) -> Result<u64, MergeError> {
+        // Future: Prepare GPU upload here (Blue/Green strategy) to minimize lock time.
+
+        let _guard = self
+            .merge_lock
+            .lock()
+            .map_err(|_| MergeError::LockPoisoned)?;
+        
+        let current = self.global.load();
+        let next_epoch_id = current
+            .epoch_id
+            .checked_add(1)
+            .ok_or(MergeError::EpochOverflow)?;
+
+        let next_snapshot = EpochSnapshot {
+            epoch_id: next_epoch_id,
+            matrix: Arc::new(new_matrix),
+        };
+        
+        self.global.store(Arc::new(next_snapshot));
+        
+        // Reset delta buffer for new epoch
+        self.pending.reset_with_epoch(next_epoch_id).map_err(|_| MergeError::LockPoisoned)?;
+
+        #[cfg(feature = "cuda")]
+        {
+            // TODO: Implement actual GPU matrix swap.
+            // For now, we just acknowledge the transition.
+            // Real implementation requires uploading ChunkedMatrix to GpuPageMatrix.
+        }
+
+        Ok(next_epoch_id)
+    }
+
     pub fn try_advance(&self) -> Result<u64, MergeError> {
         let _guard = self
             .merge_lock

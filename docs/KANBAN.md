@@ -764,6 +764,12 @@ True GPU speedup requires custom CUDA implementation.
   - Result: **VERIFIED on Modal T4, H100, and H200 GPUs**
   - Full pipeline (Client -> API -> GPU Scanner -> CUDA Kernel) functional.
   - Native Hopper (`sm_90`) and Turing (`sm_75`) support verified.
+**Phase 75: Privacy Hardening (Cuckoo Seed Rotation) (Jan 19, 2026) - IN PROGRESS**
+- [x] Design "Major Epoch" architecture (`docs/design/ROTATION_AND_UBT.md`).
+- [x] Implement `EpochManager::submit_snapshot` API stub.
+- [ ] Implement `GpuPageMatrix` loading from `ChunkedMatrix`.
+- [ ] Expose administrative API endpoint.
+
 **Phase 74d: Production Hardening (Jan 19, 2026) - COMPLETE**
 - [x] **Observability:**
   - [x] Added `tracing` and `tracing-subscriber` for structured logging (JSON/Text).
