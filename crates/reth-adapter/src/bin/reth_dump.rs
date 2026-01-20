@@ -1,5 +1,5 @@
 use clap::Parser;
-use ubt_exex::{AccountSource, build_matrix, RowScheme};
+use reth_adapter::{AccountSource, build_matrix, RowScheme};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -47,7 +47,7 @@ fn main() {
         println!("Mode: VERIFY COMPRESSION");
         #[cfg(feature = "reth")]
         {
-            let source = ubt_exex::RethSource::new(args.db.to_str().unwrap());
+            let source = reth_adapter::RethSource::new(args.db.to_str().unwrap());
             source.verify_compression();
         }
         return;
@@ -57,7 +57,7 @@ fn main() {
         println!("Mode: SAMPLE");
         #[cfg(feature = "reth")]
         {
-            let source = ubt_exex::RethSource::new(args.db.to_str().unwrap());
+            let source = reth_adapter::RethSource::new(args.db.to_str().unwrap());
             source.sample_data(10); // Sample 10 items
         }
         #[cfg(not(feature = "reth"))]
@@ -71,7 +71,7 @@ fn main() {
         println!("Mode: ESTIMATE");
         #[cfg(feature = "reth")]
         {
-            let source = ubt_exex::RethSource::new(args.db.to_str().unwrap());
+            let source = reth_adapter::RethSource::new(args.db.to_str().unwrap());
             let count = source.count_items();
             let recommended = (count as f64 / 0.85).ceil() as usize;
             println!("Found {} items (Accounts + Storage).", count);
@@ -95,7 +95,7 @@ fn main() {
 
     #[cfg(feature = "reth")]
     {
-        let (matrix, manifest, indexer) = ubt_exex::dump_reth_to_matrix(
+        let (matrix, manifest, indexer) = reth_adapter::dump_reth_to_matrix(
             args.db.to_str().unwrap(), 
             args.rows, 
             args.scheme, 
@@ -108,7 +108,7 @@ fn main() {
         let file = std::fs::File::create(manifest_path).unwrap();
         serde_json::to_writer_pretty(file, &manifest).unwrap();
         
-        if let ubt_exex::RowScheme::Compact = args.scheme {
+        if let RowScheme::Compact = args.scheme {
             let dict_path = args.output.with_extension("dict");
             println!("Saving code dictionary to {:?} ({} entries)...", dict_path, indexer.list.len());
             // Serialize as flat list of 32B hashes
@@ -126,7 +126,7 @@ fn main() {
     {
         println!("Error: This binary must be compiled with --features reth to use RethSource.");
         println!("Running with SyntheticSource for demo...");
-        let mut source = ubt_exex::SyntheticSource::new((args.rows as f64 * 0.8) as usize);
+        let mut source = reth_adapter::SyntheticSource::new((args.rows as f64 * 0.8) as usize);
         let (_matrix, manifest, _indexer) = build_matrix(&mut source, args.rows, args.scheme, args.trustless);
         
         let manifest_path = args.output.with_extension("json");

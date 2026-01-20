@@ -1,5 +1,5 @@
 [package]
-name = "ubt-exex"
+name = "reth-adapter"
 version = "0.1.0"
 edition = "2021"
 
@@ -16,7 +16,7 @@ clap = { version = "4.4", features = ["derive"] }
 eyre = "0.6"
 futures-util = "0.3"
 reth-db = { git = "https://github.com/paradigmxyz/reth", optional = true }
-alloy-primitives = { version = "0.8", optional = true }
+alloy-primitives = { version = "1.5", optional = true }
 
 [features]
 default = []

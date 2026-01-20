@@ -234,31 +234,36 @@ pub fn dump_reth_to_matrix(
 
     // 3. Stream Storage (Batching)
     println!("Streaming Storage...");
+    use reth_db::cursor::DbDupCursorRO;
+
     let mut last_storage_addr: Option<<StorageTable as Table>::Key> = None;
+    let mut last_storage_subkey: Option<alloy_primitives::B256> = None;
     let mut storage_count = 0;
 
     loop {
         let tx = db.tx().expect("Failed to start transaction");
-        let mut storage_cursor = tx.cursor_read::<StorageTable>().expect("Cursor failed");
+        let mut storage_cursor = tx.cursor_dup_read::<StorageTable>().expect("Cursor failed");
         
         let mut batch_count = 0;
         let mut found_any = false;
 
-        let mut it: Box<dyn Iterator<Item = Result<(<StorageTable as Table>::Key, <StorageTable as Table>::Value), _>>> = 
-            if let Some(last) = last_storage_addr {
-                Box::new(storage_cursor.walk_range(last..).expect("Walk failed"))
-            } else {
-                Box::new(storage_cursor.walk(None).expect("Walk failed"))
-            };
+        // Position cursor
+        let mut current_item = if let (Some(addr), Some(subkey)) = (last_storage_addr, last_storage_subkey) {
+             if let Ok(Some(_)) = storage_cursor.seek_by_key_subkey(addr, subkey) {
+                 // Successfully positioned at last item. Move to next.
+                 storage_cursor.next()
+             } else {
+                 // Fallback
+                 storage_cursor.seek(addr)
+             }
+        } else {
+            storage_cursor.first()
+        };
 
-        if last_storage_addr.is_some() {
-            it.next();
-        }
-
-        while let Some(result) = it.next() {
-            let (addr, entry): (<StorageTable as Table>::Key, <StorageTable as Table>::Value) = result.expect("Read failed");
+        while let Ok(Some((addr, entry))) = current_item {
             found_any = true;
             last_storage_addr = Some(addr);
+            last_storage_subkey = Some(entry.key);
             
             let mut k = Vec::with_capacity(52);
             k.extend_from_slice(addr.as_slice());
@@ -279,6 +284,8 @@ pub fn dump_reth_to_matrix(
             }
             
             if batch_count >= 5_000_000 { break; }
+            
+            current_item = storage_cursor.next();
         }
         
         if !found_any || batch_count < 5_000_000 { break; }
