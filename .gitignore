@@ -5,3 +5,5 @@ fixtures/*.bin
 .env*
 docs/paper/*.log
 docs/.DS_Store
+modal_*.py
+**/.DS_Store
