@@ -771,16 +771,18 @@ True GPU speedup requires custom CUDA implementation.
 - [x] **End-to-End Test:**
   - [x] Verify that `client.get_code(address)` works for a known contract (WETH).
 
-**Phase 79: Kernel Optimization (Memory Coalescing) - PLANNED**
-- [ ] **Design:**
-  - [ ] Switch from Thread-per-Page to **Warp-per-Page** processing.
-  - [ ] Threads in a warp read contiguous 16-byte blocks (Coalesced Access).
-  - [ ] Evaluate DPF once per warp (Lane 0) and broadcast mask via `__shfl_sync`.
-- [ ] **Implementation:**
-  - [ ] Modify `fused_kernel.cu`.
-  - [ ] Update `kernel.rs` launch configuration (grids/blocks).
+**Phase 79: Kernel Optimization (Memory Coalescing + Subtree DPF) - DONE**
+- [x] **Design:**
+  - [x] Warp-per-Page processing (Coalesced Memory).
+  - [x] Parallel DPF evaluation (All lanes active).
+  - [x] Subtree Caching (Plan K): Amortize top 15 levels of DPF tree.
+- [x] **Implementation:**
+  - [x] Modify `fused_kernel.cu` with `dpf_eval_prefix` and `dpf_eval_suffix`.
+  - [x] Optimize shared memory layout for mask broadcasting.
 - [ ] **Validation:**
-  - [ ] Run H100 Benchmark. Target: > 3 TB/s.
+  - [ ] Run H100/B200 Benchmark. Target: > 3 TB/s (Latency < 35ms).
+  - [x] Verify Plan I (52ms) was compute-bound.
+  - [ ] Verify Plan K breaks the compute bottleneck.
 
 **Phase 78: Full Mainnet GPU Benchmark (Jan 21, 2026) - COMPLETE**
 - [x] Update `modal_mainnet_bench.py` to use real R2 matrix data.

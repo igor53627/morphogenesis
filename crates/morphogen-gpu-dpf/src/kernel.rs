@@ -18,7 +18,7 @@ use rayon::prelude::*;
 #[cfg(feature = "cuda")]
 use crate::storage::GpuPageMatrix;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig, DriverError};
+use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig, DriverError, sys::CUfunction_attribute};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
@@ -29,7 +29,7 @@ pub const PAGE_SIZE_BYTES: usize = 4096;
 
 /// Default subtree size for kernel processing.
 /// Each block processes this many pages.
-pub const SUBTREE_SIZE: usize = 1024;
+pub const SUBTREE_SIZE: usize = 2048;
 
 /// Threads per block for CUDA kernel.
 pub const THREADS_PER_BLOCK: usize = 256;
@@ -86,6 +86,7 @@ impl DpfKeyGpu {
 pub struct GpuScanner {
     pub device: Arc<CudaDevice>,
     kernels: HashMap<usize, CudaFunction>,
+    kernels_transposed: HashMap<usize, CudaFunction>,
 }
 
 #[cfg(feature = "cuda")]
@@ -109,19 +110,50 @@ impl GpuScanner {
             "fused_batch_pir_kernel_4",
             "fused_batch_pir_kernel_8",
             "fused_batch_pir_kernel_16",
+            "fused_batch_pir_kernel_transposed_1",
+            "fused_batch_pir_kernel_transposed_2",
+            "fused_batch_pir_kernel_transposed_4",
+            "fused_batch_pir_kernel_transposed_8",
+            "fused_batch_pir_kernel_transposed_16",
         ];
         
         device.load_ptx(ptx.into(), &module_name, &kernel_names)?;
         
         let mut kernels = HashMap::new();
-        for (i, &name) in [1, 2, 4, 8, 16].iter().zip(kernel_names.iter()) {
-            let func = device.get_func(&module_name, name).unwrap();
-            kernels.insert(*i, func);
+        let mut kernels_transposed = HashMap::new();
+        
+        let setup_kernel = |name: &str, batch_size: usize| -> Result<CudaFunction, DriverError> {
+            let func = device.get_func(&module_name, name).expect("Kernel not found");
+            
+            let accum_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
+            let seed_bytes = batch_size * 3 * 32;
+            let mask_bytes = THREADS_PER_BLOCK * batch_size * 3 * 16;
+            let required_shmem = accum_bytes + seed_bytes + mask_bytes;
+            
+            unsafe {
+                // Best effort: set max shared memory. 
+                // If it exceeds hardware limits (e.g. Batch 16 on some GPUs), this might fail.
+                // We ignore the error here; the launch will fail if we actually try to use it.
+                let _ = func.set_attribute(
+                    CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    required_shmem as i32
+                );
+            }
+            Ok(func)
+        };
+        
+        for (i, &name) in [1, 2, 4, 8, 16].iter().zip(kernel_names.iter().take(5)) {
+            kernels.insert(*i, setup_kernel(name, *i)?);
+        }
+
+        for (i, &name) in [1, 2, 4, 8, 16].iter().zip(kernel_names.iter().skip(5)) {
+            kernels_transposed.insert(*i, setup_kernel(name, *i)?);
         }
 
         Ok(Self {
             device,
             kernels,
+            kernels_transposed,
         })
     }
 
@@ -133,6 +165,16 @@ impl GpuScanner {
         &self,
         db: &GpuPageMatrix,
         queries: &[[ChaChaKey; 3]],
+    ) -> Result<Vec<PirResult>, DriverError> {
+        self.scan_batch_opts(db, queries, false)
+    }
+
+    /// Execute a fused PIR scan with options (e.g. transposed layout).
+    pub unsafe fn scan_batch_opts(
+        &self,
+        db: &GpuPageMatrix,
+        queries: &[[ChaChaKey; 3]],
+        transposed: bool,
     ) -> Result<Vec<PirResult>, DriverError> {
         if queries.is_empty() {
             return Ok(Vec::new());
@@ -177,8 +219,17 @@ impl GpuScanner {
             let mut out_slice = out_accumulators.slice_mut(out_offset..out_offset + out_len);
 
             // Launch kernel
-            let func = self.kernels.get(&batch_size).expect("Kernel not found");
-            let shared_mem_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
+            let kernel_map = if transposed { &self.kernels_transposed } else { &self.kernels };
+            let func = kernel_map.get(&batch_size).expect("Kernel not found");
+            
+            // Shared memory: Accumulators + Tile Seeds + Mask Buffer
+            // Accumulators: BATCH * 3 * PAGE_SIZE
+            // Tile Seeds: BATCH * 3 * 32 bytes (approx DpfSeed size)
+            // Masks: THREADS (256) * BATCH * 3 * sizeof(uint4) (16)
+            let accum_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
+            let seed_bytes = batch_size * 3 * 32;
+            let mask_bytes = THREADS_PER_BLOCK * batch_size * 3 * 16;
+            let shared_mem_bytes = accum_bytes + seed_bytes + mask_bytes;
             
             let cfg = LaunchConfig {
                 grid_dim: (((num_pages + SUBTREE_SIZE - 1) / SUBTREE_SIZE) as u32, 1, 1),

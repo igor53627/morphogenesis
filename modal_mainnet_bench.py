@@ -20,7 +20,7 @@ image = (
     )
 )
 
-def run_benchmark(gpu_name, arch, batch_size=1):
+def run_benchmark(gpu_name, arch, batch_size=1, iterations=50, transpose=False):
     import subprocess
     import os
     
@@ -30,60 +30,63 @@ def run_benchmark(gpu_name, arch, batch_size=1):
         print("Error: /data/mainnet_compact.bin not found! Run modal_sync_r2.py first.")
         return
 
-    print(f"--- Running Full Mainnet Benchmark on {gpu_name} (Batch Size: {batch_size}) ---")
+    print(f"--- Running Full Mainnet Benchmark on {gpu_name} (Batch Size: {batch_size}, Iterations: {iterations}, Transpose: {transpose}) ---")
     
     env = os.environ.copy()
     env["CUDA_ARCH"] = arch
     
-    # We use iterations=50 for stable measurement
+    cmd = [
+        "cargo", "run", "--release", 
+        "--package", "morphogen-gpu-dpf", 
+        "--bin", "bench_real_data", 
+        "--features", "cuda", 
+        "--", 
+        "--file", "/data/mainnet_compact.bin",
+        "--iterations", str(iterations),
+        "--batch-size", str(batch_size)
+    ]
+    if transpose:
+        cmd.append("--transpose")
+
     subprocess.run(
-        [
-            "cargo", "run", "--release", 
-            "--package", "morphogen-gpu-dpf", 
-            "--bin", "bench_real_data", 
-            "--features", "cuda", 
-            "--", 
-            "--file", "/data/mainnet_compact.bin",
-            "--iterations", "50",
-            "--batch-size", str(batch_size)
-        ],
+        cmd,
         check=True,
         env=env
     )
 
 @app.function(image=image, gpu="H100", timeout=3600, memory=131072, volumes={"/data": volume})
-def bench_h100(batch_size: int = 1):
-    run_benchmark("H100", "sm_90", batch_size)
+def bench_h100(batch_size: int = 1, iterations: int = 50, transpose: bool = False):
+    run_benchmark("H100", "sm_90", batch_size, iterations, transpose)
 
 @app.function(image=image, gpu="A100-80GB", timeout=3600, memory=131072, volumes={"/data": volume})
-def bench_a100(batch_size: int = 1):
-    run_benchmark("A100-80GB", "sm_80", batch_size)
+def bench_a100(batch_size: int = 1, iterations: int = 50, transpose: bool = False):
+    run_benchmark("A100-80GB", "sm_80", batch_size, iterations, transpose)
 
 # Explicitly request H200
 @app.function(image=image, gpu="H200", timeout=3600, memory=131072, volumes={"/data": volume})
-def bench_h200(batch_size: int = 1):
-    run_benchmark("H200", "sm_90", batch_size)
+def bench_h200(batch_size: int = 1, iterations: int = 50, transpose: bool = False):
+    run_benchmark("H200", "sm_90", batch_size, iterations, transpose)
 
 # Explicitly request B200 (Note: Might fail if not in catalog)
 @app.function(image=image, gpu="B200", timeout=3600, memory=131072, volumes={"/data": volume})
-def bench_b200(batch_size: int = 1):
-    run_benchmark("B200", "sm_90", batch_size)
+def bench_b200(batch_size: int = 1, iterations: int = 50, transpose: bool = False):
+    run_benchmark("B200", "sm_90", batch_size, iterations, transpose)
 
 @app.local_entrypoint()
-def main(gpu: str = "H100", batch: int = 4):
+def main(gpu: str = "H100", batch: int = 4, iterations: int = 50, transpose: bool = False):
     """
     Run benchmark on specified GPU.
-    Usage: modal run modal_mainnet_bench.py --gpu H200 --batch 4
+    Usage: modal run modal_mainnet_bench.py --gpu H200 --batch 4 --iterations 5 --transpose
     Options: H100, A100, H200, B200
     """
     if gpu.upper() == "H100":
-        bench_h100.remote(batch)
+        bench_h100.remote(batch, iterations, transpose)
     elif gpu.upper() == "A100":
-        bench_a100.remote(batch)
+        bench_a100.remote(batch, iterations, transpose)
     elif gpu.upper() == "H200":
-        bench_h200.remote(batch) 
+        bench_h200.remote(batch, iterations, transpose) 
     elif gpu.upper() == "B200":
-        bench_b200.remote(batch)
+        bench_b200.remote(batch, iterations, transpose)
     else:
         print(f"Unknown GPU: {gpu}. Defaulting to H100.")
-        bench_h100.remote(batch)
+        bench_h100.remote(batch, iterations, transpose)

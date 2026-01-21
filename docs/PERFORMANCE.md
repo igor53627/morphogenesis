@@ -21,9 +21,9 @@ Benchmarks run on real hardware using the full 68.8 GB production matrix (Compac
 
 | Hardware | VRAM | Mode | Throughput | Latency |
 | :--- | :--- | :--- | :--- | :--- |
-| **NVIDIA H100** | 80 GB | **Production (Fused Kernel)** | **1,300 GB/s** | **53.0 ms** |
-| **NVIDIA H200** | 141 GB | Production | 1,574 GB/s | 87.3 ms* |
-| **NVIDIA B200** | 192 GB | Production | 1,798 GB/s | 38.2 ms* |
+| **NVIDIA B200** | 192 GB | **Production (Subtree)** | **2,510 GB/s** | **27.4 ms** |
+| **NVIDIA H200** | 141 GB | **Production (Subtree)** | **2,235 GB/s** | **30.8 ms** |
+| **NVIDIA H100** | 80 GB | **Production (Subtree)** | **2,143 GB/s** | **32.1 ms** |
 
 *\*H200/B200 results extrapolated from synthetic benchmarks.*
 

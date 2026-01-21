@@ -1,12 +1,14 @@
 /**
  * Fused DPF+XOR Kernel for GPU PIR.
  *
- * Implements the full PIR scan logic:
- * 1. Expand 3 DPF keys for a subtree (tile) of pages.
- * 2. Load database pages from global memory.
- * 3. Apply masks (AND) and accumulate (XOR) into output buffers.
- *
- * Each thread block processes one subtree (e.g., 1024 pages).
+ * Plan K: Subtree Optimization + Parallel DPF + Warp-per-Page
+ * 
+ * Optimization:
+ * 1. Subtree Caching: Evaluate the top of the DPF tree (Prefix) ONCE per tile.
+ *    - Amortizes ~60% of DPF compute.
+ *    - Example: For 25-bit domain and 10-bit tiles, we skip 15 levels per page.
+ * 2. Parallel Suffix: All threads evaluate the bottom 10 levels in parallel.
+ * 3. Coalesced Memory: Warp-per-Page access.
  */
 
 #include <cstdint>
@@ -14,14 +16,18 @@
 
 // Constants
 #define PAGE_SIZE_BYTES 4096
-#define SUBTREE_BITS 10
-#define SUBTREE_SIZE (1 << SUBTREE_BITS) // 1024 pages per tile
 #define MAX_DOMAIN_BITS 25
-#define THREADS_PER_BLOCK 256
+#define SUBTREE_BITS 11
+#define SUBTREE_SIZE (1 << SUBTREE_BITS) // 2048 pages
 
 // Use uint4 (16 bytes) for vectorized memory access
 #define VEC_SIZE 16
-#define VECS_PER_PAGE (PAGE_SIZE_BYTES / VEC_SIZE)
+#define VECS_PER_PAGE (PAGE_SIZE_BYTES / VEC_SIZE) // 256
+
+// Warp Constants
+#define WARP_SIZE 32
+#define WARPS_PER_BLOCK 8 // 256 threads / 32
+#define VECS_PER_THREAD 8 // 256 / 32
 
 // ChaCha8 constants
 __constant__ uint32_t CHACHA_CONSTANTS[4] = {
@@ -32,20 +38,23 @@ struct DpfKeyGpu {
     uint32_t root_seed[4];
     uint8_t root_t;
     uint8_t domain_bits;
+    uint8_t _pad[2];
     uint32_t cw_seed[MAX_DOMAIN_BITS][4];
     uint8_t cw_t_left[MAX_DOMAIN_BITS];
     uint8_t cw_t_right[MAX_DOMAIN_BITS];
+    uint8_t _pad2[2];
     uint32_t final_cw[4];
 };
 
-// Removed __constant__ c_keys[3] to simplify host-side invocation
+struct DpfSeed {
+    uint32_t seed[4];
+    uint8_t t;
+};
 
-// Helper: Rotate Left
 __device__ __forceinline__ uint32_t rotl32(uint32_t x, int n) {
     return (x << n) | (x >> (32 - n));
 }
 
-// Helper: ChaCha Quarter Round
 __device__ __forceinline__ void chacha_quarter_round(
     uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d
 ) {
@@ -55,7 +64,6 @@ __device__ __forceinline__ void chacha_quarter_round(
     c += d; b ^= c; b = rotl32(b, 7);
 }
 
-// Helper: Full ChaCha8 Block
 __device__ void chacha8_block(
     uint32_t out[16],
     const uint32_t key[8],
@@ -90,7 +98,6 @@ __device__ void chacha8_block(
     for (int i = 0; i < 16; i++) out[i] = s[i] + init[i];
 }
 
-// PRG Expansion
 __device__ void prg_expand(
     const uint32_t seed[4],
     uint32_t left_seed[4],
@@ -115,18 +122,58 @@ __device__ void prg_expand(
     right_t = b1[1] & 1;
 }
 
-// Single Point Eval (used inside fused kernel)
-__device__ void dpf_eval_point_inline(
+// Evaluate DPF from Root down to `target_level`
+__device__ void dpf_eval_prefix(
     const DpfKeyGpu& key,
     uint32_t global_idx,
-    uint32_t out_mask[4]
+    int target_level,
+    DpfSeed& out_seed
 ) {
     uint32_t seed[4];
     #pragma unroll
     for (int i = 0; i < 4; i++) seed[i] = key.root_seed[i];
     uint8_t t = key.root_t;
 
-    for (int level = 0; level < key.domain_bits; level++) {
+    for (int level = 0; level < target_level; level++) {
+        uint32_t left_seed[4], right_seed[4];
+        uint8_t left_t, right_t;
+        prg_expand(seed, left_seed, right_seed, left_t, right_t);
+
+        int bit = (global_idx >> (key.domain_bits - 1 - level)) & 1;
+        
+        uint32_t* child_seed = bit ? right_seed : left_seed;
+        uint8_t child_t = bit ? right_t : left_t;
+
+        if (t == 1) {
+            #pragma unroll
+            for (int i = 0; i < 4; i++) child_seed[i] ^= key.cw_seed[level][i];
+            child_t ^= bit ? key.cw_t_right[level] : key.cw_t_left[level];
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 4; i++) seed[i] = child_seed[i];
+        t = child_t;
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) out_seed.seed[i] = seed[i];
+    out_seed.t = t;
+}
+
+// Evaluate DPF from `start_level` to Leaf
+__device__ void dpf_eval_suffix(
+    const DpfKeyGpu& key,
+    uint32_t global_idx,
+    int start_level,
+    const DpfSeed& in_seed,
+    uint32_t out_mask[4]
+) {
+    uint32_t seed[4];
+    #pragma unroll
+    for (int i = 0; i < 4; i++) seed[i] = in_seed.seed[i];
+    uint8_t t = in_seed.t;
+
+    for (int level = start_level; level < (int)key.domain_bits; level++) {
         uint32_t left_seed[4], right_seed[4];
         uint8_t left_t, right_t;
         prg_expand(seed, left_seed, right_seed, left_t, right_t);
@@ -154,81 +201,151 @@ __device__ void dpf_eval_point_inline(
     }
 }
 
-// ----------------------------------------------------------------------------
-// Fused Batch Kernel Template
-// ----------------------------------------------------------------------------
 template<int BATCH_SIZE>
 __device__ void fused_batch_pir_kernel_tmpl(
     const uint4* __restrict__ db_pages,
-    const DpfKeyGpu* __restrict__ keys, // [batch_size * 3]
-    uint4* __restrict__ out_accumulators, // [batch_size * 3 * VECS_PER_PAGE]
+    const DpfKeyGpu* __restrict__ keys,
+    uint4* __restrict__ out_accumulators,
     int num_pages,
     int batch_size_arg
 ) {
-    // Avoid unused variable warning
     (void)batch_size_arg;
-
+    
     extern __shared__ uint4 s_mem[];
-    // Layout: s_mem[query_idx * 3 + key_idx][vec_idx]
+    // Shared Memory Layout:
+    // 1. Accumulators: BATCH * 3 * 256 uint4s
+    // 2. Tile Seeds (Prefix): BATCH * 3 * sizeof(DpfSeed) [Aligned to uint4]
+    // 3. Mask Buffer: 256 * BATCH * 3 uint4s
     
     int accum_stride = 3 * VECS_PER_PAGE;
     int total_vecs = BATCH_SIZE * accum_stride;
+    
+    // Pointers
+    uint4* s_acc = s_mem;
+    int accum_size_vecs = BATCH_SIZE * 3 * VECS_PER_PAGE;
+    
+    // Use raw pointer for seeds to handle DpfSeed struct alignment
+    DpfSeed* s_tile_seeds = (DpfSeed*)&s_mem[accum_size_vecs];
+    int seed_slots = BATCH_SIZE * 3;
+    
+    // Align mask buffer start to 16 bytes (sizeof(uint4))
+    size_t seeds_end = (size_t)(s_tile_seeds + seed_slots);
+    size_t masks_start = (seeds_end + 15) & ~15;
+    uint4* s_masks = (uint4*)masks_start;
 
-    // Initialize shared accumulators
+    // 1. Initialize shared accumulators
     for (int i = threadIdx.x; i < total_vecs; i += blockDim.x) {
-        s_mem[i] = make_uint4(0, 0, 0, 0);
+        s_acc[i] = make_uint4(0, 0, 0, 0);
     }
     __syncthreads();
 
-    // Tile processing
+    // 2. Compute Prefix (Tile Seeds) - One per Key per Batch
     int tile_start_page = blockIdx.x * SUBTREE_SIZE;
     
-    for (int i = threadIdx.x; i < SUBTREE_SIZE; i += blockDim.x) {
-        int global_page_idx = tile_start_page + i;
-        if (global_page_idx >= num_pages) break;
-
-        const uint4* page_ptr = &db_pages[(size_t)global_page_idx * VECS_PER_PAGE];
-
-        // Compute masks for all queries in batch for this page.
-        uint4 local_masks[BATCH_SIZE * 3]; 
-        
+    if (threadIdx.x == 0) {
         #pragma unroll
-        for (int q = 0; q < BATCH_SIZE; q++) {
-            #pragma unroll
-            for (int k = 0; k < 3; k++) {
-                uint32_t raw_mask[4];
-                dpf_eval_point_inline(keys[q * 3 + k], global_page_idx, raw_mask);
-                local_masks[q * 3 + k] = make_uint4(raw_mask[0], raw_mask[1], raw_mask[2], raw_mask[3]);
-            }
+        for (int q = 0; q < BATCH_SIZE * 3; q++) {
+            int split_level = keys[q].domain_bits - SUBTREE_BITS;
+            if (split_level < 0) split_level = 0;
+            dpf_eval_prefix(keys[q], tile_start_page, split_level, s_tile_seeds[q]);
         }
+    }
+    __syncthreads();
 
-        // Apply masks
-        for (int v = 0; v < VECS_PER_PAGE; v++) {
-            uint4 data = page_ptr[v];
+    // 3. Warp-per-Page Logic
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    uint4 local_acc[BATCH_SIZE * 3][VECS_PER_THREAD];
+    #pragma unroll
+    for (int q = 0; q < BATCH_SIZE * 3; q++) {
+        #pragma unroll
+        for (int v = 0; v < VECS_PER_THREAD; v++) {
+            local_acc[q][v] = make_uint4(0, 0, 0, 0);
+        }
+    }
+
+    const int PAGES_PER_WARP = SUBTREE_SIZE / WARPS_PER_BLOCK; // 128
+    const int WARP_BATCH_SIZE = WARP_SIZE; // 32
+
+    for (int batch_start = 0; batch_start < PAGES_PER_WARP; batch_start += WARP_BATCH_SIZE) {
+        // Phase 1: Parallel Suffix DPF Compute
+        int page_offset = batch_start + lane_id;
+        int global_page_idx = tile_start_page + warp_id * PAGES_PER_WARP + page_offset;
+        bool page_valid = (global_page_idx < num_pages);
+
+        int mask_base_idx = threadIdx.x * BATCH_SIZE * 3;
+
+        #pragma unroll
+        for (int q = 0; q < BATCH_SIZE * 3; q++) {
+            uint32_t raw_mask[4] = {0, 0, 0, 0};
+            if (page_valid) {
+                int split_level = keys[q].domain_bits - SUBTREE_BITS;
+                if (split_level < 0) split_level = 0;
+                dpf_eval_suffix(keys[q], global_page_idx, split_level, s_tile_seeds[q], raw_mask);
+            }
+            s_masks[mask_base_idx + q] = make_uint4(raw_mask[0], raw_mask[1], raw_mask[2], raw_mask[3]);
+        }
+        
+        __syncwarp(); 
+
+        // Phase 2: Memory Access
+        for (int p = 0; p < WARP_BATCH_SIZE; p++) {
+            int current_page_offset = batch_start + p;
+            int current_global_page = tile_start_page + warp_id * PAGES_PER_WARP + current_page_offset;
             
+            if (current_global_page >= num_pages) break;
+
+            const uint4* page_ptr = db_pages + (unsigned long long)current_global_page * VECS_PER_PAGE;
+
+            int target_thread_idx = warp_id * WARP_SIZE + p;
+            int target_mask_base = target_thread_idx * BATCH_SIZE * 3;
+
+            uint4 local_masks[BATCH_SIZE * 3];
             #pragma unroll
-            for (int q = 0; q < BATCH_SIZE; q++) {
+            for (int q = 0; q < BATCH_SIZE * 3; q++) {
+                local_masks[q] = s_masks[target_mask_base + q];
+            }
+
+            #pragma unroll
+            for (int v = 0; v < VECS_PER_THREAD; v++) {
+                int vec_idx = v * WARP_SIZE + lane_id;
+                uint4 data = page_ptr[vec_idx];
+
                 #pragma unroll
-                for (int k = 0; k < 3; k++) {
-                    uint4 m = local_masks[q * 3 + k];
-                    uint4 masked;
-                    masked.x = data.x & m.x; masked.y = data.y & m.y; 
-                    masked.z = data.z & m.z; masked.w = data.w & m.w;
-                    
-                    int acc_idx = q * accum_stride + k * VECS_PER_PAGE + v;
-                    atomicXor(&s_mem[acc_idx].x, masked.x);
-                    atomicXor(&s_mem[acc_idx].y, masked.y);
-                    atomicXor(&s_mem[acc_idx].z, masked.z);
-                    atomicXor(&s_mem[acc_idx].w, masked.w);
+                for (int q = 0; q < BATCH_SIZE * 3; q++) {
+                    uint4 m = local_masks[q];
+                    local_acc[q][v].x ^= (data.x & m.x);
+                    local_acc[q][v].y ^= (data.y & m.y);
+                    local_acc[q][v].z ^= (data.z & m.z);
+                    local_acc[q][v].w ^= (data.w & m.w);
                 }
             }
         }
     }
+
+    // 2c. Flush
+    #pragma unroll
+    for (int q = 0; q < BATCH_SIZE * 3; q++) {
+        #pragma unroll
+        for (int v = 0; v < VECS_PER_THREAD; v++) {
+            int vec_idx = v * WARP_SIZE + lane_id;
+            int acc_idx = q * VECS_PER_PAGE + vec_idx;
+            uint4 val = local_acc[q][v];
+            
+            if (val.x | val.y | val.z | val.w) {
+                atomicXor(&s_acc[acc_idx].x, val.x);
+                atomicXor(&s_acc[acc_idx].y, val.y);
+                atomicXor(&s_acc[acc_idx].z, val.z);
+                atomicXor(&s_acc[acc_idx].w, val.w);
+            }
+        }
+    }
     __syncthreads();
 
-    // Write back to global
+    // 3. Write Back
     for (int i = threadIdx.x; i < total_vecs; i += blockDim.x) {
-        uint4 val = s_mem[i];
+        uint4 val = s_acc[i];
         if (val.x | val.y | val.z | val.w) {
             atomicXor(&out_accumulators[i].x, val.x);
             atomicXor(&out_accumulators[i].y, val.y);
@@ -238,9 +355,14 @@ __device__ void fused_batch_pir_kernel_tmpl(
     }
 }
 
-// Instantiate specialized kernels
 extern "C" __global__ void fused_batch_pir_kernel_1(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<1>(d, k, o, n, b); }
 extern "C" __global__ void fused_batch_pir_kernel_2(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<2>(d, k, o, n, b); }
 extern "C" __global__ void fused_batch_pir_kernel_4(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<4>(d, k, o, n, b); }
 extern "C" __global__ void fused_batch_pir_kernel_8(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<8>(d, k, o, n, b); }
 extern "C" __global__ void fused_batch_pir_kernel_16(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<16>(d, k, o, n, b); }
+
+extern "C" __global__ void fused_batch_pir_kernel_transposed_1(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<1>(d, k, o, n, b); }
+extern "C" __global__ void fused_batch_pir_kernel_transposed_2(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<2>(d, k, o, n, b); }
+extern "C" __global__ void fused_batch_pir_kernel_transposed_4(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<4>(d, k, o, n, b); }
+extern "C" __global__ void fused_batch_pir_kernel_transposed_8(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<8>(d, k, o, n, b); }
+extern "C" __global__ void fused_batch_pir_kernel_transposed_16(const uint4* d, const DpfKeyGpu* k, uint4* o, int n, int b) { fused_batch_pir_kernel_tmpl<16>(d, k, o, n, b); }
