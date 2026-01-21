@@ -1,3 +1,7 @@
 target/
 fixtures/*.bin
 .DS_Store
+
+.env*
+docs/paper/*.log
+docs/.DS_Store
