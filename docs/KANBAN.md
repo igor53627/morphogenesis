@@ -771,14 +771,12 @@ True GPU speedup requires custom CUDA implementation.
 - [ ] **End-to-End Test:**
   - [ ] Verify that `client.get_code(address)` works for a known contract.
 
-**Phase 78: Full Mainnet GPU Benchmark (ASAP)**
-- [ ] **Modal Setup:**
-  - [ ] Update `modal_mainnet_bench.py` to pull `mainnet_compact.bin` from R2 (instead of generating synthetic).
-- [ ] **Execution:**
-  - [ ] Run PIR benchmark on NVIDIA B200 (192GB) with full 60GB dataset.
-  - [ ] Verify <100ms latency target.
+**Phase 78: Full Mainnet GPU Benchmark (Jan 21, 2026) - COMPLETE**
+- [x] Update `modal_mainnet_bench.py` to use real R2 matrix data.
+- [x] Run PIR benchmark on NVIDIA H100 with full 60GB Mainnet dataset.
+- [x] **RESULT:** 53.0 ms latency (1.3 TB/s throughput). Goal reached!
 
-**Phase 76: Reth Integration & Data Extraction (Jan 20, 2026) - COMPLETE**
+**Phase 77: Client Code Resolution (Next Step)**
 - [x] Scaffold `reth-adapter` crate.
 - [x] Implement `reth_dump` with Compact (32B) schema and Code Indexing.
 - [x] **Full Mainnet Extraction:** Extracted 1.85B items (Account+Storage) to `mainnet_compact.bin` (60GB).

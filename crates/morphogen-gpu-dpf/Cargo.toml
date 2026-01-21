@@ -25,6 +25,7 @@ cudarc = { version = "0.12", optional = true, features = ["cuda-version-from-bui
 # Bytemuck for safe transmutes
 bytemuck = { version = "1.14", features = ["derive"] }
 rayon = "1.11.0"
+clap = { version = "4.4", features = ["derive"] }
 
 [dev-dependencies]
 criterion = "0.5"
@@ -51,3 +52,7 @@ path = "src/bin/bench_batch.rs"
 [[bin]]
 name = "bench_sharded"
 path = "src/bin/bench_sharded.rs"
+
+[[bin]]
+name = "bench_real_data"
+path = "src/bin/bench_real_data.rs"
