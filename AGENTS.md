@@ -38,4 +38,5 @@ cargo clippy --package morphogen-server --features network
 - `crates/morphogen-storage/` - AlignedMatrix, ChunkedMatrix
 - `crates/morphogen-dpf/` - DPF key generation and evaluation
 - `crates/morphogen-client/` - Client library and fixtures
+- `crates/reth-adapter/` - ETL tool for converting Reth DB to Cuckoo Matrix
 - `docs/KANBAN.md` - Project task tracking
