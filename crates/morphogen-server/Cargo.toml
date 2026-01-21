@@ -13,7 +13,7 @@
 
  # Network layer
  axum = { version = "0.8", features = ["ws"], optional = true }
- tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+ tokio = { version = "1", features = ["full"], optional = true }
  serde = { version = "1", features = ["derive"], optional = true }
  serde_json = { version = "1", optional = true }
  hex = { version = "0.4", optional = true }
@@ -22,6 +22,7 @@
  tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
  metrics = { version = "0.24", optional = true }
  metrics-exporter-prometheus = { version = "0.16", optional = true }
+ clap = { version = "4.0", features = ["derive"], optional = true }
 
  [dev-dependencies]
  morphogen-client = { path = "../morphogen-client" }
@@ -39,7 +40,7 @@
  profiling = []
  streaming_stores = []
  parallel = []
- network = ["axum", "tokio", "serde", "serde_json", "hex", "tower", "tracing", "tracing-subscriber", "metrics", "metrics-exporter-prometheus"]
+ network = ["axum", "tokio", "serde", "serde_json", "hex", "tower", "tracing", "tracing-subscriber", "metrics", "metrics-exporter-prometheus", "dep:clap", "dep:morphogen-gpu-dpf"]
 
  [lib]
  name = "morphogen_server"
@@ -52,4 +53,9 @@
  [[bin]]
  name = "server"
  path = "src/bin/server.rs"
+ required-features = ["network"]
+
+ [[bin]]
+ name = "test_server"
+ path = "src/bin/test_server.rs"
  required-features = ["network"]

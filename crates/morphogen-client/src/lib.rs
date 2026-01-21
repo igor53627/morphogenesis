@@ -1,5 +1,6 @@
 pub mod fixture;
 pub mod gpu;
+pub mod network;
 pub mod page;
 
 use morphogen_core::{CuckooAddresser, NUM_HASH_FUNCTIONS};
@@ -90,7 +91,10 @@ pub struct AccountData {
 
 impl AccountData {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() == 32 {
+        // Prioritize Compact Scheme (default for v4)
+        // If it's a full page (4096) or exactly 32 bytes, treat as Compact.
+        // Full scheme (64 bytes) is legacy/iceboxed.
+        if bytes.len() == 32 || bytes.len() == 4096 {
             // Compact Scheme: [Balance(16) | Nonce(8) | CodeID(4) | Padding(4)]
             let balance = u128::from_be_bytes(bytes[0..16].try_into().ok()?);
             let nonce = u64::from_be_bytes(bytes[16..24].try_into().ok()?);

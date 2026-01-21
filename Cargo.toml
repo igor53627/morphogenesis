@@ -7,5 +7,6 @@
      "crates/morphogen-storage",
      "crates/morphogen-server",
      "crates/reth-adapter",
+     "crates/morphogen-rpc-adapter",
  ]
  resolver = "2"
