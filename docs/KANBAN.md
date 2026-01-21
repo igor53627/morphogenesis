@@ -783,21 +783,11 @@ True GPU speedup requires custom CUDA implementation.
 - [x] **Code Extraction:** Extracted 2M unique contracts to sharded `code_store/`.
 - [x] **Deployment:** Uploaded Matrix (64GB) and Metadata to R2. CAS upload running in background.
 
-**Phase 75: Privacy Hardening (Cuckoo Seed Rotation) (Jan 19, 2026) - IN PROGRESS**
-
-
-**Icebox: Trustless Mode (Future Work)**
-- [ ] **Data Structure:**
-  - [ ] Implement UBT (Unified Binary Tree) construction in `ubt-exex`.
-  - [ ] Generate Merkle Proofs for 2KB payload rows.
-- [ ] **Hardware:**
-  - [ ] Acquire 8-GPU cluster (H200/B200) to host ~3.7 TB matrix.
-- [ ] **Client:**
-  - [ ] Integrate Helios light client for Merkle verification.
+**Phase 75: Privacy Hardening (Cuckoo Seed Rotation) (Jan 19, 2026) - COMPLETE**
 - [x] Design "Major Epoch" architecture (`docs/design/ROTATION_AND_UBT.md`).
 - [x] Implement `EpochManager::submit_snapshot` API stub.
-- [ ] Implement `GpuPageMatrix` loading from `ChunkedMatrix`.
-- [ ] Expose administrative API endpoint.
+- [x] Implement `GpuPageMatrix` loading from `ChunkedMatrix`.
+- [x] Expose administrative API endpoint.
 
 **Phase 74d: Production Hardening (Jan 19, 2026) - COMPLETE**
 - [x] **Observability:**

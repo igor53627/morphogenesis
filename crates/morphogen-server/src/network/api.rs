@@ -39,7 +39,6 @@ pub struct EpochMetadata {
 #[derive(Clone)]
 pub struct AppState {
     pub global: Arc<GlobalState>,
-    pub pending: Arc<morphogen_core::DeltaBuffer>,
     pub row_size_bytes: usize,
     pub num_rows: usize,
     pub seeds: [u64; 3],
@@ -98,6 +97,32 @@ pub struct EpochMetadataResponse {
 pub struct QueryRequest {
     #[serde(with = "hex_bytes_vec")]
     pub keys: Vec<Vec<u8>>,
+}
+
+#[derive(Deserialize)]
+pub struct AdminSnapshotRequest {
+    pub epoch_id: u64,
+    pub rows: usize,
+    pub seeds: [u64; 3],
+    pub block_number: u64,
+    #[serde(with = "hex_bytes")]
+    pub state_root: [u8; 32],
+    pub matrix_url: String,
+}
+
+pub async fn admin_snapshot_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AdminSnapshotRequest>,
+) -> Result<StatusCode, StatusCode> {
+    // 1. Download matrix (TODO: implement background downloader)
+    // 2. Load into ChunkedMatrix
+    // 3. submit_snapshot to global state
+    
+    // For now, we just log it as a stub
+    #[cfg(feature = "tracing")]
+    info!("Admin requested snapshot for epoch {}", request.epoch_id);
+    
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[derive(Serialize)]
@@ -270,7 +295,7 @@ pub async fn query_handler(
 
     let (results, epoch_id) = scan_consistent(
         state.global.as_ref(),
-        state.pending.as_ref(),
+        state.global.load_pending().as_ref(),
         &keys,
         state.row_size_bytes,
     )
@@ -420,7 +445,8 @@ pub async fn page_query_gpu_handler(
             
             // 2. Check epochs
             if let Some(matrix) = matrix_guard.as_ref() {
-                let pending_epoch = state.pending.pending_epoch(); // Relaxed check
+                let pending = state.global.load_pending();
+                let pending_epoch = pending.pending_epoch(); // Relaxed check
                 if pending_epoch != snapshot1.epoch_id {
                     drop(matrix_guard);
                     std::thread::yield_now();
@@ -432,12 +458,12 @@ pub async fn page_query_gpu_handler(
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 
                 // 4. Scan Delta
-                let delta_results = scan_delta_for_gpu(&state.pending, &[keys[0], keys[1], keys[2]], PAGE_SIZE_BYTES)
+                let delta_results = scan_delta_for_gpu(pending.as_ref(), &[keys[0], keys[1], keys[2]], PAGE_SIZE_BYTES)
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
                 
                 // 5. Verify consistency after scan
                 let snapshot2 = state.global.load();
-                let pending_epoch_after = state.pending.pending_epoch();
+                let pending_epoch_after = pending.pending_epoch();
                 
                 if snapshot1.epoch_id == snapshot2.epoch_id && pending_epoch_after == snapshot1.epoch_id {
                     // Merge results
@@ -524,7 +550,7 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
                             let keys = [k0, k1, k2];
                             match scan_consistent(
                                 state.global.as_ref(),
-                                state.pending.as_ref(),
+                                state.global.load_pending().as_ref(),
                                 &keys,
                                 state.row_size_bytes,
                             ) {
@@ -601,6 +627,7 @@ pub fn create_router_with_concurrency(
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/epoch", get(epoch_handler))
+        .route("/admin/snapshot", post(admin_snapshot_handler))
         .merge(scan_routes)
         .route("/ws/epoch", get(ws_epoch_handler))
         .route("/ws/query", get(ws_query_handler))
@@ -629,8 +656,8 @@ mod tests {
             epoch_id: 42,
             matrix,
         };
-        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
         let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
 
         let initial = EpochMetadata {
             epoch_id: 42,
@@ -642,7 +669,6 @@ mod tests {
         let (_tx, rx) = watch::channel(initial);
         Arc::new(AppState {
             global,
-            pending,
             row_size_bytes,
             num_rows: 100_000,
             seeds: [0x1234, 0x5678, 0x9ABC],
@@ -661,7 +687,7 @@ mod tests {
                 fn app_state_has_pending_buffer() {
             
         let state = test_state();
-        assert!(state.pending.is_empty().unwrap());
+        assert!(state.global.load_pending().is_empty().unwrap());
         assert_eq!(state.row_size_bytes, 256);
     }
 

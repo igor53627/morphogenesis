@@ -7,6 +7,8 @@
 use cudarc::driver::{CudaDevice, CudaSlice};
 #[cfg(feature = "cuda")]
 use std::sync::Arc;
+#[cfg(feature = "cuda")]
+use morphogen_storage::ChunkedMatrix;
 
 /// Page size in bytes (4KB).
 pub const PAGE_SIZE_BYTES: usize = 4096;
@@ -35,6 +37,46 @@ impl GpuPageMatrix {
             data,
             num_pages,
         })
+    }
+
+    /// Create a new GpuPageMatrix from a ChunkedMatrix (CPU).
+    pub fn from_chunked_matrix(device: Arc<CudaDevice>, matrix: &ChunkedMatrix) -> Result<Self, cudarc::driver::DriverError> {
+        let total_size = matrix.total_size_bytes();
+        // Pad total size if not aligned
+        let padding = if total_size % PAGE_SIZE_BYTES != 0 {
+            PAGE_SIZE_BYTES - (total_size % PAGE_SIZE_BYTES)
+        } else {
+            0
+        };
+        let padded_total_size = total_size + padding;
+        let num_pages = padded_total_size / PAGE_SIZE_BYTES;
+        
+        let mut gpu_matrix = Self::alloc_empty(device.clone(), num_pages)?;
+        
+        let mut current_offset = 0;
+        for i in 0..matrix.num_chunks() {
+            let chunk = matrix.chunk(i);
+            let size = matrix.chunk_size(i);
+            
+            // Check if chunk size is multiple of PAGE_SIZE_BYTES
+            // If it's the last chunk, it might not be multiple.
+            if size % PAGE_SIZE_BYTES != 0 {
+                // If not multiple, we need to pad this chunk before upload
+                let mut padded_chunk = chunk.as_slice().to_vec();
+                let chunk_padding = PAGE_SIZE_BYTES - (size % PAGE_SIZE_BYTES);
+                padded_chunk.extend(std::iter::repeat(0).take(chunk_padding));
+                
+                let start_page = current_offset / PAGE_SIZE_BYTES;
+                gpu_matrix.update_pages(start_page, &padded_chunk)?;
+            } else {
+                let start_page = current_offset / PAGE_SIZE_BYTES;
+                gpu_matrix.update_pages(start_page, chunk.as_slice())?;
+            }
+            
+            current_offset += size;
+        }
+        
+        Ok(gpu_matrix)
     }
 
     /// Allocate an empty (zeroed) GpuPageMatrix on the device.

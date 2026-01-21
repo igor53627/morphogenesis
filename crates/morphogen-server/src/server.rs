@@ -13,7 +13,6 @@ use crate::scan::{scan_consistent, ScanError};
 pub struct MorphogenServer {
     config: ServerConfig,
     state: GlobalState,
-    pending: Arc<DeltaBuffer>,
 }
 
 impl MorphogenServer {
@@ -34,18 +33,19 @@ impl MorphogenServer {
             epoch_id: 0,
             matrix,
         });
+        
+        let pending = Arc::new(DeltaBuffer::new(row_size_bytes));
 
         Ok(Self {
             config,
-            state: GlobalState::new(snapshot),
-            pending: Arc::new(DeltaBuffer::new(row_size_bytes)),
+            state: GlobalState::new(snapshot, pending),
         })
     }
 
     pub fn scan<K: DpfKey>(&self, keys: &[K; 3]) -> Result<([Vec<u8>; 3], u64), ScanError> {
         scan_consistent(
             &self.state,
-            self.pending.as_ref(),
+            self.state.load_pending().as_ref(),
             keys,
             self.config.row_size_bytes,
         )
@@ -58,7 +58,7 @@ impl MorphogenServer {
     ) -> Result<([Vec<u8>; 3], u64), ScanError> {
         scan_consistent_parallel(
             &self.state,
-            self.pending.as_ref(),
+            self.state.load_pending().as_ref(),
             keys,
             self.config.row_size_bytes,
         )
@@ -86,18 +86,30 @@ impl MorphogenServer {
         row_idx: usize,
         diff: Vec<u8>,
     ) -> Result<(), morphogen_core::DeltaError> {
-        self.pending.push(row_idx, diff)
+        self.state.load_pending().push(row_idx, diff)
     }
 
     pub fn try_merge_epoch(&mut self) -> Result<u64, MergeError> {
         let current = self.state.load();
+        let pending = self.state.load_pending();
         let next_epoch_id = current.epoch_id + 1;
         let next_snapshot =
-            try_build_next_snapshot(current.as_ref(), self.pending.as_ref(), next_epoch_id)?;
+            try_build_next_snapshot(current.as_ref(), pending.as_ref(), next_epoch_id)?;
 
         self.state.store(Arc::new(next_snapshot));
-        self.pending = Arc::new(DeltaBuffer::new(self.config.row_size_bytes));
+        self.state.store_pending(Arc::new(DeltaBuffer::new(self.config.row_size_bytes)));
         Ok(next_epoch_id)
+    }
+
+    /// Submits a full snapshot from an external source (seed rotation).
+    pub fn submit_snapshot(&self, epoch_id: u64, matrix: Arc<ChunkedMatrix>) {
+        let snapshot = Arc::new(EpochSnapshot {
+            epoch_id,
+            matrix,
+        });
+        self.state.store(snapshot);
+        // Reset pending buffer for the new epoch
+        self.state.store_pending(Arc::new(DeltaBuffer::new_with_epoch(self.config.row_size_bytes, epoch_id)));
     }
 }
 
