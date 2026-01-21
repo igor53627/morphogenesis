@@ -18,12 +18,17 @@ struct Args {
     /// GPU Device ID
     #[arg(long, default_value_t = 0)]
     gpu: usize,
+
+    /// Batch size (concurrent queries)
+    #[arg(long, default_value_t = 1)]
+    batch_size: usize,
 }
 
 fn main() {
     let args = Args::parse();
     println!("=== Morphogenesis Real Data Benchmark ===");
     println!("File: {:?}", args.file);
+    println!("Batch Size: {}", args.batch_size);
 
     // 1. Load File
     let start_load = Instant::now();
@@ -48,6 +53,13 @@ fn main() {
     println!("Initializing GPU {}...", args.gpu);
     let scanner = GpuScanner::new(args.gpu).expect("Failed to init scanner");
     
+    // Get device name/arch for logging
+    #[cfg(feature = "cuda")]
+    {
+        let name = scanner.device.name().unwrap_or_else(|_| "Unknown".to_string());
+        println!("Device: {}", name);
+    }
+    
     // Auto-detect parameters
     let row_size = 32; // We know it's compact
     let num_rows = total_bytes / row_size;
@@ -69,16 +81,21 @@ fn main() {
     // 4. Benchmark
     println!("Running {} iterations...", args.iterations);
     let params = ChaChaParams::new(domain_bits).unwrap();
-    let (k0, _k1) = morphogen_gpu_dpf::dpf::generate_chacha_dpf_keys(&params, 12345).unwrap();
-    let keys = [&k0, &k0, &k0]; // Batch of 3 queries
+    
+    // Prepare batch of queries
+    let mut queries = Vec::with_capacity(args.batch_size);
+    for i in 0..args.batch_size {
+        let (k0, _k1) = morphogen_gpu_dpf::dpf::generate_chacha_dpf_keys(&params, 12345 + i).unwrap();
+        queries.push([k0.clone(), k0.clone(), k0.clone()]);
+    }
 
     // Warmup
-    unsafe { scanner.scan(&gpu_db, keys).unwrap(); }
+    unsafe { scanner.scan_batch(&gpu_db, &queries).unwrap(); }
 
     let mut latencies = Vec::new();
     for i in 0..args.iterations {
         let start = Instant::now();
-        unsafe { scanner.scan(&gpu_db, keys).unwrap(); }
+        unsafe { scanner.scan_batch(&gpu_db, &queries).unwrap(); }
         latencies.push(start.elapsed());
         print!(".");
         use std::io::Write;
@@ -88,9 +105,15 @@ fn main() {
 
     let avg_latency = latencies.iter().sum::<std::time::Duration>() / args.iterations as u32;
     let avg_ms = avg_latency.as_secs_f64() * 1000.0;
-    let throughput = (total_bytes as f64 / 1e9) / avg_latency.as_secs_f64();
+    
+    // Throughput = Total Bytes Scanned / Time
+    // Note: In batched PIR, we scan the DB *once* per batch, but do work for N queries.
+    // The "Effective Throughput" is N * DB_Size / Time.
+    let effective_throughput = (total_bytes as f64 * args.batch_size as f64 / 1e9) / avg_latency.as_secs_f64();
+    let qps = args.batch_size as f64 / avg_latency.as_secs_f64();
 
-    println!("Results:");
-    println!("  Avg Latency: {:.2} ms", avg_ms);
-    println!("  Throughput:  {:.2} GB/s", throughput);
+    println!("Results (Batch Size {}):", args.batch_size);
+    println!("  Avg Latency:       {:.2} ms", avg_ms);
+    println!("  Effective Bandwidth: {:.2} GB/s", effective_throughput);
+    println!("  Queries Per Sec:   {:.2} QPS", qps);
 }
