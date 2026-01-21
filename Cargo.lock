@@ -2780,6 +2780,7 @@ dependencies = [
  "criterion",
  "cudarc",
  "hex",
+ "morphogen-storage",
  "rand 0.8.5",
  "rayon",
 ]

@@ -61,6 +61,7 @@ impl MorphogenServer {
             self.state.load_pending().as_ref(),
             keys,
             self.config.row_size_bytes,
+            1, // Default batch size
         )
     }
 
