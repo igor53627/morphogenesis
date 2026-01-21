@@ -57,7 +57,23 @@ impl RethSource {
     }
 
     pub fn sample_data(&self, limit: usize) {
-        // ... (existing) ...
+        let tx = self.db.tx().expect("Failed to start transaction");
+        println!("--- Account Sample ---");
+        
+        // Try WETH
+        let weth_addr = alloy_primitives::address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let mut acc_cursor = tx.cursor_read::<reth_db::tables::PlainAccountState>().expect("Cursor failed");
+        if let Ok(Some((addr, acc))) = acc_cursor.seek_exact(weth_addr) {
+            println!("WETH {:?}: Nonce={}, Balance={}, CodeHash={:?}", addr, acc.nonce, acc.balance, acc.bytecode_hash);
+        }
+
+        let mut cursor = tx.cursor_read::<reth_db::tables::PlainAccountState>().expect("Cursor failed");
+        let mut count = 0;
+        while let Some((addr, acc)) = cursor.next().unwrap() {
+            if count >= limit { break; }
+            println!("Account {:?}: Nonce={}, Balance={}, CodeHash={:?}", addr, acc.nonce, acc.balance, acc.bytecode_hash);
+            count += 1;
+        }
     }
 
     pub fn verify_compression(&self) {

@@ -764,12 +764,12 @@ True GPU speedup requires custom CUDA implementation.
   - Result: **VERIFIED on Modal T4, H100, and H200 GPUs**
   - Full pipeline (Client -> API -> GPU Scanner -> CUDA Kernel) functional.
   - Native Hopper (`sm_90`) and Turing (`sm_75`) support verified.
-**Phase 77: Client Code Resolution (Next Step)**
-- [ ] **Client Logic:**
-  - [ ] Implement `resolve_code_hash(code_id)` using HTTP Range Requests to `mainnet_compact.dict` on R2.
-  - [ ] Implement `fetch_bytecode(code_hash)` using direct GET to `pir/cas/{shard}/{hash}.bin`.
-- [ ] **End-to-End Test:**
-  - [ ] Verify that `client.get_code(address)` works for a known contract.
+**Phase 77: Client Code Resolution (Jan 21, 2026) - COMPLETE**
+- [x] **Client Logic:**
+  - [x] Implement `resolve_code_hash(code_id)` using HTTP Range Requests to `mainnet_compact.dict` on R2.
+  - [x] Implement `fetch_bytecode(code_hash)` using direct GET to `pir/cas/{shard}/{hash}.bin`.
+- [x] **End-to-End Test:**
+  - [x] Verify that `client.get_code(address)` works for a known contract (WETH).
 
 **Phase 78: Full Mainnet GPU Benchmark (Jan 21, 2026) - COMPLETE**
 - [x] Update `modal_mainnet_bench.py` to use real R2 matrix data.

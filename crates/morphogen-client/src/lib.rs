@@ -108,6 +108,77 @@ impl AccountData {
     }
 }
 
+pub struct CodeResolver {
+    pub dict_url: String,
+    pub cas_base_url: String,
+    pub client: reqwest::Client,
+}
+
+impl CodeResolver {
+    pub fn new(dict_url: String, cas_base_url: String) -> Self {
+        Self {
+            dict_url,
+            cas_base_url,
+            client: reqwest::Client::new(),
+        }
+    }
+
+    pub async fn resolve_code_hash(&self, code_id: u32) -> Result<[u8; 32], String> {
+        let offset = code_id as u64 * 32;
+        let range_header = format!("bytes={}-{}", offset, offset + 31);
+        
+        let response = self.client.get(&self.dict_url)
+            .header("Range", range_header)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+            
+        if !response.status().is_success() {
+            return Err(format!("HTTP error: {}", response.status()));
+        }
+
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        if bytes.len() < 32 {
+            return Err("Received less than 32 bytes for hash".to_string());
+        }
+
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&bytes[..32]);
+        Ok(hash)
+    }
+
+    pub async fn fetch_bytecode(&self, code_hash: [u8; 32]) -> Result<Vec<u8>, String> {
+        if code_hash == [0u8; 32] {
+            return Ok(Vec::new()); // EOA
+        }
+
+        let hex_hash = hex::encode(code_hash);
+        let shard1 = &hex_hash[0..2];
+        let shard2 = &hex_hash[2..4];
+        let url = format!("{}/{}/{}/{}.bin", self.cas_base_url, shard1, shard2, hex_hash);
+        
+        let response = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("HTTP error: {}", response.status()));
+        }
+
+        let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+        Ok(bytes.to_vec())
+    }
+
+    pub async fn resolve_full_data(&self, data: &AccountData) -> Result<AccountData, String> {
+        let mut resolved = data.clone();
+        
+        if let Some(code_id) = data.code_id {
+            if resolved.code_hash.is_none() {
+                resolved.code_hash = Some(self.resolve_code_hash(code_id).await?);
+            }
+        }
+        
+        Ok(resolved)
+    }
+}
+
 pub fn generate_query<R: Rng>(
     rng: &mut R,
     account_key: &[u8],
@@ -436,5 +507,86 @@ mod tests {
         assert_eq!(data.nonce, 5);
         assert_eq!(data.code_hash, Some([0xAA; 32]));
         assert!(data.code_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_code_resolver_resolve_hash() {
+        let mut server = mockito::Server::new_async().await;
+        let dict_url = format!("{}/dict.bin", server.url());
+        
+        let hash = [0x11u8; 32];
+        let _m = server.mock("GET", "/dict.bin")
+            .match_header("Range", "bytes=32-63")
+            .with_body(&hash)
+            .create_async()
+            .await;
+            
+        let resolver = CodeResolver::new(dict_url, "http://localhost/cas".to_string());
+        let resolved_hash = resolver.resolve_code_hash(1).await.unwrap();
+        
+        assert_eq!(resolved_hash, hash);
+    }
+
+    #[tokio::test]
+    async fn test_code_resolver_fetch_bytecode() {
+        let mut server = mockito::Server::new_async().await;
+        let cas_base_url = server.url();
+        
+        let hash = [0xAAu8; 32];
+        let hex_hash = hex::encode(hash);
+        let shard1 = &hex_hash[0..2];
+        let shard2 = &hex_hash[2..4];
+        let path = format!("/{}/{}/{}.bin", shard1, shard2, hex_hash);
+        
+        let bytecode = vec![0x60, 0x80, 0x60, 0x40];
+        let _m = server.mock("GET", path.as_str())
+            .with_body(&bytecode)
+            .create_async()
+            .await;
+            
+        let resolver = CodeResolver::new("http://localhost/dict".to_string(), cas_base_url);
+        let fetched_bytecode = resolver.fetch_bytecode(hash).await.unwrap();
+        
+        assert_eq!(fetched_bytecode, bytecode);
+    }
+
+    #[tokio::test]
+    async fn test_code_resolver_e2e_flow() {
+        let mut server = mockito::Server::new_async().await;
+        let base_url = server.url();
+        
+        let code_id = 628088;
+        let weth_hash = hex::decode("d0a06b12ac47863b5c7be4185c2deaad1c61557033f56c7d4ea74429cbb25e23").unwrap();
+        let weth_bytecode = vec![0x60, 0x80, 0x60, 0x40]; // Mock bytecode
+        
+        // Mock dictionary range request
+        let _m1 = server.mock("GET", "/mainnet_compact.dict")
+            .match_header("Range", format!("bytes={}-{}", code_id * 32, code_id * 32 + 31).as_str())
+            .with_body(&weth_hash)
+            .create_async()
+            .await;
+            
+        // Mock CAS request
+        let shard1 = "d0";
+        let shard2 = "a0";
+        let hex_hash = "d0a06b12ac47863b5c7be4185c2deaad1c61557033f56c7d4ea74429cbb25e23";
+        let cas_path = format!("/cas/{}/{}/{}.bin", shard1, shard2, hex_hash);
+        let _m2 = server.mock("GET", cas_path.as_str())
+            .with_body(&weth_bytecode)
+            .create_async()
+            .await;
+            
+        let resolver = CodeResolver::new(
+            format!("{}/mainnet_compact.dict", base_url),
+            format!("{}/cas", base_url)
+        );
+        
+        // 1. Resolve hash
+        let resolved_hash = resolver.resolve_code_hash(code_id).await.unwrap();
+        assert_eq!(resolved_hash.as_slice(), weth_hash.as_slice());
+        
+        // 2. Fetch bytecode
+        let fetched_bytecode = resolver.fetch_bytecode(resolved_hash).await.unwrap();
+        assert_eq!(fetched_bytecode, weth_bytecode);
     }
 }
