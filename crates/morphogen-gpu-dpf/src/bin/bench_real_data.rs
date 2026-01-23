@@ -14,7 +14,7 @@ struct Args {
     /// Number of iterations
     #[arg(short, long, default_value_t = 10)]
     iterations: usize,
-    
+
     /// GPU Device ID
     #[arg(long, default_value_t = 0)]
     gpu: usize,
@@ -22,6 +22,10 @@ struct Args {
     /// Batch size (concurrent queries)
     #[arg(long, default_value_t = 1)]
     batch_size: usize,
+
+    /// Limit data size in GB (e.g. 10.0)
+    #[arg(long)]
+    limit_gb: Option<f64>,
 }
 
 fn main() {
@@ -33,10 +37,23 @@ fn main() {
     // 1. Load File
     let start_load = Instant::now();
     let mut data = std::fs::read(&args.file).expect("Failed to read file");
+
+    if let Some(limit) = args.limit_gb {
+        let limit_bytes = (limit * 1e9) as usize;
+        if data.len() > limit_bytes {
+            println!(
+                "Limiting dataset to {} bytes ({:.2} GB)",
+                limit_bytes, limit
+            );
+            data.truncate(limit_bytes);
+        }
+    }
+
     let load_time = start_load.elapsed();
     let total_bytes = data.len();
-    println!("Loaded {:.2} GB in {:.2}s ({:.2} GB/s)", 
-        total_bytes as f64 / 1e9, 
+    println!(
+        "Loaded {:.2} GB in {:.2}s ({:.2} GB/s)",
+        total_bytes as f64 / 1e9,
         load_time.as_secs_f64(),
         (total_bytes as f64 / 1e9) / load_time.as_secs_f64()
     );
@@ -45,35 +62,44 @@ fn main() {
     let remainder = data.len() % 4096;
     if remainder != 0 {
         let padding = 4096 - remainder;
-        println!("Padding data with {} bytes to align to 4KB page...", padding);
+        println!(
+            "Padding data with {} bytes to align to 4KB page...",
+            padding
+        );
         data.extend(std::iter::repeat(0).take(padding));
     }
 
     // 2. Init GPU
     println!("Initializing GPU {}...", args.gpu);
     let scanner = GpuScanner::new(args.gpu).expect("Failed to init scanner");
-    
+
     // Get device name/arch for logging
     #[cfg(feature = "cuda")]
     {
-        let name = scanner.device.name().unwrap_or_else(|_| "Unknown".to_string());
+        let name = scanner
+            .device
+            .name()
+            .unwrap_or_else(|_| "Unknown".to_string());
         println!("Device: {}", name);
     }
-    
+
     // Auto-detect parameters
     let row_size = 32; // We know it's compact
     let num_rows = total_bytes / row_size;
     let domain_bits = (num_rows as f64).log2().ceil() as usize;
-    
-    println!("Detected Matrix: {} rows, {} bits domain, {} bytes/row", 
-        num_rows, domain_bits, row_size);
+
+    println!(
+        "Detected Matrix: {} rows, {} bits domain, {} bytes/row",
+        num_rows, domain_bits, row_size
+    );
 
     // 3. Upload
     println!("Uploading to VRAM...");
     let start_upload = Instant::now();
     let gpu_db = GpuPageMatrix::new(scanner.device.clone(), &data).expect("Failed to upload");
     let upload_time = start_upload.elapsed();
-    println!("Uploaded in {:.2}s ({:.2} GB/s)",
+    println!(
+        "Uploaded in {:.2}s ({:.2} GB/s)",
         upload_time.as_secs_f64(),
         (total_bytes as f64 / 1e9) / upload_time.as_secs_f64()
     );
@@ -81,21 +107,26 @@ fn main() {
     // 4. Benchmark
     println!("Running {} iterations...", args.iterations);
     let params = ChaChaParams::new(domain_bits).unwrap();
-    
+
     // Prepare batch of queries
     let mut queries = Vec::with_capacity(args.batch_size);
     for i in 0..args.batch_size {
-        let (k0, _k1) = morphogen_gpu_dpf::dpf::generate_chacha_dpf_keys(&params, 12345 + i).unwrap();
+        let (k0, _k1) =
+            morphogen_gpu_dpf::dpf::generate_chacha_dpf_keys(&params, 12345 + i).unwrap();
         queries.push([k0.clone(), k0.clone(), k0.clone()]);
     }
 
     // Warmup
-    unsafe { scanner.scan_batch(&gpu_db, &queries).unwrap(); }
+    unsafe {
+        scanner.scan_batch(&gpu_db, &queries).unwrap();
+    }
 
     let mut latencies = Vec::new();
     for i in 0..args.iterations {
         let start = Instant::now();
-        unsafe { scanner.scan_batch(&gpu_db, &queries).unwrap(); }
+        unsafe {
+            scanner.scan_batch(&gpu_db, &queries).unwrap();
+        }
         latencies.push(start.elapsed());
         print!(".");
         use std::io::Write;
@@ -105,11 +136,12 @@ fn main() {
 
     let avg_latency = latencies.iter().sum::<std::time::Duration>() / args.iterations as u32;
     let avg_ms = avg_latency.as_secs_f64() * 1000.0;
-    
+
     // Throughput = Total Bytes Scanned / Time
     // Note: In batched PIR, we scan the DB *once* per batch, but do work for N queries.
     // The "Effective Throughput" is N * DB_Size / Time.
-    let effective_throughput = (total_bytes as f64 * args.batch_size as f64 / 1e9) / avg_latency.as_secs_f64();
+    let effective_throughput =
+        (total_bytes as f64 * args.batch_size as f64 / 1e9) / avg_latency.as_secs_f64();
     let qps = args.batch_size as f64 / avg_latency.as_secs_f64();
 
     println!("Results (Batch Size {}):", args.batch_size);
