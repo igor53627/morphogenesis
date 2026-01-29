@@ -33,7 +33,7 @@ impl MorphogenServer {
             epoch_id: 0,
             matrix,
         });
-        
+
         let pending = Arc::new(DeltaBuffer::new(row_size_bytes));
 
         Ok(Self {
@@ -98,19 +98,21 @@ impl MorphogenServer {
             try_build_next_snapshot(current.as_ref(), pending.as_ref(), next_epoch_id)?;
 
         self.state.store(Arc::new(next_snapshot));
-        self.state.store_pending(Arc::new(DeltaBuffer::new(self.config.row_size_bytes)));
+        self.state
+            .store_pending(Arc::new(DeltaBuffer::new(self.config.row_size_bytes)));
         Ok(next_epoch_id)
     }
 
     /// Submits a full snapshot from an external source (seed rotation).
     pub fn submit_snapshot(&self, epoch_id: u64, matrix: Arc<ChunkedMatrix>) {
-        let snapshot = Arc::new(EpochSnapshot {
-            epoch_id,
-            matrix,
-        });
+        let snapshot = Arc::new(EpochSnapshot { epoch_id, matrix });
         self.state.store(snapshot);
         // Reset pending buffer for the new epoch
-        self.state.store_pending(Arc::new(DeltaBuffer::new_with_epoch(self.config.row_size_bytes, epoch_id)));
+        self.state
+            .store_pending(Arc::new(DeltaBuffer::new_with_epoch(
+                self.config.row_size_bytes,
+                epoch_id,
+            )));
     }
 }
 

@@ -24,7 +24,11 @@ impl std::fmt::Display for GpuDpfError {
                 write!(f, "Page index {} exceeds max {}", index, max)
             }
             Self::InvalidKeyLength { expected, actual } => {
-                write!(f, "Invalid key length: expected {}, got {}", expected, actual)
+                write!(
+                    f,
+                    "Invalid key length: expected {}, got {}",
+                    expected, actual
+                )
             }
             Self::InvalidKeyFormat(reason) => {
                 write!(f, "Invalid key format: {}", reason)
@@ -160,10 +164,14 @@ impl ChaChaKey {
     pub fn eval_subtree(&self, start: usize, output: &mut [Seed128]) -> Result<(), GpuDpfError> {
         let subtree_size = output.len();
         if !subtree_size.is_power_of_two() {
-            return Err(GpuDpfError::InvalidKeyFormat("Subtree size must be power of 2"));
+            return Err(GpuDpfError::InvalidKeyFormat(
+                "Subtree size must be power of 2",
+            ));
         }
         if start % subtree_size != 0 {
-            return Err(GpuDpfError::InvalidKeyFormat("Start index must be aligned to subtree size"));
+            return Err(GpuDpfError::InvalidKeyFormat(
+                "Start index must be aligned to subtree size",
+            ));
         }
 
         // Find the seed and t at the root of this subtree
@@ -184,7 +192,11 @@ impl ChaChaKey {
             if t == 1 {
                 let cw = &self.correction_words[level];
                 next_seed = next_seed.xor(&cw.seed_cw);
-                next_t ^= if bit == 0 { cw.t_cw_left } else { cw.t_cw_right };
+                next_t ^= if bit == 0 {
+                    cw.t_cw_left
+                } else {
+                    cw.t_cw_right
+                };
             }
             seed = next_seed;
             t = next_t;
@@ -195,13 +207,7 @@ impl ChaChaKey {
         Ok(())
     }
 
-    fn expand_recursive(
-        &self,
-        level: usize,
-        seed: Seed128,
-        t: u8,
-        output: &mut [Seed128],
-    ) {
+    fn expand_recursive(&self, level: usize, seed: Seed128, t: u8, output: &mut [Seed128]) {
         if level == self.domain_bits {
             // Leaf reached
             let mut final_seed = seed;
@@ -256,13 +262,13 @@ impl ChaChaKey {
         bytes.push(self.root_t);
         bytes.push(self.party);
         bytes.push(self.domain_bits as u8);
-        
+
         for cw in &self.correction_words {
             bytes.extend_from_slice(&cw.seed_cw.to_bytes());
             bytes.push(cw.t_cw_left);
             bytes.push(cw.t_cw_right);
         }
-        
+
         bytes.extend_from_slice(&self.final_cw.to_bytes());
         bytes
     }

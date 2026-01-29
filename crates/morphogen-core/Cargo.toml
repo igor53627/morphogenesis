@@ -6,7 +6,13 @@
  [dependencies]
  arc-swap = "1.7"
  morphogen-storage = { path = "../morphogen-storage" }
- 
- [lib]
- name = "morphogen_core"
- path = "src/lib.rs"
+ alloy-primitives = { version = "1.5" }
+ sha3 = "0.10"
+ binius_field = { git = "https://github.com/IrreducibleOSS/binius" }
+ rand = "0.8"
+ serde = { version = "1.0", features = ["derive"] }
+ rayon = "1.8"
+
+[lib]
+name = "morphogen_core"
+path = "src/lib.rs"

@@ -1,4 +1,7 @@
-use crate::{aggregate_responses, generate_query, AccountData, EpochMetadata, ServerResponse, QUERIES_PER_REQUEST};
+use crate::{
+    aggregate_responses, generate_query, AccountData, EpochMetadata, ServerResponse,
+    QUERIES_PER_REQUEST,
+};
 use anyhow::{anyhow, Result};
 use rand::thread_rng;
 use serde::Deserialize;
@@ -36,7 +39,10 @@ impl PirClient {
         let resp: RawEpochResponse = self.http_client.get(url).send().await?.json().await?;
 
         let mut state_root = [0u8; 32];
-        let hex_root = resp.state_root.strip_prefix("0x").unwrap_or(&resp.state_root);
+        let hex_root = resp
+            .state_root
+            .strip_prefix("0x")
+            .unwrap_or(&resp.state_root);
         hex::decode_to_slice(hex_root, &mut state_root)?;
 
         let metadata = Arc::new(EpochMetadata {
@@ -64,7 +70,7 @@ impl PirClient {
 
     pub async fn query_account(&self, address: [u8; 20]) -> Result<AccountData> {
         let metadata = self.get_metadata().await?;
-        
+
         let query_keys = {
             let mut rng = thread_rng();
             generate_query(&mut rng, &address, &metadata)

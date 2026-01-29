@@ -2,12 +2,12 @@
 //!
 //! Simulates splitting the database across 2 GPUs to measure latency reduction.
 
-use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams, ChaChaKey};
-use morphogen_gpu_dpf::kernel::{PAGE_SIZE_BYTES};
+use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaKey, ChaChaParams};
+use morphogen_gpu_dpf::kernel::PAGE_SIZE_BYTES;
 use std::env;
-use std::time::{Instant, Duration};
-use std::thread;
 use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "cuda")]
 use morphogen_gpu_dpf::kernel::GpuScanner;
@@ -22,7 +22,7 @@ fn main() {
 
     let domain_bits = 25; // Mainnet scale (137 GB total)
     let num_shards = 2;
-    
+
     println!("=== Morphogenesis Sharded Benchmark (2x GPUs) ===");
     println!("Total Domain: {} bits (137 GB)", domain_bits);
     println!("Shards: {}", num_shards);
@@ -51,30 +51,34 @@ fn main() {
         for gpu_id in 0..num_shards {
             let barrier = barrier.clone();
             let query = query.clone();
-            
+
             handles.push(thread::spawn(move || {
                 println!("[GPU {}] Initializing...", gpu_id);
                 let scanner = GpuScanner::new(gpu_id).expect("Failed to create GpuScanner");
-                
+
                 println!("[GPU {}] Allocating {:.2} GB...", gpu_id, shard_size_gb);
                 // Allocate empty zeros to save host RAM/Time (we only care about GPU VRAM/BW)
                 let gpu_db = GpuPageMatrix::alloc_empty(scanner.device.clone(), pages_per_shard)
                     .expect("Failed to allocate VRAM");
-                
+
                 println!("[GPU {}] Ready.", gpu_id);
-                
+
                 // Wait for all GPUs to be ready
                 barrier.wait();
-                
+
                 // Wait for start signal
                 barrier.wait();
-                
+
                 let start = Instant::now();
                 let _result = unsafe { scanner.scan(&gpu_db, [&query[0], &query[1], &query[2]]) }
                     .expect("Scan failed");
                 let elapsed = start.elapsed();
-                
-                println!("[GPU {}] Scan finished in {:.2} ms", gpu_id, elapsed.as_secs_f64() * 1000.0);
+
+                println!(
+                    "[GPU {}] Scan finished in {:.2} ms",
+                    gpu_id,
+                    elapsed.as_secs_f64() * 1000.0
+                );
                 elapsed
             }));
         }
@@ -82,7 +86,7 @@ fn main() {
         // Wait for initialization
         barrier.wait();
         println!("\nAll GPUs initialized and data loaded. Starting synchronized scan...");
-        
+
         // Start race
         let start = Instant::now();
         barrier.wait(); // Release threads
@@ -97,10 +101,10 @@ fn main() {
         }
         let total_elapsed = start.elapsed(); // Includes thread overhead
 
-        // Note: total_elapsed includes the overhead of join(), but since scan is sync, 
+        // Note: total_elapsed includes the overhead of join(), but since scan is sync,
         // the max_latency from threads is the real "parallel" time.
         // Actually, wall clock is determined by the slowest thread.
-        
+
         let ms = max_latency.as_secs_f64() * 1000.0;
         let total_bw = (137.44 / ms) * 1000.0;
 
@@ -108,11 +112,11 @@ fn main() {
         println!("Sharded Latency (Max): {:.2} ms", ms);
         println!("Effective Throughput:  {:.2} GB/s", total_bw);
         println!("(Single GPU baseline was ~1600 GB/s)");
-        
+
         // Single GPU estimated latency for 137GB: ~87ms (from previous H200 bench)
         // If we get ~43ms here, linear scaling is proven.
     }
-    
+
     #[cfg(not(feature = "cuda"))]
     panic!("Requires cuda feature");
 }

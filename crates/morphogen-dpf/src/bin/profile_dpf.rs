@@ -113,21 +113,21 @@ fn analyze_mask_distribution(k0: &morphogen_dpf::page::PageDpfKey, num_pages: us
     use fss_rs::group::Group;
 
     println!("Analyzing mask distribution...");
-    
+
     let mut dpf_output = vec![ByteGroup::zero(); num_pages];
-    
+
     match k0.domain_bits() {
         1..=8 => {
             // Can't easily access params, use full_eval
         }
         _ => {}
     }
-    
+
     k0.full_eval(&mut dpf_output).unwrap();
-    
+
     let mut zero_masks = 0usize;
     let mut nonzero_masks = 0usize;
-    
+
     for output in &dpf_output {
         if output.0[0] == 0 {
             zero_masks += 1;
@@ -135,12 +135,18 @@ fn analyze_mask_distribution(k0: &morphogen_dpf::page::PageDpfKey, num_pages: us
             nonzero_masks += 1;
         }
     }
-    
+
     println!("Total pages: {}", num_pages);
     println!("Zero masks (first byte = 0): {}", zero_masks);
-    println!("Non-zero masks: {} ({:.1}%)", nonzero_masks, 
-             nonzero_masks as f64 / num_pages as f64 * 100.0);
-    println!("\nThis means the XOR loop processes {} pages (should ideally be 1)", nonzero_masks);
+    println!(
+        "Non-zero masks: {} ({:.1}%)",
+        nonzero_masks,
+        nonzero_masks as f64 / num_pages as f64 * 100.0
+    );
+    println!(
+        "\nThis means the XOR loop processes {} pages (should ideally be 1)",
+        nonzero_masks
+    );
 }
 
 fn run_contiguous_benchmark(
@@ -184,10 +190,7 @@ fn run_contiguous_benchmark(
     }
     let elapsed = profile_start.elapsed();
     let ms_per_iter = elapsed.as_secs_f64() * 1000.0 / 100.0;
-    println!(
-        "100 iterations: {:?} ({:.2}ms/iter)",
-        elapsed, ms_per_iter
-    );
+    println!("100 iterations: {:?} ({:.2}ms/iter)", elapsed, ms_per_iter);
 
     if domain_bits < 25 {
         let scale = (1usize << 25) as f64 / num_pages as f64;
@@ -241,10 +244,7 @@ fn run_fragmented_benchmark(
     }
     let elapsed = profile_start.elapsed();
     let ms_per_iter = elapsed.as_secs_f64() * 1000.0 / 100.0;
-    println!(
-        "100 iterations: {:?} ({:.2}ms/iter)",
-        elapsed, ms_per_iter
-    );
+    println!("100 iterations: {:?} ({:.2}ms/iter)", elapsed, ms_per_iter);
 
     if domain_bits < 25 {
         let scale = (1usize << 25) as f64 / num_pages as f64;
@@ -262,10 +262,14 @@ fn run_chunk_size_sweep(k0: &morphogen_dpf::page::PageDpfKey, num_pages: usize) 
     let storage = ContiguousPages::new(num_pages);
     let pages = storage.as_page_refs();
 
-    let chunk_sizes = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+    let chunk_sizes = [
+        256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
+    ];
 
-    println!("\n{:>8} {:>10} {:>10} {:>10} {:>10}", 
-             "Chunk", "DPF(ms)", "XOR(ms)", "Total(ms)", "DPF%");
+    println!(
+        "\n{:>8} {:>10} {:>10} {:>10} {:>10}",
+        "Chunk", "DPF(ms)", "XOR(ms)", "Total(ms)", "DPF%"
+    );
     println!("{:-<52}", "");
 
     for &chunk_size in &chunk_sizes {

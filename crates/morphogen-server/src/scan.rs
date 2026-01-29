@@ -7,7 +7,9 @@ pub const DEFAULT_MAX_RETRIES: usize = 1000;
 #[derive(Debug, PartialEq, Eq)]
 pub enum ScanError {
     LockPoisoned,
-    TooManyRetries { attempts: usize },
+    TooManyRetries {
+        attempts: usize,
+    },
     MatrixNotAligned {
         total_bytes: usize,
         unit_size: usize,
@@ -267,9 +269,8 @@ pub fn try_scan_pages_chunked(
         }
     }
 
-    let results: [Vec<u8>; 3] = std::array::from_fn(|i| {
-        keys[i].eval_and_accumulate_chunked(&page_refs, dpf_chunk_size)
-    });
+    let results: [Vec<u8>; 3] =
+        std::array::from_fn(|i| keys[i].eval_and_accumulate_chunked(&page_refs, dpf_chunk_size));
 
     Ok(results)
 }
@@ -345,7 +346,7 @@ pub fn scan_delta_for_gpu(
     page_size_bytes: usize,
 ) -> Result<[Vec<u8>; 3], ScanError> {
     let entries = delta.snapshot().map_err(|_| ScanError::LockPoisoned)?;
-    
+
     let mut results = [
         vec![0u8; page_size_bytes],
         vec![0u8; page_size_bytes],
@@ -365,7 +366,7 @@ pub fn scan_delta_for_gpu(
     for entry in entries {
         let page_idx = entry.row_idx / rows_per_page;
         let row_offset_in_page = (entry.row_idx % rows_per_page) * row_size;
-        
+
         // Ensure we don't write out of bounds
         if row_offset_in_page + row_size > page_size_bytes {
             continue; // Should not happen if invariants hold
@@ -1562,8 +1563,10 @@ mod concurrency_tests {
         let keys_server0 = [k0_0, k1_0, k2_0];
         let keys_server1 = [k0_1, k1_1, k2_1];
 
-        let results0 = scan_pages_chunked(global.load().matrix.as_ref(), &keys_server0, page_size, 64);
-        let results1 = scan_pages_chunked(global.load().matrix.as_ref(), &keys_server1, page_size, 64);
+        let results0 =
+            scan_pages_chunked(global.load().matrix.as_ref(), &keys_server0, page_size, 64);
+        let results1 =
+            scan_pages_chunked(global.load().matrix.as_ref(), &keys_server1, page_size, 64);
 
         let mut page_result = vec![0u8; page_size];
         xor_pages(&results0[0], &results1[0], &mut page_result);

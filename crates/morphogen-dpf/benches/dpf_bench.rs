@@ -210,7 +210,10 @@ fn bench_chunked_vs_full_memory(c: &mut Criterion) {
     println!("Chunked (4096) DPF buffer:{} KB", 4096 * 16 / 1024);
     println!("\n=== Projected Memory at 25-bit domain (27M pages) ===");
     let pages_27m: usize = 1 << 25;
-    println!("Full eval DPF buffer:     {} MB", pages_27m * 16 / 1024 / 1024);
+    println!(
+        "Full eval DPF buffer:     {} MB",
+        pages_27m * 16 / 1024 / 1024
+    );
     println!("Chunked (4096) DPF buffer:{} KB", 4096 * 16 / 1024);
     println!("Memory reduction:         {}x", pages_27m / 4096);
 }

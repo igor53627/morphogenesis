@@ -65,9 +65,10 @@ fn bench_fused_3dpf(c: &mut Criterion) {
         let data_size = num_pages * PAGE_SIZE_BYTES;
         group.throughput(Throughput::Bytes(data_size as u64));
 
-        group.bench_function(format!("{}bit_{}MB", bits, data_size / (1024 * 1024)), |b| {
-            b.iter(|| eval_fused_3dpf_cpu([&k0_0, &k1_0, &k2_0], black_box(&pages)))
-        });
+        group.bench_function(
+            format!("{}bit_{}MB", bits, data_size / (1024 * 1024)),
+            |b| b.iter(|| eval_fused_3dpf_cpu([&k0_0, &k1_0, &k2_0], black_box(&pages))),
+        );
     }
 
     group.finish();

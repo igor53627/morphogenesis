@@ -12,12 +12,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rayon = "1.10"
 sha3 = "0.10"
+alloy-primitives = "1.5"
 clap = { version = "4.4", features = ["derive"] }
 eyre = "0.6"
 futures-util = "0.3"
 reth-db = { git = "https://github.com/paradigmxyz/reth", optional = true }
-alloy-primitives = { version = "1.5", optional = true }
+reth-trie = { git = "https://github.com/paradigmxyz/reth", optional = true }
+alloy-rlp = { version = "0.3", optional = true }
 
 [features]
 default = []
-reth = ["dep:reth-db", "dep:alloy-primitives"]
+reth = ["dep:reth-db", "dep:reth-trie", "dep:alloy-rlp"]

@@ -75,7 +75,10 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         loop {
             match state_clone.pir_client.update_metadata().await {
-                Ok(m) => info!("Updated PIR metadata: epoch={}, block={}", m.epoch_id, m.block_number),
+                Ok(m) => info!(
+                    "Updated PIR metadata: epoch={}, block={}",
+                    m.epoch_id, m.block_number
+                ),
                 Err(e) => warn!("Failed to update PIR metadata: {}", e),
             }
             sleep(Duration::from_secs(state_clone.args.refresh_interval)).await;
@@ -89,16 +92,16 @@ async fn main() -> Result<()> {
         let (address_str, _block): (String, Value) = params.parse()?;
         let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
         let mut address = [0u8; 20];
-        hex::decode_to_slice(address_hex, &mut address)
-            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>))?;
+        hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
+        })?;
 
         info!("Private eth_getBalance for 0x{}", address_hex);
-        
-        let account = state.pir_client.query_account(address).await
-            .map_err(|e| {
-                error!("PIR query failed: {}", e);
-                ErrorObjectOwned::owned(-32000, "Internal PIR error".to_string(), None::<()>)
-            })?;
+
+        let account = state.pir_client.query_account(address).await.map_err(|e| {
+            error!("PIR query failed: {}", e);
+            ErrorObjectOwned::owned(-32000, "Internal PIR error".to_string(), None::<()>)
+        })?;
 
         Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", account.balance)))
     })?;
@@ -108,16 +111,16 @@ async fn main() -> Result<()> {
         let (address_str, _block): (String, Value) = params.parse()?;
         let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
         let mut address = [0u8; 20];
-        hex::decode_to_slice(address_hex, &mut address)
-            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>))?;
+        hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
+        })?;
 
         info!("Private eth_getTransactionCount for 0x{}", address_hex);
-        
-        let account = state.pir_client.query_account(address).await
-            .map_err(|e| {
-                error!("PIR query failed: {}", e);
-                ErrorObjectOwned::owned(-32000, "Internal PIR error".to_string(), None::<()>)
-            })?;
+
+        let account = state.pir_client.query_account(address).await.map_err(|e| {
+            error!("PIR query failed: {}", e);
+            ErrorObjectOwned::owned(-32000, "Internal PIR error".to_string(), None::<()>)
+        })?;
 
         Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", account.nonce)))
     })?;
@@ -127,17 +130,17 @@ async fn main() -> Result<()> {
         let (address_str, _block): (String, Value) = params.parse()?;
         let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
         let mut address = [0u8; 20];
-        hex::decode_to_slice(address_hex, &mut address)
-            .map_err(|e| ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>))?;
+        hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
+        })?;
 
         info!("Private eth_getCode for 0x{}", address_hex);
-        
+
         // 1. PIR Query for Account Data
-        let account = state.pir_client.query_account(address).await
-            .map_err(|e| {
-                error!("PIR query failed: {}", e);
-                ErrorObjectOwned::owned(-32000, "Internal PIR error".to_string(), None::<()>)
-            })?;
+        let account = state.pir_client.query_account(address).await.map_err(|e| {
+            error!("PIR query failed: {}", e);
+            ErrorObjectOwned::owned(-32000, "Internal PIR error".to_string(), None::<()>)
+        })?;
 
         // 2. Resolve CodeID -> CodeHash -> Bytecode
         let bytecode = if let Some(code_id) = account.code_id {
@@ -146,12 +149,20 @@ async fn main() -> Result<()> {
                     Ok(code) => code,
                     Err(e) => {
                         error!("CAS fetch failed for code_id {}: {}", code_id, e);
-                        return Err(ErrorObjectOwned::owned(-32000, "Failed to fetch bytecode", None::<()>));
+                        return Err(ErrorObjectOwned::owned(
+                            -32000,
+                            "Failed to fetch bytecode",
+                            None::<()>,
+                        ));
                     }
                 },
                 Err(e) => {
                     error!("Code resolution failed for code_id {}: {}", code_id, e);
-                    return Err(ErrorObjectOwned::owned(-32000, "Failed to resolve code hash", None::<()>));
+                    return Err(ErrorObjectOwned::owned(
+                        -32000,
+                        "Failed to resolve code hash",
+                        None::<()>,
+                    ));
                 }
             }
         } else {
@@ -187,7 +198,13 @@ async fn main() -> Result<()> {
         module.register_async_method(method, move |params, state, _| {
             let m = method_name.clone();
             async move {
-                proxy_to_upstream(&state.args.upstream, &state.http_client, &m, params.parse()?).await
+                proxy_to_upstream(
+                    &state.args.upstream,
+                    &state.http_client,
+                    &m,
+                    params.parse()?,
+                )
+                .await
             }
         })?;
     }
@@ -208,7 +225,7 @@ async fn proxy_to_upstream(
     params: Value,
 ) -> Result<Value, ErrorObjectOwned> {
     info!("Proxying {} to upstream", method);
-    
+
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -216,13 +233,15 @@ async fn proxy_to_upstream(
         "params": params
     });
 
-    let response = client.post(url)
+    let response = client
+        .post(url)
         .json(&request)
         .send()
         .await
         .map_err(|e| ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>))?;
 
-    let json: Value = response.json()
+    let json: Value = response
+        .json()
         .await
         .map_err(|e| ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>))?;
 
@@ -230,8 +249,12 @@ async fn proxy_to_upstream(
         warn!("Upstream error for {}: {:?}", method, error);
         return Err(ErrorObjectOwned::owned(
             error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32,
-            error.get("message").and_then(|m| m.as_str()).unwrap_or("Unknown error").to_string(),
-            error.get("data").cloned()
+            error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown error")
+                .to_string(),
+            error.get("data").cloned(),
         ));
     }
 

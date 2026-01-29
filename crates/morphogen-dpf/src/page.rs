@@ -501,7 +501,6 @@ fn xor_page_masked(response: &mut [u8], page_data: &[u8], mask: u8) {
 
 #[cfg(feature = "fss")]
 impl PageDpfKey {
-
     /// Instrumented version of eval_and_accumulate_chunked that returns timing breakdown.
     ///
     /// Use this to measure bottleneck split between DPF evaluation and XOR accumulation.
@@ -678,7 +677,10 @@ impl PageDpfKey {
             });
         }
 
-        let params = PageDpfParams { prg_keys, domain_bits };
+        let params = PageDpfParams {
+            prg_keys,
+            domain_bits,
+        };
 
         Ok(Self {
             share: Share {
@@ -1202,7 +1204,10 @@ mod fss_page_tests {
         let timing = k0.eval_and_accumulate_chunked_timed(&page_refs, 4096);
 
         assert!(timing.dpf_eval_ns > 0, "DPF eval time should be > 0");
-        assert!(timing.xor_accumulate_ns > 0, "XOR accumulate time should be > 0");
+        assert!(
+            timing.xor_accumulate_ns > 0,
+            "XOR accumulate time should be > 0"
+        );
         assert_eq!(timing.response.len(), PAGE_SIZE_BYTES);
 
         let total = timing.dpf_eval_ns + timing.xor_accumulate_ns;
@@ -1235,7 +1240,10 @@ mod fss_page_tests {
         let timing = k0.eval_and_accumulate_chunked_timed(&page_refs, 4096);
 
         assert!(timing.dpf_eval_ns > 0, "DPF eval time should be > 0");
-        assert!(timing.xor_accumulate_ns > 0, "XOR accumulate time should be > 0");
+        assert!(
+            timing.xor_accumulate_ns > 0,
+            "XOR accumulate time should be > 0"
+        );
         assert_eq!(timing.response.len(), PAGE_SIZE_BYTES);
 
         let total = timing.dpf_eval_ns + timing.xor_accumulate_ns;

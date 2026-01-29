@@ -22,11 +22,7 @@ fn main() {
     println!("Data size: {} MB", data_size_mb);
 
     // Generate 3 key pairs for Cuckoo hashing
-    let targets = [
-        num_pages / 4,
-        num_pages / 2,
-        3 * num_pages / 4,
-    ];
+    let targets = [num_pages / 4, num_pages / 2, 3 * num_pages / 4];
     println!("Targets: {:?}", targets);
 
     let (k0_0, k0_1) = generate_chacha_dpf_keys(&params, targets[0]).unwrap();
@@ -120,15 +116,20 @@ fn main() {
     let throughput_gbs = throughput_mbs / 1024.0;
 
     println!("Average latency: {:.2} ms", ms_per_iter);
-    println!("Throughput: {:.1} MB/s ({:.2} GB/s)", throughput_mbs, throughput_gbs);
+    println!(
+        "Throughput: {:.1} MB/s ({:.2} GB/s)",
+        throughput_mbs, throughput_gbs
+    );
 
     // Extrapolate to 25-bit (mainnet)
     if domain_bits < 25 {
         let scale = (1usize << 25) as f64 / num_pages as f64;
         let projected_ms = ms_per_iter * scale;
+        println!("\nExtrapolated 25-bit (27M pages, 108GB):");
         println!(
-            "\nExtrapolated 25-bit (27M pages, 108GB):"
+            "  Projected latency: {:.0} ms ({:.1} s)",
+            projected_ms,
+            projected_ms / 1000.0
         );
-        println!("  Projected latency: {:.0} ms ({:.1} s)", projected_ms, projected_ms / 1000.0);
     }
 }

@@ -1,5 +1,5 @@
 use clap::Parser;
-use reth_adapter::{AccountSource, build_matrix, RowScheme};
+use reth_adapter::{build_matrix, AccountSource, RowScheme};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -12,8 +12,8 @@ struct Args {
     #[arg(short, long, default_value = "matrix.bin")]
     output: PathBuf,
 
-    /// Row scheme (compact=32B, full=64B)
-    #[arg(short, long, value_enum, default_value_t = RowScheme::Compact)]
+    /// Row scheme (compact=32B, full=64B, optimized48=48B)
+    #[arg(short, long, value_enum, default_value_t = RowScheme::Optimized48)]
     scheme: RowScheme,
 
     /// Number of rows in Cuckoo table
@@ -39,6 +39,10 @@ struct Args {
     /// Extract bytecode using dictionary (pass path to .dict file)
     #[arg(long)]
     extract_code: Option<PathBuf>,
+
+    /// Estimate Merkle Proof sizes (MPT) by sampling
+    #[arg(long)]
+    estimate_proofs: bool,
 }
 
 fn main() {
@@ -46,6 +50,20 @@ fn main() {
 
     println!("=== Morphogenesis Reth Extraction Tool ===");
     println!("DB Path: {:?}", args.db);
+
+    if args.estimate_proofs {
+        println!("Mode: ESTIMATE PROOFS");
+        #[cfg(feature = "reth")]
+        {
+            let source = reth_adapter::RethSource::new(args.db.to_str().unwrap());
+            source.estimate_proof_sizes(100); // Sample 100 accounts
+        }
+        #[cfg(not(feature = "reth"))]
+        {
+            println!("Error: Compile with --features reth for proof estimation.");
+        }
+        return;
+    }
 
     if let Some(dict_path) = args.extract_code {
         println!("Mode: EXTRACT CODE");
@@ -114,21 +132,25 @@ fn main() {
     #[cfg(feature = "reth")]
     {
         let (matrix, manifest, indexer) = reth_adapter::dump_reth_to_matrix(
-            args.db.to_str().unwrap(), 
-            args.rows, 
-            args.scheme, 
-            args.trustless
+            args.db.to_str().unwrap(),
+            args.rows,
+            args.scheme,
+            args.trustless,
         );
         println!("Saving matrix to {:?}...", args.output);
         matrix.write_to_file(&args.output).unwrap();
-        
+
         let manifest_path = args.output.with_extension("json");
         let file = std::fs::File::create(manifest_path).unwrap();
         serde_json::to_writer_pretty(file, &manifest).unwrap();
-        
+
         if let RowScheme::Compact = args.scheme {
             let dict_path = args.output.with_extension("dict");
-            println!("Saving code dictionary to {:?} ({} entries)...", dict_path, indexer.list.len());
+            println!(
+                "Saving code dictionary to {:?} ({} entries)...",
+                dict_path,
+                indexer.list.len()
+            );
             // Serialize as flat list of 32B hashes
             let mut dict_file = std::fs::File::create(dict_path).unwrap();
             use std::io::Write;
@@ -136,7 +158,7 @@ fn main() {
                 dict_file.write_all(&hash).unwrap();
             }
         }
-        
+
         println!("Extraction complete.");
     }
 
@@ -145,10 +167,14 @@ fn main() {
         println!("Error: This binary must be compiled with --features reth to use RethSource.");
         println!("Running with SyntheticSource for demo...");
         let mut source = reth_adapter::SyntheticSource::new((args.rows as f64 * 0.8) as usize);
-        let (_matrix, manifest, _indexer) = build_matrix(&mut source, args.rows, args.scheme, args.trustless);
-        
+        let (_matrix, manifest, _indexer) =
+            build_matrix(&mut source, args.rows, args.scheme, args.trustless);
+
         let manifest_path = args.output.with_extension("json");
         println!("Writing manifest to {:?}", manifest_path);
-        println!("Manifest: {}", serde_json::to_string_pretty(&manifest).unwrap());
+        println!(
+            "Manifest: {}",
+            serde_json::to_string_pretty(&manifest).unwrap()
+        );
     }
 }

@@ -6,9 +6,9 @@
 #[cfg(feature = "cuda")]
 use cudarc::driver::{CudaDevice, CudaSlice};
 #[cfg(feature = "cuda")]
-use std::sync::Arc;
-#[cfg(feature = "cuda")]
 use morphogen_storage::ChunkedMatrix;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 /// Page size in bytes (4KB).
 pub const PAGE_SIZE_BYTES: usize = 4096;
@@ -24,7 +24,10 @@ pub struct GpuPageMatrix {
 #[cfg(feature = "cuda")]
 impl GpuPageMatrix {
     /// Create a new GpuPageMatrix from a CPU buffer.
-    pub fn new(device: Arc<CudaDevice>, cpu_data: &[u8]) -> Result<Self, cudarc::driver::DriverError> {
+    pub fn new(
+        device: Arc<CudaDevice>,
+        cpu_data: &[u8],
+    ) -> Result<Self, cudarc::driver::DriverError> {
         if cpu_data.len() % PAGE_SIZE_BYTES != 0 {
             panic!("cpu_data length must be multiple of PAGE_SIZE_BYTES");
         }
@@ -40,7 +43,10 @@ impl GpuPageMatrix {
     }
 
     /// Create a new GpuPageMatrix from a ChunkedMatrix (CPU).
-    pub fn from_chunked_matrix(device: Arc<CudaDevice>, matrix: &ChunkedMatrix) -> Result<Self, cudarc::driver::DriverError> {
+    pub fn from_chunked_matrix(
+        device: Arc<CudaDevice>,
+        matrix: &ChunkedMatrix,
+    ) -> Result<Self, cudarc::driver::DriverError> {
         let total_size = matrix.total_size_bytes();
         // Pad total size if not aligned
         let padding = if total_size % PAGE_SIZE_BYTES != 0 {
@@ -50,14 +56,14 @@ impl GpuPageMatrix {
         };
         let padded_total_size = total_size + padding;
         let num_pages = padded_total_size / PAGE_SIZE_BYTES;
-        
+
         let mut gpu_matrix = Self::alloc_empty(device.clone(), num_pages)?;
-        
+
         let mut current_offset = 0;
         for i in 0..matrix.num_chunks() {
             let chunk = matrix.chunk(i);
             let size = matrix.chunk_size(i);
-            
+
             // Check if chunk size is multiple of PAGE_SIZE_BYTES
             // If it's the last chunk, it might not be multiple.
             if size % PAGE_SIZE_BYTES != 0 {
@@ -65,22 +71,25 @@ impl GpuPageMatrix {
                 let mut padded_chunk = chunk.as_slice().to_vec();
                 let chunk_padding = PAGE_SIZE_BYTES - (size % PAGE_SIZE_BYTES);
                 padded_chunk.extend(std::iter::repeat(0).take(chunk_padding));
-                
+
                 let start_page = current_offset / PAGE_SIZE_BYTES;
                 gpu_matrix.update_pages(start_page, &padded_chunk)?;
             } else {
                 let start_page = current_offset / PAGE_SIZE_BYTES;
                 gpu_matrix.update_pages(start_page, chunk.as_slice())?;
             }
-            
+
             current_offset += size;
         }
-        
+
         Ok(gpu_matrix)
     }
 
     /// Allocate an empty (zeroed) GpuPageMatrix on the device.
-    pub fn alloc_empty(device: Arc<CudaDevice>, num_pages: usize) -> Result<Self, cudarc::driver::DriverError> {
+    pub fn alloc_empty(
+        device: Arc<CudaDevice>,
+        num_pages: usize,
+    ) -> Result<Self, cudarc::driver::DriverError> {
         let size_bytes = num_pages * PAGE_SIZE_BYTES;
         let data = device.alloc_zeros::<u8>(size_bytes)?;
 
@@ -92,7 +101,11 @@ impl GpuPageMatrix {
     }
 
     /// Update a range of pages from the CPU.
-    pub fn update_pages(&mut self, start_page: usize, cpu_pages: &[u8]) -> Result<(), cudarc::driver::DriverError> {
+    pub fn update_pages(
+        &mut self,
+        start_page: usize,
+        cpu_pages: &[u8],
+    ) -> Result<(), cudarc::driver::DriverError> {
         if cpu_pages.len() % PAGE_SIZE_BYTES != 0 {
             panic!("cpu_pages length must be multiple of PAGE_SIZE_BYTES");
         }

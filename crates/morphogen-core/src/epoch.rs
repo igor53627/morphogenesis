@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 
-use morphogen_storage::ChunkedMatrix;
 use crate::DeltaBuffer;
+use morphogen_storage::ChunkedMatrix;
 
 pub struct EpochSnapshot {
     pub epoch_id: u64,

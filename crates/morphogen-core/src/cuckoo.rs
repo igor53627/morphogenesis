@@ -161,9 +161,10 @@ impl<V: Clone> CuckooTable<V> {
     }
 
     pub fn iter_enumerated(&self) -> impl Iterator<Item = (usize, &Vec<u8>, &V)> {
-        self.buckets.iter().enumerate().filter_map(|(i, b)| {
-            b.as_ref().map(|(k, v)| (i, k, v))
-        })
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| b.as_ref().map(|(k, v)| (i, k, v)))
     }
 }
 
