@@ -699,5 +699,51 @@ mod tests {
 
         let data = StorageData::from_bytes(&payload).unwrap();
         assert_eq!(data.value[31], 0x42);
+        assert!(data.tag.is_none()); // Legacy payload has no tag
+    }
+
+    #[test]
+    fn storage_data_extracts_tag_from_optimized48() {
+        let mut payload = vec![0u8; 48];
+        // Value
+        payload[31] = 0xFF;
+        // Tag at bytes [32..40]
+        for i in 0..8 {
+            payload[32 + i] = (0xAA + i) as u8;
+        }
+
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert_eq!(data.value[31], 0xFF);
+        assert!(data.tag.is_some());
+
+        let tag = data.tag.unwrap();
+        for i in 0..8 {
+            assert_eq!(tag[i], (0xAA + i) as u8);
+        }
+    }
+
+    #[test]
+    fn storage_data_tag_none_for_legacy_payload() {
+        let payload = vec![0xFFu8; 32]; // 32-byte legacy
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert!(data.tag.is_none());
+    }
+
+    #[test]
+    fn storage_data_tag_extraction_correctness() {
+        use alloy_primitives::keccak256;
+
+        // Simulate server-side tag computation
+        let storage_key = b"test_address_20b_slot_32bytes_total_52b_key_here";
+        let tag_hash = keccak256(storage_key);
+        let expected_tag: [u8; 8] = tag_hash[0..8].try_into().unwrap();
+
+        // Build payload with that tag
+        let mut payload = vec![0u8; 48];
+        payload[31] = 0x42; // Some value
+        payload[32..40].copy_from_slice(&expected_tag);
+
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert_eq!(data.tag.unwrap(), expected_tag);
     }
 }

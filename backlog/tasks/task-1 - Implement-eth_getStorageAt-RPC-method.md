@@ -4,11 +4,11 @@ title: Implement eth_getStorageAt RPC method
 status: Done
 assignee: []
 created_date: '2026-02-03 14:29'
-updated_date: '2026-02-03 15:31'
+updated_date: '2026-02-03 16:29'
 labels: []
 dependencies: []
 references:
-  - 170c6c8 - Implement private eth_getStorageAt via PIR
+  - cd18dbc - Add tag verification to storage queries
 priority: high
 ---
 

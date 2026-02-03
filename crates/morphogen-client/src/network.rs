@@ -215,11 +215,12 @@ impl PirClient {
             .map_err(|e| anyhow!("Aggregation error: {:?}", e))?;
 
         // Compute expected tag: Keccak256(storage_key)[0..8]
+        // This matches the server-side tag computation in reth-adapter
         use alloy_primitives::keccak256;
         let tag_hash = keccak256(&storage_key);
         let expected_tag: [u8; 8] = tag_hash[0..8].try_into().unwrap();
 
-        // Find payload with matching tag
+        // Find payload with matching tag (Optimized48 scheme)
         for payload in aggregated.payloads.iter() {
             if let Some(data) = StorageData::from_bytes(payload) {
                 if let Some(tag) = data.tag {
@@ -230,7 +231,17 @@ impl PirClient {
             }
         }
 
-        // Return zero value if not found (no matching tag)
+        // Fallback: Check for non-zero legacy payloads (32-byte, no tag)
+        // This handles backward compatibility with older server deployments
+        for payload in aggregated.payloads.iter() {
+            if let Some(data) = StorageData::from_bytes(payload) {
+                if data.tag.is_none() && data.value != [0u8; 32] {
+                    return Ok(data);
+                }
+            }
+        }
+
+        // Return zero value if not found
         Ok(StorageData {
             value: [0u8; 32],
             tag: None,

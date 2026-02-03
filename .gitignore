@@ -4,3 +4,4 @@ fixtures/*.bin
 .env*
 docs/paper/*.log
 modal_*.py
+target/
