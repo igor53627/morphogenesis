@@ -3127,6 +3127,7 @@ dependencies = [
 name = "morphogen-client"
 version = "0.1.0"
 dependencies = [
+ "alloy-primitives",
  "anyhow",
  "binius_field",
  "fss-rs",

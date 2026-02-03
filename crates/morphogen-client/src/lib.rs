@@ -93,6 +93,7 @@ pub struct AccountData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageData {
     pub value: [u8; 32],
+    pub tag: Option<[u8; 8]>,
 }
 
 impl AccountData {
@@ -134,7 +135,12 @@ impl StorageData {
         // or just [Value (32) | ...] for legacy schemes
         if bytes.len() >= 32 {
             let value: [u8; 32] = bytes[0..32].try_into().ok()?;
-            Some(Self { value })
+            let tag = if bytes.len() >= 40 {
+                Some(bytes[32..40].try_into().ok()?)
+            } else {
+                None
+            };
+            Some(Self { value, tag })
         } else {
             None
         }

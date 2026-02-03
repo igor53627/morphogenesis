@@ -1,11 +1,14 @@
 ---
 id: TASK-1
 title: Implement eth_getStorageAt RPC method
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-03 14:29'
+updated_date: '2026-02-03 15:31'
 labels: []
 dependencies: []
+references:
+  - 170c6c8 - Implement private eth_getStorageAt via PIR
 priority: high
 ---
 
