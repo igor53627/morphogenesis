@@ -52,6 +52,42 @@ struct AdapterState {
     code_resolver: CodeResolver,
 }
 
+const PASSTHROUGH_METHODS: &[&str] = &[
+    "eth_blockNumber",
+    "eth_chainId",
+    "eth_gasPrice",
+    "eth_estimateGas",
+    "eth_sendRawTransaction",
+    "eth_call", // Still passthrough for now until Phase 2
+    "net_version",
+    "web3_clientVersion",
+    // Wallet Essentials (History & Status)
+    "eth_getTransactionByHash",
+    "eth_getTransactionReceipt",
+    "eth_getBlockByNumber",
+    "eth_getBlockByHash",
+    "eth_feeHistory",
+    "eth_maxPriorityFeePerGas",
+    // Warning: eth_getLogs leaks privacy to upstream
+    "eth_getLogs",
+    // Storage & State (passthrough for now - TODO: implement private eth_getStorageAt)
+    "eth_getStorageAt",
+    "eth_getProof",
+    // Account queries (read-only, safe to passthrough)
+    "eth_accounts",
+    // NOTE: eth_sign and eth_signTransaction are intentionally NOT included
+    // These should be handled client-side by wallets to avoid remote signing risks
+    // Filter APIs (for event monitoring)
+    // TODO: Implement sticky routing for filter IDs if using load-balanced upstreams
+    // Current implementation assumes single fixed upstream provider
+    "eth_newFilter",
+    "eth_newBlockFilter",
+    "eth_newPendingTransactionFilter",
+    "eth_uninstallFilter",
+    "eth_getFilterChanges",
+    "eth_getFilterLogs",
+];
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
@@ -173,44 +209,7 @@ async fn main() -> Result<()> {
     })?;
 
     // Register passthrough methods
-    let passthrough_methods = [
-        "eth_blockNumber",
-        "eth_chainId",
-        "eth_gasPrice",
-        "eth_estimateGas",
-        "eth_sendRawTransaction",
-        "eth_call", // Still passthrough for now until Phase 2
-        "net_version",
-        "web3_clientVersion",
-        // Wallet Essentials (History & Status)
-        "eth_getTransactionByHash",
-        "eth_getTransactionReceipt",
-        "eth_getBlockByNumber",
-        "eth_getBlockByHash",
-        "eth_feeHistory",
-        "eth_maxPriorityFeePerGas",
-        // Warning: eth_getLogs leaks privacy to upstream (shows interest in specific addresses/topics)
-        // We allow it for compatibility, but a future version should implement Private Log Retrieval.
-        "eth_getLogs",
-        // Storage & State (passthrough for now - TODO: implement private eth_getStorageAt)
-        "eth_getStorageAt",
-        "eth_getProof",
-        // Account queries (read-only, safe to passthrough)
-        "eth_accounts",
-        // NOTE: eth_sign and eth_signTransaction are intentionally NOT included
-        // These should be handled client-side by wallets to avoid remote signing risks
-        // Filter APIs (for event monitoring)
-        // TODO: Implement sticky routing for filter IDs if using load-balanced upstreams
-        // Current implementation assumes single fixed upstream provider
-        "eth_newFilter",
-        "eth_newBlockFilter",
-        "eth_newPendingTransactionFilter",
-        "eth_uninstallFilter",
-        "eth_getFilterChanges",
-        "eth_getFilterLogs",
-    ];
-
-    for method in passthrough_methods {
+    for method in PASSTHROUGH_METHODS {
         let method_name = method.to_string();
         module.register_async_method(method, move |params, state, _| {
             let m = method_name.clone();
@@ -280,47 +279,22 @@ async fn proxy_to_upstream(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::PASSTHROUGH_METHODS;
 
     #[test]
     fn test_passthrough_methods_include_storage_and_filter_apis() {
-        let passthrough_methods = [
-            "eth_blockNumber",
-            "eth_chainId",
-            "eth_gasPrice",
-            "eth_estimateGas",
-            "eth_sendRawTransaction",
-            "eth_call",
-            "net_version",
-            "web3_clientVersion",
-            "eth_getTransactionByHash",
-            "eth_getTransactionReceipt",
-            "eth_getBlockByNumber",
-            "eth_getBlockByHash",
-            "eth_feeHistory",
-            "eth_maxPriorityFeePerGas",
-            "eth_getLogs",
-            "eth_getStorageAt",
-            "eth_getProof",
-            "eth_accounts",
-            "eth_newFilter",
-            "eth_newBlockFilter",
-            "eth_newPendingTransactionFilter",
-            "eth_uninstallFilter",
-            "eth_getFilterChanges",
-            "eth_getFilterLogs",
-        ];
+        // Test against actual production allowlist (prevents regression)
 
         // Verify storage methods are included
-        assert!(passthrough_methods.contains(&"eth_getStorageAt"));
-        assert!(passthrough_methods.contains(&"eth_getProof"));
+        assert!(PASSTHROUGH_METHODS.contains(&"eth_getStorageAt"));
+        assert!(PASSTHROUGH_METHODS.contains(&"eth_getProof"));
 
         // Verify filter APIs are included
-        assert!(passthrough_methods.contains(&"eth_newFilter"));
-        assert!(passthrough_methods.contains(&"eth_getFilterChanges"));
+        assert!(PASSTHROUGH_METHODS.contains(&"eth_newFilter"));
+        assert!(PASSTHROUGH_METHODS.contains(&"eth_getFilterChanges"));
 
         // Verify signing methods are NOT included (security)
-        assert!(!passthrough_methods.contains(&"eth_sign"));
-        assert!(!passthrough_methods.contains(&"eth_signTransaction"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_sign"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_signTransaction"));
     }
 }
