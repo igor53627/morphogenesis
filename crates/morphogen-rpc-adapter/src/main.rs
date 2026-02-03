@@ -70,8 +70,7 @@ const PASSTHROUGH_METHODS: &[&str] = &[
     "eth_maxPriorityFeePerGas",
     // Warning: eth_getLogs leaks privacy to upstream
     "eth_getLogs",
-    // Storage & State (passthrough for now - TODO: implement private eth_getStorageAt)
-    "eth_getStorageAt",
+    // Storage & State (eth_getStorageAt now private via PIR)
     "eth_getProof",
     // Account queries (read-only, safe to passthrough)
     "eth_accounts",
@@ -208,6 +207,47 @@ async fn main() -> Result<()> {
         Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{}", hex::encode(bytecode))))
     })?;
 
+    // Register eth_getStorageAt (Private via PIR)
+    module.register_async_method("eth_getStorageAt", |params, state, _| async move {
+        let (address_str, slot_str, _block): (String, String, Value) = params.parse()?;
+        let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
+        let slot_hex = slot_str.strip_prefix("0x").unwrap_or(&slot_str);
+
+        let mut address = [0u8; 20];
+        hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
+        })?;
+
+        let mut slot = [0u8; 32];
+        // Pad slot to 32 bytes if shorter
+        let slot_bytes = hex::decode(slot_hex).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("Invalid slot: {}", e), None::<()>)
+        })?;
+        if slot_bytes.len() > 32 {
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                "Slot too long (max 32 bytes)".to_string(),
+                None::<()>,
+            ));
+        }
+        // Copy to the end of the array (big-endian padding)
+        let offset = 32 - slot_bytes.len();
+        slot[offset..].copy_from_slice(&slot_bytes);
+
+        info!("Private eth_getStorageAt for 0x{} slot 0x{}", address_hex, hex::encode(slot));
+
+        let storage = state
+            .pir_client
+            .query_storage(address, slot)
+            .await
+            .map_err(|e| {
+                error!("PIR storage query failed: {}", e);
+                ErrorObjectOwned::owned(-32000, "Internal PIR error".to_string(), None::<()>)
+            })?;
+
+        Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{}", hex::encode(storage.value))))
+    })?;
+
     // Register passthrough methods
     for method in PASSTHROUGH_METHODS {
         let method_name = method.to_string();
@@ -282,11 +322,13 @@ mod tests {
     use super::PASSTHROUGH_METHODS;
 
     #[test]
-    fn test_passthrough_methods_include_storage_and_filter_apis() {
+    fn test_passthrough_methods_include_filter_apis() {
         // Test against actual production allowlist (prevents regression)
 
-        // Verify storage methods are included
-        assert!(PASSTHROUGH_METHODS.contains(&"eth_getStorageAt"));
+        // Verify eth_getStorageAt is now private (NOT in passthrough)
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_getStorageAt"));
+
+        // Verify eth_getProof is still passthrough
         assert!(PASSTHROUGH_METHODS.contains(&"eth_getProof"));
 
         // Verify filter APIs are included

@@ -1,6 +1,6 @@
 use crate::{
     aggregate_responses, generate_query, AccountData, EpochMetadata, ServerResponse,
-    QUERIES_PER_REQUEST,
+    StorageData, QUERIES_PER_REQUEST,
 };
 use anyhow::{anyhow, Result};
 use rand::thread_rng;
@@ -140,6 +140,92 @@ impl PirClient {
             balance: 0,
             code_hash: None,
             code_id: None,
+        })
+    }
+
+    pub async fn query_storage(
+        &self,
+        address: [u8; 20],
+        slot: [u8; 32],
+    ) -> Result<StorageData> {
+        let metadata = self.get_metadata().await?;
+
+        // Construct 52-byte storage key: Address (20) + SlotKey (32)
+        let mut storage_key = [0u8; 52];
+        storage_key[0..20].copy_from_slice(&address);
+        storage_key[20..52].copy_from_slice(&slot);
+
+        let query_keys = {
+            let mut rng = thread_rng();
+            generate_query(&mut rng, &storage_key, &metadata)
+        };
+
+        // Send queries in parallel
+        let req_a = self
+            .http_client
+            .post(format!("{}/query", self.server_a_url))
+            .json(&serde_json::json!({
+                "keys": query_keys.keys_a.iter().map(|k| format!("0x{}", hex::encode(k.to_bytes()))).collect::<Vec<_>>()
+            }))
+            .send();
+
+        let req_b = self
+            .http_client
+            .post(format!("{}/query", self.server_b_url))
+            .json(&serde_json::json!({
+                "keys": query_keys.keys_b.iter().map(|k| format!("0x{}", hex::encode(k.to_bytes()))).collect::<Vec<_>>()
+            }))
+            .send();
+
+        let (resp_a, resp_b) = tokio::try_join!(req_a, req_b)?;
+
+        #[derive(Deserialize)]
+        struct QueryResponse {
+            #[allow(dead_code)]
+            epoch_id: u64,
+            payloads: Vec<String>,
+        }
+
+        let json_a: QueryResponse = resp_a.json().await?;
+        let json_b: QueryResponse = resp_b.json().await?;
+
+        let parse_payloads = |payloads: Vec<String>| -> Result<[Vec<u8>; QUERIES_PER_REQUEST]> {
+            if payloads.len() != QUERIES_PER_REQUEST {
+                return Err(anyhow!("Invalid payload count"));
+            }
+            let mut out: [Vec<u8>; QUERIES_PER_REQUEST] = Default::default();
+            for (i, p) in payloads.into_iter().enumerate() {
+                let hex_p = p.strip_prefix("0x").unwrap_or(&p);
+                out[i] = hex::decode(hex_p)?;
+            }
+            Ok(out)
+        };
+
+        let server_resp_a = ServerResponse {
+            epoch_id: json_a.epoch_id,
+            payloads: parse_payloads(json_a.payloads)?,
+        };
+
+        let server_resp_b = ServerResponse {
+            epoch_id: json_b.epoch_id,
+            payloads: parse_payloads(json_b.payloads)?,
+        };
+
+        let aggregated = aggregate_responses(&server_resp_a, &server_resp_b)
+            .map_err(|e| anyhow!("Aggregation error: {:?}", e))?;
+
+        // Look for non-zero storage value
+        for payload in aggregated.payloads.iter() {
+            if let Some(data) = StorageData::from_bytes(payload) {
+                if data.value != [0u8; 32] {
+                    return Ok(data);
+                }
+            }
+        }
+
+        // Return zero value if not found
+        Ok(StorageData {
+            value: [0u8; 32],
         })
     }
 }

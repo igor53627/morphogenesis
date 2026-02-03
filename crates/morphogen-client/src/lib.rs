@@ -90,6 +90,11 @@ pub struct AccountData {
     pub code_id: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageData {
+    pub value: [u8; 32],
+}
+
 impl AccountData {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         // Prioritize Compact Scheme (default for v4)
@@ -117,6 +122,19 @@ impl AccountData {
                 code_hash: Some(code_hash),
                 code_id: None,
             })
+        } else {
+            None
+        }
+    }
+}
+
+impl StorageData {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        // Storage payloads: [Value (32) | Tag (8) | Pad (8)] for Optimized48
+        // or just [Value (32) | ...] for legacy schemes
+        if bytes.len() >= 32 {
+            let value: [u8; 32] = bytes[0..32].try_into().ok()?;
+            Some(Self { value })
         } else {
             None
         }
@@ -625,5 +643,55 @@ mod tests {
         // 2. Fetch bytecode
         let fetched_bytecode = resolver.fetch_bytecode(resolved_hash).await.unwrap();
         assert_eq!(fetched_bytecode, weth_bytecode);
+    }
+
+    #[test]
+    fn storage_data_parses_value() {
+        let mut payload = vec![0u8; 48];
+        // Storage value = 0x123
+        payload[31] = 0x23;
+        payload[30] = 0x01;
+
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert_eq!(data.value[31], 0x23);
+        assert_eq!(data.value[30], 0x01);
+        for i in 0..30 {
+            assert_eq!(data.value[i], 0);
+        }
+    }
+
+    #[test]
+    fn storage_data_parses_zero_value() {
+        let payload = vec![0u8; 48];
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert_eq!(data.value, [0u8; 32]);
+    }
+
+    #[test]
+    fn storage_data_parses_full_value() {
+        let mut payload = vec![0xFFu8; 48];
+        for i in 0..32 {
+            payload[i] = i as u8;
+        }
+
+        let data = StorageData::from_bytes(&payload).unwrap();
+        for i in 0..32 {
+            assert_eq!(data.value[i], i as u8);
+        }
+    }
+
+    #[test]
+    fn storage_data_rejects_short_payload() {
+        let payload = vec![0u8; 16];
+        assert!(StorageData::from_bytes(&payload).is_none());
+    }
+
+    #[test]
+    fn storage_data_accepts_32_byte_payload() {
+        let mut payload = vec![0u8; 32];
+        payload[31] = 0x42;
+
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert_eq!(data.value[31], 0x42);
     }
 }
