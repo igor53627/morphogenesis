@@ -21,6 +21,12 @@ fn storage_cuckoo_key(address: [u8; 20], slot: [u8; 32]) -> [u8; 8] {
     out
 }
 
+/// Returns the 8-byte key used for storage query generation.
+/// This is the Cuckoo key derived as keccak(address || slot)[0..8].
+fn storage_query_key(address: [u8; 20], slot: [u8; 32]) -> [u8; 8] {
+    storage_cuckoo_key(address, slot)
+}
+
 #[derive(Deserialize)]
 struct RawEpochResponse {
     epoch_id: u64,
@@ -159,14 +165,16 @@ impl PirClient {
     pub async fn query_storage(&self, address: [u8; 20], slot: [u8; 32]) -> Result<StorageData> {
         let metadata = self.get_metadata().await?;
 
-        // Construct 52-byte storage key: Address (20) + SlotKey (32)
+        // Construct 52-byte storage key for tag verification: Address (20) + SlotKey (32)
         let mut storage_key = [0u8; 52];
         storage_key[0..20].copy_from_slice(&address);
         storage_key[20..52].copy_from_slice(&slot);
 
+        // Use 8-byte Cuckoo key for query generation
+        let cuckoo_key = storage_query_key(address, slot);
         let query_keys = {
             let mut rng = thread_rng();
-            generate_query(&mut rng, &storage_key, &metadata)
+            generate_query(&mut rng, &cuckoo_key, &metadata)
         };
 
         // Send queries in parallel
@@ -281,5 +289,23 @@ mod tests {
 
         let actual = storage_cuckoo_key(address, slot);
         assert_eq!(actual, expected_tag);
+    }
+
+    #[test]
+    fn storage_query_uses_8_byte_cuckoo_key() {
+        let address = [0x33u8; 20];
+        let slot = [0x44u8; 32];
+
+        // The key used for query generation must be 8 bytes (Cuckoo key)
+        let query_key = storage_query_key(address, slot);
+        assert_eq!(
+            query_key.len(),
+            8,
+            "storage query must use 8-byte Cuckoo key"
+        );
+
+        // Verify it matches the expected Cuckoo key derivation
+        let expected = storage_cuckoo_key(address, slot);
+        assert_eq!(query_key, expected);
     }
 }
