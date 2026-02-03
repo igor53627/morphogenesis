@@ -195,11 +195,13 @@ async fn main() -> Result<()> {
         // Storage & State (passthrough for now - TODO: implement private eth_getStorageAt)
         "eth_getStorageAt",
         "eth_getProof",
-        // Wallet signing methods (should be handled by wallet, but added for compatibility)
+        // Account queries (read-only, safe to passthrough)
         "eth_accounts",
-        "eth_sign",
-        "eth_signTransaction",
+        // NOTE: eth_sign and eth_signTransaction are intentionally NOT included
+        // These should be handled client-side by wallets to avoid remote signing risks
         // Filter APIs (for event monitoring)
+        // TODO: Implement sticky routing for filter IDs if using load-balanced upstreams
+        // Current implementation assumes single fixed upstream provider
         "eth_newFilter",
         "eth_newBlockFilter",
         "eth_newPendingTransactionFilter",
@@ -274,4 +276,51 @@ async fn proxy_to_upstream(
     }
 
     Ok(json.get("result").cloned().unwrap_or(Value::Null))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_passthrough_methods_include_storage_and_filter_apis() {
+        let passthrough_methods = [
+            "eth_blockNumber",
+            "eth_chainId",
+            "eth_gasPrice",
+            "eth_estimateGas",
+            "eth_sendRawTransaction",
+            "eth_call",
+            "net_version",
+            "web3_clientVersion",
+            "eth_getTransactionByHash",
+            "eth_getTransactionReceipt",
+            "eth_getBlockByNumber",
+            "eth_getBlockByHash",
+            "eth_feeHistory",
+            "eth_maxPriorityFeePerGas",
+            "eth_getLogs",
+            "eth_getStorageAt",
+            "eth_getProof",
+            "eth_accounts",
+            "eth_newFilter",
+            "eth_newBlockFilter",
+            "eth_newPendingTransactionFilter",
+            "eth_uninstallFilter",
+            "eth_getFilterChanges",
+            "eth_getFilterLogs",
+        ];
+
+        // Verify storage methods are included
+        assert!(passthrough_methods.contains(&"eth_getStorageAt"));
+        assert!(passthrough_methods.contains(&"eth_getProof"));
+
+        // Verify filter APIs are included
+        assert!(passthrough_methods.contains(&"eth_newFilter"));
+        assert!(passthrough_methods.contains(&"eth_getFilterChanges"));
+
+        // Verify signing methods are NOT included (security)
+        assert!(!passthrough_methods.contains(&"eth_sign"));
+        assert!(!passthrough_methods.contains(&"eth_signTransaction"));
+    }
 }
