@@ -232,16 +232,21 @@ impl PirClient {
         }
 
         // Fallback: Check for non-zero legacy payloads (32-byte, no tag)
-        // This handles backward compatibility with older server deployments
+        // Only accept if exactly ONE non-zero legacy payload exists to avoid ambiguity
+        let mut legacy_candidates: Vec<StorageData> = Vec::new();
         for payload in aggregated.payloads.iter() {
             if let Some(data) = StorageData::from_bytes(payload) {
                 if data.tag.is_none() && data.value != [0u8; 32] {
-                    return Ok(data);
+                    legacy_candidates.push(data);
                 }
             }
         }
 
-        // Return zero value if not found
+        if legacy_candidates.len() == 1 {
+            return Ok(legacy_candidates.into_iter().next().unwrap());
+        }
+
+        // Return zero value if not found or ambiguous
         Ok(StorageData {
             value: [0u8; 32],
             tag: None,

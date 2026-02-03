@@ -4,11 +4,11 @@ title: Implement eth_getStorageAt RPC method
 status: Done
 assignee: []
 created_date: '2026-02-03 14:29'
-updated_date: '2026-02-03 16:29'
+updated_date: '2026-02-03 16:36'
 labels: []
 dependencies: []
 references:
-  - cd18dbc - Add tag verification to storage queries
+  - 3112620 - Add tag tests and legacy fallback
 priority: high
 ---
 
