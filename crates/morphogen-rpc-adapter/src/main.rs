@@ -186,11 +186,26 @@ async fn main() -> Result<()> {
         "eth_getTransactionByHash",
         "eth_getTransactionReceipt",
         "eth_getBlockByNumber",
+        "eth_getBlockByHash",
         "eth_feeHistory",
         "eth_maxPriorityFeePerGas",
         // Warning: eth_getLogs leaks privacy to upstream (shows interest in specific addresses/topics)
         // We allow it for compatibility, but a future version should implement Private Log Retrieval.
         "eth_getLogs",
+        // Storage & State (passthrough for now - TODO: implement private eth_getStorageAt)
+        "eth_getStorageAt",
+        "eth_getProof",
+        // Wallet signing methods (should be handled by wallet, but added for compatibility)
+        "eth_accounts",
+        "eth_sign",
+        "eth_signTransaction",
+        // Filter APIs (for event monitoring)
+        "eth_newFilter",
+        "eth_newBlockFilter",
+        "eth_newPendingTransactionFilter",
+        "eth_uninstallFilter",
+        "eth_getFilterChanges",
+        "eth_getFilterLogs",
     ];
 
     for method in passthrough_methods {

@@ -1,9 +1,10 @@
 ---
 id: TASK-6
 title: Add missing standard RPC methods
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-02-03 14:38'
+updated_date: '2026-02-03 14:55'
 labels:
   - rpc
   - immediate
