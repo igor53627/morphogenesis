@@ -1,0 +1,44 @@
+# Mandatory Development Tooling
+
+This file confirms that morphogenesis requires:
+
+## Tools
+
+1. **backlog.md** (v1.35.4+)
+   - Task management with git integration
+   - MCP server at http://127.0.0.1:7373
+   - Tasks located in `backlog/`
+
+2. **roborev** (v0.23.1+)
+   - Continuous code review
+   - Auto-triggered via post-commit hook
+   - Claude skills integration enabled
+
+## Git Hook
+
+`.git/hooks/post-commit` runs:
+- zoekt-git-index (search indexing)
+- roborev enqueue (automatic review)
+- backlog task edit (auto-link commits to tasks)
+
+## Verification
+
+Run to verify setup:
+```bash
+backlog task list           # Should show tasks
+roborev list               # Should show review history
+cat .git/hooks/post-commit # Should contain all 3 integrations
+```
+
+## Usage
+
+Every commit:
+1. Include "Addresses TASK-X" in commit message
+2. Hook auto-links commit to task
+3. Hook triggers roborev review
+4. Review findings appear in `roborev list`
+5. Address findings with `roborev address JOB_ID`
+
+## Created
+
+2026-02-03 - Initial mandatory tooling setup
