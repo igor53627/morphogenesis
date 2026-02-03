@@ -1,12 +1,25 @@
 use crate::{
-    aggregate_responses, generate_query, AccountData, EpochMetadata, ServerResponse,
-    StorageData, QUERIES_PER_REQUEST,
+    aggregate_responses, generate_query, AccountData, EpochMetadata, ServerResponse, StorageData,
+    QUERIES_PER_REQUEST,
 };
 use anyhow::{anyhow, Result};
 use rand::thread_rng;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+fn storage_cuckoo_key(address: [u8; 20], slot: [u8; 32]) -> [u8; 8] {
+    use alloy_primitives::keccak256;
+
+    let mut storage_key = [0u8; 52];
+    storage_key[0..20].copy_from_slice(&address);
+    storage_key[20..52].copy_from_slice(&slot);
+
+    let tag = keccak256(&storage_key);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&tag[0..8]);
+    out
+}
 
 #[derive(Deserialize)]
 struct RawEpochResponse {
@@ -143,11 +156,7 @@ impl PirClient {
         })
     }
 
-    pub async fn query_storage(
-        &self,
-        address: [u8; 20],
-        slot: [u8; 32],
-    ) -> Result<StorageData> {
+    pub async fn query_storage(&self, address: [u8; 20], slot: [u8; 32]) -> Result<StorageData> {
         let metadata = self.get_metadata().await?;
 
         // Construct 52-byte storage key: Address (20) + SlotKey (32)
@@ -251,5 +260,26 @@ impl PirClient {
             value: [0u8; 32],
             tag: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_key_hashes_to_8_bytes() {
+        use alloy_primitives::keccak256;
+
+        let address = [0x11u8; 20];
+        let slot = [0x22u8; 32];
+        let mut storage_key = [0u8; 52];
+        storage_key[0..20].copy_from_slice(&address);
+        storage_key[20..52].copy_from_slice(&slot);
+        let expected = keccak256(&storage_key);
+        let expected_tag: [u8; 8] = expected[0..8].try_into().unwrap();
+
+        let actual = storage_cuckoo_key(address, slot);
+        assert_eq!(actual, expected_tag);
     }
 }
