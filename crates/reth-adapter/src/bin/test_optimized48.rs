@@ -1,5 +1,40 @@
 use alloy_primitives::keccak256;
-use reth_adapter::{serialize_account, Account, CodeIndexer, RowScheme};
+use reth_adapter::{
+    build_matrix, serialize_account, Account, AccountSource, CodeIndexer, RowScheme, UbtItem,
+};
+
+/// A test source that yields a single storage item.
+struct SingleStorageSource {
+    address: [u8; 20],
+    slot: [u8; 32],
+    value: [u8; 32],
+    consumed: bool,
+}
+
+impl SingleStorageSource {
+    fn new(address: [u8; 20], slot: [u8; 32], value: [u8; 32]) -> Self {
+        Self {
+            address,
+            slot,
+            value,
+            consumed: false,
+        }
+    }
+}
+
+impl AccountSource for SingleStorageSource {
+    fn next_item(&mut self) -> Option<UbtItem> {
+        if self.consumed {
+            return None;
+        }
+        self.consumed = true;
+        Some(UbtItem::Storage {
+            address: self.address,
+            key: self.slot,
+            value: self.value,
+        })
+    }
+}
 
 fn main() {
     println!("=== Testing Optimized48 Schema ===");
@@ -30,15 +65,9 @@ fn main() {
     let expected_tag = &keccak256(acc.address)[0..8];
     assert_eq!(&payload[28..36], expected_tag, "Account Tag mismatch");
 
-    println!("✅ Account serialization passed.");
+    println!("[OK] Account serialization passed.");
 
-    // 2. Storage Test
-    // We can't call build_matrix directly easily in a unit test without mocking source,
-    // but we can verify the logic we implemented matches the spec.
-    // The logic in build_matrix is:
-    // p[0..32] = value
-    // p[32..40] = Keccak(Key)[0..8]
-
+    // 2. Storage Test - Verify payload serialization logic
     let key = vec![0xBB; 52]; // Address(20) + Slot(32)
     let value = [0xDD; 32];
 
@@ -51,5 +80,41 @@ fn main() {
     assert_eq!(&p[0..32], &value, "Storage Value mismatch");
     assert_eq!(&p[32..40], &tag_hash[0..8], "Storage Tag mismatch");
 
-    println!("✅ Storage serialization logic verified.");
+    println!("[OK] Storage serialization logic verified.");
+
+    // 3. Storage Cuckoo Key Test - Verify 8-byte key indexing
+    // The Cuckoo table key for storage must be keccak(address || slot)[0..8]
+    let address = [0x11u8; 20];
+    let slot = [0x22u8; 32];
+    let value = [0x33u8; 32];
+
+    let mut source = SingleStorageSource::new(address, slot, value);
+    let (_matrix, manifest, _indexer) =
+        build_matrix(&mut source, 1024, RowScheme::Optimized48, false);
+
+    // Compute expected 8-byte Cuckoo key
+    let mut storage_key = [0u8; 52];
+    storage_key[0..20].copy_from_slice(&address);
+    storage_key[20..52].copy_from_slice(&slot);
+    let expected_hash = keccak256(&storage_key);
+    let expected_tag: [u8; 8] = expected_hash[0..8].try_into().unwrap();
+
+    // Verify that the item was inserted (manifest shows 1 item)
+    assert_eq!(
+        manifest.item_count, 1,
+        "Expected 1 storage item in manifest"
+    );
+
+    // Verify the key length used for indexing by checking the cuckoo_key_for_storage function
+    let short_key = reth_adapter::cuckoo_key_for_storage(&address, &slot);
+    assert_eq!(short_key.len(), 8, "Storage Cuckoo key must be 8 bytes");
+    assert_eq!(
+        short_key.as_slice(),
+        &expected_tag,
+        "Storage Cuckoo key must equal keccak(address || slot)[0..8]"
+    );
+
+    println!("[OK] Storage Cuckoo key is 8 bytes and matches keccak(address || slot)[0..8].");
+
+    println!("=== All tests passed ===");
 }

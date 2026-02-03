@@ -1,3 +1,4 @@
+use alloy_primitives::keccak256;
 use morphogen_core::cuckoo::CuckooTable;
 use morphogen_storage::{AlignedMatrix, ChunkedMatrix};
 use std::sync::Arc;
@@ -33,6 +34,16 @@ pub trait AccountSource {
         }
         count
     }
+}
+
+/// Compute the 8-byte Cuckoo key for a storage entry.
+/// Key = keccak256(address || slot)[0..8]
+pub fn cuckoo_key_for_storage(address: &[u8; 20], slot: &[u8; 32]) -> Vec<u8> {
+    let mut k = [0u8; 52];
+    k[0..20].copy_from_slice(address);
+    k[20..52].copy_from_slice(slot);
+    let tag_hash = keccak256(&k);
+    tag_hash[0..8].to_vec()
 }
 
 // ...
@@ -581,25 +592,20 @@ pub fn build_matrix(
                 }
                 UbtItem::Storage {
                     address,
-                    key,
+                    key: slot,
                     value,
                 } => {
-                    // Storage key: Address . SlotKey (52 bytes)
-                    let mut k = Vec::with_capacity(52);
-                    k.extend_from_slice(&address);
-                    k.extend_from_slice(&key);
+                    // Compute 8-byte Cuckoo key from keccak(address || slot)[0..8]
+                    let cuckoo_key = cuckoo_key_for_storage(&address, &slot);
 
                     let mut p = vec![0u8; row_size];
 
                     match scheme {
                         RowScheme::Optimized48 => {
                             // [Value (32) | Tag (8) | Pad (8)]
+                            // Tag = same as cuckoo_key (keccak(address || slot)[0..8])
                             p[0..32].copy_from_slice(&value);
-
-                            // Tag = Keccak(Key)[0..8]
-                            use alloy_primitives::keccak256;
-                            let tag_hash = keccak256(&k);
-                            p[32..40].copy_from_slice(&tag_hash[0..8]);
+                            p[32..40].copy_from_slice(&cuckoo_key);
                         }
                         _ => {
                             // Legacy logic (Compact/Full): just value
@@ -607,7 +613,7 @@ pub fn build_matrix(
                         }
                     }
 
-                    (k, p)
+                    (cuckoo_key, p)
                 }
             };
 
