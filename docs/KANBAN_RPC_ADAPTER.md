@@ -43,6 +43,81 @@
   - [x] Extract `code_id`.
   - [x] Resolve hash and fetch from CAS (verified with mock server).
 
+## 🎯 Priority Roadmap
+
+### Immediate (for basic wallet support)
+1. **Fix missing standard methods** (at least as passthroughs)
+   - `eth_getStorageAt`, `eth_getBlockByHash`, `eth_getProof`
+   - Wallet signing methods (`eth_accounts`, `eth_sign`, `eth_signTransaction`)
+   - Filter APIs (`eth_newFilter`, `eth_getFilterChanges`)
+2. **Integration testing with real wallets**
+   - MetaMask/Rabby connection tests
+   - End-to-end transaction flow verification
+3. **Error handling hardening**
+   - Server down scenarios
+   - Epoch mismatch recovery
+   - Timeout handling
+
+### High Priority (for meaningful privacy)
+
+**Context:** Current database (68GB) ALREADY contains 1.85B items: 350M accounts + 1.5B storage slots
+mixed in the same Cuckoo table. Storage slots are keyed as `Address.SlotKey` (52 bytes) vs accounts
+at `Address` (20 bytes). The data exists on the server - we just need client/adapter support to query it.
+
+1. **`eth_getStorageAt` implementation** - enables private ERC20 balance checks
+   - **Data status:** ✅ Storage slots already in database (1.5B slots in 68GB matrix)
+   - **What's needed:** RPC adapter method to query storage slots
+   - **Implementation:**
+     - Construct 52-byte key: `Address (20) . SlotKey (32)`
+     - SlotKey calculation: `keccak256(abi.encode(userAddress, mappingSlot))` for mappings
+     - PIR query using 52-byte key instead of 20-byte address
+     - May need client library updates to support variable-length keys
+   - **Use case:** Check USDT balance (`balanceOf[address]`), allowances, NFT ownership privately
+
+2. **Client library support for storage queries**
+   - Current: `generate_query()` takes 20-byte address
+   - Needed: Support 52-byte keys for storage slot queries
+   - Cuckoo addressing already supports arbitrary byte keys
+   - Should be straightforward extension
+
+3. **Local EVM + lazy storage loading** - enables private `eth_call`
+   - Embed local EVM (e.g., `revm`) in adapter
+   - Execute contract calls locally
+   - On `SLOAD(key)` miss: pause → PIR query storage slot → resume
+   - Iterate until execution completes
+   - **Use case:** Uniswap price quotes, DeFi position checks without leaking intent
+   - **Note:** Storage data already available, just need EVM integration
+
+### Medium Priority
+1. **Private log retrieval (`eth_getLogs`)**
+   - Current passthrough leaks address/topic interest to upstream
+   - Implement Bloom filter PIR or full log database scan
+   - Client-side filtering
+2. **Caching layer for repeated queries**
+   - Cache PIR results by (epoch_id, address)
+   - TTL based on epoch rotation interval
+   - Reduces query cost for frequently accessed accounts
+3. **Batch query support**
+   - Accept multiple addresses in single request
+   - Single database scan for all queries
+   - Reduce per-query overhead
+
+### Research/Future
+1. **WASM build for browser integration**
+   - Compile adapter to WebAssembly
+   - Integrate directly into browser wallet extensions
+   - Eliminate localhost proxy requirement
+2. **Access list optimization for `eth_call`**
+   - Use `eth_createAccessList` to prefetch storage slots
+   - Batch PIR queries before execution starts
+   - Minimize execution pauses
+3. **Storage slot prefetching/prediction**
+   - ML-based prediction of likely storage accesses
+   - Speculative PIR queries during execution
+   - Hide latency with parallelism
+
+---
+
 ## [TODO]
 
 
