@@ -1,6 +1,8 @@
 use clap::Parser;
 use morphogen_gpu_dpf::dpf::ChaChaParams;
+#[cfg(feature = "cuda")]
 use morphogen_gpu_dpf::kernel::GpuScanner;
+#[cfg(feature = "cuda")]
 use morphogen_gpu_dpf::storage::GpuPageMatrix;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -28,6 +30,7 @@ struct Args {
     limit_gb: Option<f64>,
 }
 
+#[cfg(feature = "cuda")]
 fn main() {
     let args = Args::parse();
     println!("=== Morphogenesis Real Data Benchmark ===");
@@ -74,7 +77,6 @@ fn main() {
     let scanner = GpuScanner::new(args.gpu).expect("Failed to init scanner");
 
     // Get device name/arch for logging
-    #[cfg(feature = "cuda")]
     {
         let name = scanner
             .device
@@ -122,7 +124,7 @@ fn main() {
     }
 
     let mut latencies = Vec::new();
-    for i in 0..args.iterations {
+    for _ in 0..args.iterations {
         let start = Instant::now();
         unsafe {
             scanner.scan_batch(&gpu_db, &queries).unwrap();
@@ -148,4 +150,11 @@ fn main() {
     println!("  Avg Latency:       {:.2} ms", avg_ms);
     println!("  Effective Bandwidth: {:.2} GB/s", effective_throughput);
     println!("  Queries Per Sec:   {:.2} QPS", qps);
+}
+
+#[cfg(not(feature = "cuda"))]
+fn main() {
+    eprintln!("Error: This benchmark requires the 'cuda' feature to be enabled.");
+    eprintln!("Please rebuild with: cargo build --release --features cuda");
+    std::process::exit(1);
 }

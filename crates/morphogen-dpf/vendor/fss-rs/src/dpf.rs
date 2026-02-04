@@ -278,7 +278,10 @@ where
     ) where
         G: Group<OUT_BLEN>,
     {
-        debug_assert!(range_start < range_end, "empty range passed to eval_range_layer");
+        debug_assert!(
+            range_start < range_end,
+            "empty range passed to eval_range_layer"
+        );
         debug_assert_eq!(
             ys.len(),
             range_end - range_start,
@@ -288,8 +291,7 @@ where
         let subtree_size = subtree_end - subtree_start;
         if subtree_size == 1 {
             debug_assert_eq!(ys.len(), 1, "leaf node but ys.len() != 1");
-            ys[0] =
-                (Into::<G>::into(s) + if t { k.cw_np1.clone() } else { G::zero() }).neg_if(b);
+            ys[0] = (Into::<G>::into(s) + if t { k.cw_np1.clone() } else { G::zero() }).neg_if(b);
             return;
         }
 
@@ -563,7 +565,8 @@ mod tests {
 
         for i in 0..64 {
             assert_eq!(
-                range_output[i], full_output[32 + i],
+                range_output[i],
+                full_output[32 + i],
                 "mismatch at index {} (domain idx {})",
                 i,
                 32 + i
@@ -597,13 +600,22 @@ mod tests {
         let mut first_chunk = vec![ByteGroup::zero(); 16];
         dpf.eval_range(false, &k0, 0, &mut first_chunk);
         for i in 0..16 {
-            assert_eq!(first_chunk[i], full_output[i], "first chunk mismatch at {}", i);
+            assert_eq!(
+                first_chunk[i], full_output[i],
+                "first chunk mismatch at {}",
+                i
+            );
         }
 
         let mut last_chunk = vec![ByteGroup::zero(); 16];
         dpf.eval_range(false, &k0, 240, &mut last_chunk);
         for i in 0..16 {
-            assert_eq!(last_chunk[i], full_output[240 + i], "last chunk mismatch at {}", i);
+            assert_eq!(
+                last_chunk[i],
+                full_output[240 + i],
+                "last chunk mismatch at {}",
+                i
+            );
         }
 
         let mut entire = vec![ByteGroup::zero(); 256];

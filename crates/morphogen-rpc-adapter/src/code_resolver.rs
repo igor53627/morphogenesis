@@ -23,14 +23,16 @@ impl CodeResolver {
     pub async fn resolve_code_hash(&self, code_id: u32) -> Result<[u8; 32]> {
         let offset = code_id as u64 * 32;
         let range_header = format!("bytes={}-{}", offset, offset + 31);
-        
+
         info!("Resolving CodeID {} via Range: {}", code_id, range_header);
 
-        let response = self.client.get(&self.dict_url)
+        let response = self
+            .client
+            .get(&self.dict_url)
             .header("Range", range_header)
             .send()
             .await?;
-            
+
         if !response.status().is_success() {
             return Err(anyhow!("Dictionary fetch failed: {}", response.status()));
         }
@@ -55,8 +57,11 @@ impl CodeResolver {
         let hex_hash = hex::encode(code_hash);
         let shard1 = &hex_hash[0..2];
         let shard2 = &hex_hash[2..4];
-        let url = format!("{}/{}/{}/{}.bin", self.cas_base_url, shard1, shard2, hex_hash);
-        
+        let url = format!(
+            "{}/{}/{}/{}.bin",
+            self.cas_base_url, shard1, shard2, hex_hash
+        );
+
         info!("Fetching bytecode from CAS: {}", url);
 
         let response = self.client.get(&url).send().await?;

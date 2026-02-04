@@ -1,9 +1,31 @@
-use crate::{aggregate_responses, generate_query, AccountData, EpochMetadata, ServerResponse, QUERIES_PER_REQUEST};
+use crate::{
+    aggregate_responses, generate_query, AccountData, EpochMetadata, ServerResponse, StorageData,
+    QUERIES_PER_REQUEST,
+};
 use anyhow::{anyhow, Result};
 use rand::thread_rng;
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+fn storage_cuckoo_key(address: [u8; 20], slot: [u8; 32]) -> [u8; 8] {
+    use alloy_primitives::keccak256;
+
+    let mut storage_key = [0u8; 52];
+    storage_key[0..20].copy_from_slice(&address);
+    storage_key[20..52].copy_from_slice(&slot);
+
+    let tag = keccak256(&storage_key);
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&tag[0..8]);
+    out
+}
+
+/// Returns the 8-byte key used for storage query generation.
+/// This is the Cuckoo key derived as keccak(address || slot)[0..8].
+fn storage_query_key(address: [u8; 20], slot: [u8; 32]) -> [u8; 8] {
+    storage_cuckoo_key(address, slot)
+}
 
 #[derive(Deserialize)]
 struct RawEpochResponse {
@@ -36,7 +58,10 @@ impl PirClient {
         let resp: RawEpochResponse = self.http_client.get(url).send().await?.json().await?;
 
         let mut state_root = [0u8; 32];
-        let hex_root = resp.state_root.strip_prefix("0x").unwrap_or(&resp.state_root);
+        let hex_root = resp
+            .state_root
+            .strip_prefix("0x")
+            .unwrap_or(&resp.state_root);
         hex::decode_to_slice(hex_root, &mut state_root)?;
 
         let metadata = Arc::new(EpochMetadata {
@@ -64,7 +89,7 @@ impl PirClient {
 
     pub async fn query_account(&self, address: [u8; 20]) -> Result<AccountData> {
         let metadata = self.get_metadata().await?;
-        
+
         let query_keys = {
             let mut rng = thread_rng();
             generate_query(&mut rng, &address, &metadata)
@@ -135,5 +160,146 @@ impl PirClient {
             code_hash: None,
             code_id: None,
         })
+    }
+
+    pub async fn query_storage(&self, address: [u8; 20], slot: [u8; 32]) -> Result<StorageData> {
+        let metadata = self.get_metadata().await?;
+
+        // Construct 52-byte storage key for tag verification: Address (20) + SlotKey (32)
+        let mut storage_key = [0u8; 52];
+        storage_key[0..20].copy_from_slice(&address);
+        storage_key[20..52].copy_from_slice(&slot);
+
+        // Use 8-byte Cuckoo key for query generation
+        let cuckoo_key = storage_query_key(address, slot);
+        let query_keys = {
+            let mut rng = thread_rng();
+            generate_query(&mut rng, &cuckoo_key, &metadata)
+        };
+
+        // Send queries in parallel
+        let req_a = self
+            .http_client
+            .post(format!("{}/query", self.server_a_url))
+            .json(&serde_json::json!({
+                "keys": query_keys.keys_a.iter().map(|k| format!("0x{}", hex::encode(k.to_bytes()))).collect::<Vec<_>>()
+            }))
+            .send();
+
+        let req_b = self
+            .http_client
+            .post(format!("{}/query", self.server_b_url))
+            .json(&serde_json::json!({
+                "keys": query_keys.keys_b.iter().map(|k| format!("0x{}", hex::encode(k.to_bytes()))).collect::<Vec<_>>()
+            }))
+            .send();
+
+        let (resp_a, resp_b) = tokio::try_join!(req_a, req_b)?;
+
+        #[derive(Deserialize)]
+        struct QueryResponse {
+            #[allow(dead_code)]
+            epoch_id: u64,
+            payloads: Vec<String>,
+        }
+
+        let json_a: QueryResponse = resp_a.json().await?;
+        let json_b: QueryResponse = resp_b.json().await?;
+
+        let parse_payloads = |payloads: Vec<String>| -> Result<[Vec<u8>; QUERIES_PER_REQUEST]> {
+            if payloads.len() != QUERIES_PER_REQUEST {
+                return Err(anyhow!("Invalid payload count"));
+            }
+            let mut out: [Vec<u8>; QUERIES_PER_REQUEST] = Default::default();
+            for (i, p) in payloads.into_iter().enumerate() {
+                let hex_p = p.strip_prefix("0x").unwrap_or(&p);
+                out[i] = hex::decode(hex_p)?;
+            }
+            Ok(out)
+        };
+
+        let server_resp_a = ServerResponse {
+            epoch_id: json_a.epoch_id,
+            payloads: parse_payloads(json_a.payloads)?,
+        };
+
+        let server_resp_b = ServerResponse {
+            epoch_id: json_b.epoch_id,
+            payloads: parse_payloads(json_b.payloads)?,
+        };
+
+        let aggregated = aggregate_responses(&server_resp_a, &server_resp_b)
+            .map_err(|e| anyhow!("Aggregation error: {:?}", e))?;
+
+        // Compute expected tag: Keccak256(storage_key)[0..8]
+        // This matches the server-side tag computation in reth-adapter
+        use alloy_primitives::keccak256;
+        let tag_hash = keccak256(&storage_key);
+        let expected_tag: [u8; 8] = tag_hash[0..8].try_into().unwrap();
+
+        // Find payload with matching tag (Optimized48 scheme)
+        for payload in aggregated.payloads.iter() {
+            if let Some(data) = StorageData::from_bytes(payload) {
+                if let Some(tag) = data.tag {
+                    if tag == expected_tag {
+                        return Ok(data);
+                    }
+                }
+            }
+        }
+
+        // Fallback: Check for non-zero legacy payloads (32-byte, no tag)
+        // Only accept if exactly ONE non-zero legacy payload exists to avoid ambiguity
+        let mut legacy_candidates: Vec<StorageData> = Vec::new();
+        for payload in aggregated.payloads.iter() {
+            if let Some(data) = StorageData::from_bytes(payload) {
+                if data.tag.is_none() && data.value != [0u8; 32] {
+                    legacy_candidates.push(data);
+                }
+            }
+        }
+
+        if legacy_candidates.len() == 1 {
+            return Ok(legacy_candidates.into_iter().next().unwrap());
+        }
+
+        // Return zero value if not found or ambiguous
+        Ok(StorageData {
+            value: [0u8; 32],
+            tag: None,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_key_hashes_to_8_bytes() {
+        let address = [0x11u8; 20];
+        let slot = [0x22u8; 32];
+        let expected_tag = [0x2b, 0xc0, 0xe4, 0x45, 0x3d, 0x02, 0x2b, 0x3e];
+
+        let actual = storage_cuckoo_key(address, slot);
+        assert_eq!(actual, expected_tag);
+    }
+
+    #[test]
+    fn storage_query_uses_8_byte_cuckoo_key() {
+        let address = [0x33u8; 20];
+        let slot = [0x44u8; 32];
+
+        // The key used for query generation must be 8 bytes (Cuckoo key)
+        let query_key = storage_query_key(address, slot);
+        assert_eq!(
+            query_key.len(),
+            8,
+            "storage query must use 8-byte Cuckoo key"
+        );
+
+        // Verify it matches the expected Cuckoo key derivation
+        let expected = storage_cuckoo_key(address, slot);
+        assert_eq!(query_key, expected);
     }
 }

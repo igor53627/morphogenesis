@@ -367,7 +367,7 @@ impl EpochManager {
             .merge_lock
             .lock()
             .map_err(|_| MergeError::LockPoisoned)?;
-        
+
         let current = self.global.load();
         let next_epoch_id = current
             .epoch_id
@@ -378,11 +378,13 @@ impl EpochManager {
             epoch_id: next_epoch_id,
             matrix: Arc::new(new_matrix),
         };
-        
+
         self.global.store(Arc::new(next_snapshot));
-        
+
         // Reset delta buffer for new epoch
-        self.pending.reset_with_epoch(next_epoch_id).map_err(|_| MergeError::LockPoisoned)?;
+        self.pending
+            .reset_with_epoch(next_epoch_id)
+            .map_err(|_| MergeError::LockPoisoned)?;
 
         #[cfg(feature = "cuda")]
         {
@@ -447,7 +449,10 @@ impl EpochManager {
 
         #[cfg(feature = "cuda")]
         {
-            let mut gpu_guard = self.gpu_matrix.lock().map_err(|_| MergeError::LockPoisoned)?;
+            let mut gpu_guard = self
+                .gpu_matrix
+                .lock()
+                .map_err(|_| MergeError::LockPoisoned)?;
             if let Some(gpu_matrix) = gpu_guard.as_mut() {
                 let snapshot = self.global.load();
                 let chunk_size = snapshot.matrix.chunk_size_bytes();
@@ -463,8 +468,7 @@ impl EpochManager {
                     if is_dirty {
                         let chunk = snapshot.matrix.chunk(chunk_idx);
                         let start_byte = chunk_idx * chunk_size;
-                        let start_page =
-                            start_byte / morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+                        let start_page = start_byte / morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
                         if let Err(e) = gpu_matrix.update_pages(start_page, chunk.as_slice()) {
                             eprintln!("GPU update failed for chunk {}: {:?}", chunk_idx, e);
                             // We don't fail the whole advance because CPU is already updated,
@@ -650,8 +654,7 @@ pub async fn spawn_merge_worker_with_callback<F>(
 mod tests {
     use super::{
         build_next_snapshot, dirty_chunks, dirty_chunks_vec, try_build_next_snapshot,
-        try_dirty_chunks, try_dirty_chunks_vec, EpochManager, EpochManagerError,
-        MergeError,
+        try_dirty_chunks, try_dirty_chunks_vec, EpochManager, EpochManagerError, MergeError,
     };
     use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
     use morphogen_storage::ChunkedMatrix;
@@ -927,10 +930,11 @@ mod tests {
         assert_eq!(next.epoch_id, 6);
     }
 
-    fn make_global_state(epoch_id: u64, _row_size: usize) -> Arc<GlobalState> {
+    fn make_global_state(epoch_id: u64, row_size: usize) -> Arc<GlobalState> {
         let matrix = Arc::new(ChunkedMatrix::new(64, 32));
         let snapshot = EpochSnapshot { epoch_id, matrix };
-        Arc::new(GlobalState::new(Arc::new(snapshot)))
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size, epoch_id));
+        Arc::new(GlobalState::new(Arc::new(snapshot), pending))
     }
 
     #[test]
@@ -1479,10 +1483,11 @@ mod async_tests {
     use std::time::Duration;
     use tokio::sync::watch;
 
-    fn make_global_state(epoch_id: u64, _row_size: usize) -> Arc<GlobalState> {
+    fn make_global_state(epoch_id: u64, row_size: usize) -> Arc<GlobalState> {
         let matrix = Arc::new(ChunkedMatrix::new(64, 32));
         let snapshot = EpochSnapshot { epoch_id, matrix };
-        Arc::new(GlobalState::new(Arc::new(snapshot)))
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size, epoch_id));
+        Arc::new(GlobalState::new(Arc::new(snapshot), pending))
     }
 
     #[tokio::test]

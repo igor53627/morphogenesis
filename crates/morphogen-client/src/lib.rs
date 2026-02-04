@@ -2,6 +2,7 @@ pub mod fixture;
 pub mod gpu;
 pub mod network;
 pub mod page;
+mod verification_test;
 
 use morphogen_core::{CuckooAddresser, NUM_HASH_FUNCTIONS};
 pub use morphogen_dpf::AesDpfKey;
@@ -89,6 +90,12 @@ pub struct AccountData {
     pub code_id: Option<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageData {
+    pub value: [u8; 32],
+    pub tag: Option<[u8; 8]>,
+}
+
 impl AccountData {
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         // Prioritize Compact Scheme (default for v4)
@@ -99,13 +106,41 @@ impl AccountData {
             let balance = u128::from_be_bytes(bytes[0..16].try_into().ok()?);
             let nonce = u64::from_be_bytes(bytes[16..24].try_into().ok()?);
             let code_id = u32::from_be_bytes(bytes[24..28].try_into().ok()?);
-            Some(Self { nonce, balance, code_hash: None, code_id: Some(code_id) })
+            Some(Self {
+                nonce,
+                balance,
+                code_hash: None,
+                code_id: Some(code_id),
+            })
         } else if bytes.len() == 64 {
             // Full Scheme: [Balance(16) | Nonce(8) | CodeHash(32) | Padding(8)]
             let balance = u128::from_be_bytes(bytes[0..16].try_into().ok()?);
             let nonce = u64::from_be_bytes(bytes[16..24].try_into().ok()?);
             let code_hash: [u8; 32] = bytes[24..56].try_into().ok()?;
-            Some(Self { nonce, balance, code_hash: Some(code_hash), code_id: None })
+            Some(Self {
+                nonce,
+                balance,
+                code_hash: Some(code_hash),
+                code_id: None,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl StorageData {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        // Storage payloads: [Value (32) | Tag (8) | Pad (8)] for Optimized48
+        // or just [Value (32) | ...] for legacy schemes
+        if bytes.len() >= 32 {
+            let value: [u8; 32] = bytes[0..32].try_into().ok()?;
+            let tag = if bytes.len() >= 40 {
+                Some(bytes[32..40].try_into().ok()?)
+            } else {
+                None
+            };
+            Some(Self { value, tag })
         } else {
             None
         }
@@ -130,13 +165,15 @@ impl CodeResolver {
     pub async fn resolve_code_hash(&self, code_id: u32) -> Result<[u8; 32], String> {
         let offset = code_id as u64 * 32;
         let range_header = format!("bytes={}-{}", offset, offset + 31);
-        
-        let response = self.client.get(&self.dict_url)
+
+        let response = self
+            .client
+            .get(&self.dict_url)
             .header("Range", range_header)
             .send()
             .await
             .map_err(|e| e.to_string())?;
-            
+
         if !response.status().is_success() {
             return Err(format!("HTTP error: {}", response.status()));
         }
@@ -159,9 +196,17 @@ impl CodeResolver {
         let hex_hash = hex::encode(code_hash);
         let shard1 = &hex_hash[0..2];
         let shard2 = &hex_hash[2..4];
-        let url = format!("{}/{}/{}/{}.bin", self.cas_base_url, shard1, shard2, hex_hash);
-        
-        let response = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let url = format!(
+            "{}/{}/{}/{}.bin",
+            self.cas_base_url, shard1, shard2, hex_hash
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         if !response.status().is_success() {
             return Err(format!("HTTP error: {}", response.status()));
         }
@@ -172,13 +217,13 @@ impl CodeResolver {
 
     pub async fn resolve_full_data(&self, data: &AccountData) -> Result<AccountData, String> {
         let mut resolved = data.clone();
-        
+
         if let Some(code_id) = data.code_id {
             if resolved.code_hash.is_none() {
                 resolved.code_hash = Some(self.resolve_code_hash(code_id).await?);
             }
         }
-        
+
         Ok(resolved)
     }
 }
@@ -487,8 +532,11 @@ mod tests {
         // Nonce = 2
         row[23] = 2;
         // CodeID = 0xDEADBEEF
-        row[24] = 0xDE; row[25] = 0xAD; row[26] = 0xBE; row[27] = 0xEF;
-        
+        row[24] = 0xDE;
+        row[25] = 0xAD;
+        row[26] = 0xBE;
+        row[27] = 0xEF;
+
         let data = AccountData::from_bytes(&row).unwrap();
         assert_eq!(data.balance, 1);
         assert_eq!(data.nonce, 2);
@@ -505,7 +553,7 @@ mod tests {
         for i in 24..56 {
             row[i] = 0xAA;
         }
-        
+
         let data = AccountData::from_bytes(&row).unwrap();
         assert_eq!(data.balance, 100);
         assert_eq!(data.nonce, 5);
@@ -517,17 +565,18 @@ mod tests {
     async fn test_code_resolver_resolve_hash() {
         let mut server = mockito::Server::new_async().await;
         let dict_url = format!("{}/dict.bin", server.url());
-        
+
         let hash = [0x11u8; 32];
-        let _m = server.mock("GET", "/dict.bin")
+        let _m = server
+            .mock("GET", "/dict.bin")
             .match_header("Range", "bytes=32-63")
             .with_body(&hash)
             .create_async()
             .await;
-            
+
         let resolver = CodeResolver::new(dict_url, "http://localhost/cas".to_string());
         let resolved_hash = resolver.resolve_code_hash(1).await.unwrap();
-        
+
         assert_eq!(resolved_hash, hash);
     }
 
@@ -535,22 +584,23 @@ mod tests {
     async fn test_code_resolver_fetch_bytecode() {
         let mut server = mockito::Server::new_async().await;
         let cas_base_url = server.url();
-        
+
         let hash = [0xAAu8; 32];
         let hex_hash = hex::encode(hash);
         let shard1 = &hex_hash[0..2];
         let shard2 = &hex_hash[2..4];
         let path = format!("/{}/{}/{}.bin", shard1, shard2, hex_hash);
-        
+
         let bytecode = vec![0x60, 0x80, 0x60, 0x40];
-        let _m = server.mock("GET", path.as_str())
+        let _m = server
+            .mock("GET", path.as_str())
             .with_body(&bytecode)
             .create_async()
             .await;
-            
+
         let resolver = CodeResolver::new("http://localhost/dict".to_string(), cas_base_url);
         let fetched_bytecode = resolver.fetch_bytecode(hash).await.unwrap();
-        
+
         assert_eq!(fetched_bytecode, bytecode);
     }
 
@@ -558,39 +608,142 @@ mod tests {
     async fn test_code_resolver_e2e_flow() {
         let mut server = mockito::Server::new_async().await;
         let base_url = server.url();
-        
+
         let code_id = 628088;
-        let weth_hash = hex::decode("d0a06b12ac47863b5c7be4185c2deaad1c61557033f56c7d4ea74429cbb25e23").unwrap();
+        let weth_hash =
+            hex::decode("d0a06b12ac47863b5c7be4185c2deaad1c61557033f56c7d4ea74429cbb25e23")
+                .unwrap();
         let weth_bytecode = vec![0x60, 0x80, 0x60, 0x40]; // Mock bytecode
-        
+
         // Mock dictionary range request
-        let _m1 = server.mock("GET", "/mainnet_compact.dict")
-            .match_header("Range", format!("bytes={}-{}", code_id * 32, code_id * 32 + 31).as_str())
+        let _m1 = server
+            .mock("GET", "/mainnet_compact.dict")
+            .match_header(
+                "Range",
+                format!("bytes={}-{}", code_id * 32, code_id * 32 + 31).as_str(),
+            )
             .with_body(&weth_hash)
             .create_async()
             .await;
-            
+
         // Mock CAS request
         let shard1 = "d0";
         let shard2 = "a0";
         let hex_hash = "d0a06b12ac47863b5c7be4185c2deaad1c61557033f56c7d4ea74429cbb25e23";
         let cas_path = format!("/cas/{}/{}/{}.bin", shard1, shard2, hex_hash);
-        let _m2 = server.mock("GET", cas_path.as_str())
+        let _m2 = server
+            .mock("GET", cas_path.as_str())
             .with_body(&weth_bytecode)
             .create_async()
             .await;
-            
+
         let resolver = CodeResolver::new(
             format!("{}/mainnet_compact.dict", base_url),
-            format!("{}/cas", base_url)
+            format!("{}/cas", base_url),
         );
-        
+
         // 1. Resolve hash
         let resolved_hash = resolver.resolve_code_hash(code_id).await.unwrap();
         assert_eq!(resolved_hash.as_slice(), weth_hash.as_slice());
-        
+
         // 2. Fetch bytecode
         let fetched_bytecode = resolver.fetch_bytecode(resolved_hash).await.unwrap();
         assert_eq!(fetched_bytecode, weth_bytecode);
+    }
+
+    #[test]
+    fn storage_data_parses_value() {
+        let mut payload = vec![0u8; 48];
+        // Storage value = 0x123
+        payload[31] = 0x23;
+        payload[30] = 0x01;
+
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert_eq!(data.value[31], 0x23);
+        assert_eq!(data.value[30], 0x01);
+        for i in 0..30 {
+            assert_eq!(data.value[i], 0);
+        }
+    }
+
+    #[test]
+    fn storage_data_parses_zero_value() {
+        let payload = vec![0u8; 48];
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert_eq!(data.value, [0u8; 32]);
+    }
+
+    #[test]
+    fn storage_data_parses_full_value() {
+        let mut payload = vec![0xFFu8; 48];
+        for i in 0..32 {
+            payload[i] = i as u8;
+        }
+
+        let data = StorageData::from_bytes(&payload).unwrap();
+        for i in 0..32 {
+            assert_eq!(data.value[i], i as u8);
+        }
+    }
+
+    #[test]
+    fn storage_data_rejects_short_payload() {
+        let payload = vec![0u8; 16];
+        assert!(StorageData::from_bytes(&payload).is_none());
+    }
+
+    #[test]
+    fn storage_data_accepts_32_byte_payload() {
+        let mut payload = vec![0u8; 32];
+        payload[31] = 0x42;
+
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert_eq!(data.value[31], 0x42);
+        assert!(data.tag.is_none()); // Legacy payload has no tag
+    }
+
+    #[test]
+    fn storage_data_extracts_tag_from_optimized48() {
+        let mut payload = vec![0u8; 48];
+        // Value
+        payload[31] = 0xFF;
+        // Tag at bytes [32..40]
+        for i in 0..8 {
+            payload[32 + i] = (0xAA + i) as u8;
+        }
+
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert_eq!(data.value[31], 0xFF);
+        assert!(data.tag.is_some());
+
+        let tag = data.tag.unwrap();
+        for i in 0..8 {
+            assert_eq!(tag[i], (0xAA + i) as u8);
+        }
+    }
+
+    #[test]
+    fn storage_data_tag_none_for_legacy_payload() {
+        let payload = vec![0xFFu8; 32]; // 32-byte legacy
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert!(data.tag.is_none());
+    }
+
+    #[test]
+    fn storage_data_tag_extraction_correctness() {
+        use alloy_primitives::keccak256;
+
+        // Simulate server-side tag computation
+        let storage_key = b"test_address_20b_slot_32bytes_total_52b_key_here";
+        let tag_hash = keccak256(storage_key);
+        let expected_tag: [u8; 8] = tag_hash[0..8].try_into().unwrap();
+
+        // Build payload with that tag
+        let mut payload = vec![0u8; 48];
+        payload[31] = 0x42; // Some value
+        payload[32..40].copy_from_slice(&expected_tag);
+
+        let data = StorageData::from_bytes(&payload).unwrap();
+        assert_eq!(data.tag.unwrap(), expected_tag);
     }
 }

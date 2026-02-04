@@ -13,5 +13,7 @@ pub fn init_tracing() {
 
 pub fn init_metrics() -> PrometheusHandle {
     let builder = PrometheusBuilder::new();
-    builder.install_recorder().expect("failed to install Prometheus recorder")
+    builder
+        .install_recorder()
+        .expect("failed to install Prometheus recorder")
 }

@@ -95,6 +95,12 @@ pub struct GpuScanner {
     pub device: Arc<CudaDevice>,
     kernels: HashMap<usize, CudaFunction>,
     kernels_transposed: HashMap<usize, CudaFunction>,
+    /// Optimized kernels v1 - fast PRG, reduced shared memory
+    kernels_optimized: HashMap<usize, CudaFunction>,
+    /// Optimized kernels v2 - minimal shared memory (sequential queries)
+    kernels_optimized_v2: HashMap<usize, CudaFunction>,
+    /// Optimized kernels v3 - hybrid approach (query grouping)
+    kernels_optimized_v3: HashMap<usize, CudaFunction>,
 }
 
 #[cfg(feature = "cuda")]
@@ -158,10 +164,145 @@ impl GpuScanner {
             kernels_transposed.insert(*i, setup_kernel(name, *i)?);
         }
 
+        // Load optimized kernels v1
+        let mut kernels_optimized = HashMap::new();
+        let opt_ptx_path = concat!(env!("OUT_DIR"), "/fused_kernel_optimized.ptx");
+        if let Ok(opt_ptx) = std::fs::read_to_string(opt_ptx_path) {
+            let opt_module_name = "fused_pir_optimized".to_string();
+            let opt_kernel_names = [
+                "fused_batch_pir_kernel_optimized_1",
+                "fused_batch_pir_kernel_optimized_2",
+                "fused_batch_pir_kernel_optimized_4",
+                "fused_batch_pir_kernel_optimized_8",
+                "fused_batch_pir_kernel_optimized_16",
+            ];
+
+            if device
+                .load_ptx(opt_ptx.into(), &opt_module_name, &opt_kernel_names)
+                .is_ok()
+            {
+                let setup_opt_kernel =
+                    |name: &str, batch_size: usize| -> Result<CudaFunction, DriverError> {
+                        let func = device
+                            .get_func(&opt_module_name, name)
+                            .expect("Optimized kernel not found");
+
+                        let accum_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
+                        let verif_bytes = batch_size * 3 * 16;
+                        let seed_bytes = batch_size * 3 * 32;
+                        let required_shmem = accum_bytes + verif_bytes + seed_bytes;
+
+                        unsafe {
+                            let _ = func.set_attribute(
+                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            required_shmem as i32,
+                        );
+                        }
+                        Ok(func)
+                    };
+
+                for (i, &name) in [1, 2, 4, 8, 16].iter().zip(opt_kernel_names.iter()) {
+                    if let Ok(kernel) = setup_opt_kernel(name, *i) {
+                        kernels_optimized.insert(*i, kernel);
+                    }
+                }
+            }
+        }
+
+        // Load optimized kernels v2 - minimal shared memory
+        let mut kernels_optimized_v2 = HashMap::new();
+        let opt_v2_ptx_path = concat!(env!("OUT_DIR"), "/fused_kernel_optimized_v2.ptx");
+        if let Ok(opt_v2_ptx) = std::fs::read_to_string(opt_v2_ptx_path) {
+            let opt_v2_module_name = "fused_pir_optimized_v2".to_string();
+            let opt_v2_kernel_names = [
+                "fused_batch_pir_kernel_v2_1",
+                "fused_batch_pir_kernel_v2_2",
+                "fused_batch_pir_kernel_v2_4",
+                "fused_batch_pir_kernel_v2_8",
+                "fused_batch_pir_kernel_v2_16",
+            ];
+
+            if device
+                .load_ptx(opt_v2_ptx.into(), &opt_v2_module_name, &opt_v2_kernel_names)
+                .is_ok()
+            {
+                let setup_opt_v2_kernel =
+                    |name: &str, batch_size: usize| -> Result<CudaFunction, DriverError> {
+                        let func = device
+                            .get_func(&opt_v2_module_name, name)
+                            .expect("Optimized v2 kernel not found");
+
+                        let seed_bytes = batch_size * 3 * 32;
+                        let required_shmem = seed_bytes;
+
+                        unsafe {
+                            let _ = func.set_attribute(
+                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            required_shmem as i32,
+                        );
+                        }
+                        Ok(func)
+                    };
+
+                for (i, &name) in [1, 2, 4, 8, 16].iter().zip(opt_v2_kernel_names.iter()) {
+                    if let Ok(kernel) = setup_opt_v2_kernel(name, *i) {
+                        kernels_optimized_v2.insert(*i, kernel);
+                    }
+                }
+            }
+        }
+
+        // Load optimized kernels v3 - hybrid approach
+        let mut kernels_optimized_v3 = HashMap::new();
+        let opt_v3_ptx_path = concat!(env!("OUT_DIR"), "/fused_kernel_optimized_v3.ptx");
+        if let Ok(opt_v3_ptx) = std::fs::read_to_string(opt_v3_ptx_path) {
+            let opt_v3_module_name = "fused_pir_optimized_v3".to_string();
+            let opt_v3_kernel_names = [
+                "fused_batch_pir_kernel_v3_1",
+                "fused_batch_pir_kernel_v3_2",
+                "fused_batch_pir_kernel_v3_4",
+                "fused_batch_pir_kernel_v3_8",
+                "fused_batch_pir_kernel_v3_16",
+            ];
+
+            if device
+                .load_ptx(opt_v3_ptx.into(), &opt_v3_module_name, &opt_v3_kernel_names)
+                .is_ok()
+            {
+                let setup_opt_v3_kernel =
+                    |name: &str, batch_size: usize| -> Result<CudaFunction, DriverError> {
+                        let func = device
+                            .get_func(&opt_v3_module_name, name)
+                            .expect("Optimized v3 kernel not found");
+
+                        // v3: seeds only in shared memory (accumulators in registers)
+                        let seed_bytes = batch_size * 3 * 32;
+                        let required_shmem = seed_bytes;
+
+                        unsafe {
+                            let _ = func.set_attribute(
+                            CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                            required_shmem as i32,
+                        );
+                        }
+                        Ok(func)
+                    };
+
+                for (i, &name) in [1, 2, 4, 8, 16].iter().zip(opt_v3_kernel_names.iter()) {
+                    if let Ok(kernel) = setup_opt_v3_kernel(name, *i) {
+                        kernels_optimized_v3.insert(*i, kernel);
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             device,
             kernels,
             kernels_transposed,
+            kernels_optimized,
+            kernels_optimized_v2,
+            kernels_optimized_v3,
         })
     }
 
@@ -174,15 +315,26 @@ impl GpuScanner {
         db: &GpuPageMatrix,
         queries: &[[ChaChaKey; 3]],
     ) -> Result<Vec<PirResult>, DriverError> {
-        self.scan_batch_opts(db, queries, false)
+        self.scan_batch_opts(db, queries, false, false, false, false)
     }
 
     /// Execute a fused PIR scan with options (e.g. transposed layout).
+    ///
+    /// # Arguments
+    /// * `db` - The database matrix on GPU
+    /// * `queries` - Batch of queries (each with 3 DPF keys for Cuckoo)
+    /// * `transposed` - Whether to use transposed memory layout
+    /// * `optimized` - Whether to use Plinko-optimized kernels v1 (fast PRG)
+    /// * `optimized_v2` - Whether to use optimized kernels v2 (minimal shared memory, sequential)
+    /// * `optimized_v3` - Whether to use optimized kernels v3 (hybrid query grouping)
     pub unsafe fn scan_batch_opts(
         &self,
         db: &GpuPageMatrix,
         queries: &[[ChaChaKey; 3]],
         transposed: bool,
+        optimized: bool,
+        optimized_v2: bool,
+        optimized_v3: bool,
     ) -> Result<Vec<PirResult>, DriverError> {
         if queries.is_empty() {
             return Ok(Vec::new());
@@ -242,19 +394,52 @@ impl GpuScanner {
             let mut verif_slice = out_verifiers.slice_mut(verif_offset..verif_offset + verif_len);
 
             // Launch kernel
-            let kernel_map = if transposed {
-                &self.kernels_transposed
+            let func = if optimized_v3 && !self.kernels_optimized_v3.is_empty() {
+                // Use optimized v3 kernel (hybrid query grouping)
+                self.kernels_optimized_v3
+                    .get(&batch_size)
+                    .expect("Optimized v3 kernel not found")
+            } else if optimized_v2 && !self.kernels_optimized_v2.is_empty() {
+                // Use optimized v2 kernel (minimal shared memory)
+                self.kernels_optimized_v2
+                    .get(&batch_size)
+                    .expect("Optimized v2 kernel not found")
+            } else if optimized && !self.kernels_optimized.is_empty() {
+                // Use optimized v1 kernel
+                self.kernels_optimized
+                    .get(&batch_size)
+                    .expect("Optimized kernel not found")
+            } else if transposed {
+                self.kernels_transposed
+                    .get(&batch_size)
+                    .expect("Kernel not found")
             } else {
-                &self.kernels
+                self.kernels.get(&batch_size).expect("Kernel not found")
             };
-            let func = kernel_map.get(&batch_size).expect("Kernel not found");
 
-            // Shared memory: Accumulators + Verifiers + Tile Seeds + Mask Buffer
+            // Shared memory calculation
             let accum_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
             let verif_bytes_sh = batch_size * 3 * 16;
             let seed_bytes = batch_size * 3 * 32;
-            let mask_bytes = THREADS_PER_BLOCK * batch_size * 3 * 16;
-            let shared_mem_bytes = accum_bytes + verif_bytes_sh + seed_bytes + mask_bytes;
+            // Optimized v2/v3 kernels use minimal shared memory (just seeds)
+            // Optimized v1 kernels don't use mask buffer
+            let mask_bytes = if (optimized || optimized_v2 || optimized_v3)
+                && ((!optimized || !self.kernels_optimized.is_empty())
+                    || (!optimized_v2 || !self.kernels_optimized_v2.is_empty())
+                    || (!optimized_v3 || !self.kernels_optimized_v3.is_empty()))
+            {
+                0
+            } else {
+                THREADS_PER_BLOCK * batch_size * 3 * 16
+            };
+            let shared_mem_bytes = if (optimized_v2 && !self.kernels_optimized_v2.is_empty())
+                || (optimized_v3 && !self.kernels_optimized_v3.is_empty())
+            {
+                // v2/v3: only seed storage in shared memory
+                seed_bytes
+            } else {
+                accum_bytes + verif_bytes_sh + seed_bytes + mask_bytes
+            };
 
             let cfg = LaunchConfig {
                 grid_dim: (((num_pages + SUBTREE_SIZE - 1) / SUBTREE_SIZE) as u32, 1, 1),
@@ -322,6 +507,50 @@ impl GpuScanner {
         let query = [keys[0].clone(), keys[1].clone(), keys[2].clone()];
         let results = self.scan_batch(db, &[query])?;
         Ok(results.into_iter().next().unwrap())
+    }
+
+    /// Execute a fused PIR scan using optimized kernels v1 (Plinko-style fast PRG).
+    ///
+    /// This uses the optimized CUDA kernels with:
+    /// - Fast PRG expansion (fewer ChaCha rounds computed)
+    /// - Warp-level DPF sharing
+    /// - Better instruction scheduling
+    pub unsafe fn scan_batch_optimized(
+        &self,
+        db: &GpuPageMatrix,
+        queries: &[[ChaChaKey; 3]],
+    ) -> Result<Vec<PirResult>, DriverError> {
+        self.scan_batch_opts(db, queries, false, true, false, false)
+    }
+
+    /// Execute a fused PIR scan using optimized kernels v2 (minimal shared memory).
+    ///
+    /// This uses the optimized CUDA kernels with:
+    /// - Register-based accumulation (no shared memory for accumulators)
+    /// - Warp-level reduction using shuffle
+    /// - Minimal shared memory usage (only for tile seeds)
+    /// - Supports much larger batch sizes without shared memory overflow
+    pub unsafe fn scan_batch_optimized_v2(
+        &self,
+        db: &GpuPageMatrix,
+        queries: &[[ChaChaKey; 3]],
+    ) -> Result<Vec<PirResult>, DriverError> {
+        self.scan_batch_opts(db, queries, false, false, true, false)
+    }
+
+    /// Execute a fused PIR scan using optimized kernels v3 (hybrid query grouping).
+    ///
+    /// This uses the optimized CUDA kernels with:
+    /// - Query grouping (process 3 queries at a time to reduce register pressure)
+    /// - Parallel processing within each group
+    /// - Accumulates in registers, flushes via warp shuffle
+    /// - Intended to balance parallelism and resource usage
+    pub unsafe fn scan_batch_optimized_v3(
+        &self,
+        db: &GpuPageMatrix,
+        queries: &[[ChaChaKey; 3]],
+    ) -> Result<Vec<PirResult>, DriverError> {
+        self.scan_batch_opts(db, queries, false, false, false, true)
     }
 }
 
@@ -400,7 +629,7 @@ pub fn eval_fused_3dpf_cpu(
 
     // Process in tiles
     let effective_subtree_size = SUBTREE_SIZE.min(domain_size);
-    let num_tiles = (num_pages + effective_subtree_size - 1) / effective_subtree_size;
+    let num_tiles = num_pages.div_ceil(effective_subtree_size);
 
     let (acc0, acc1, acc2) = (0..num_tiles)
         .into_par_iter()

@@ -37,11 +37,21 @@ We support two row layouts. The 32-byte "Compact" schema is the production stand
 | 56 | 8 | `u8[8]` | **Padding** | Reserved |
 
 ### Storage Slots
-Storage slots are mixed into the same table as Accounts.
-- **Key:** `Address . SlotKey` (52 bytes) -> Cuckoo Hash.
-- **Value:** The 32-byte storage value is placed into the row.
-    - In **Compact**, it fills the entire 32-byte row.
-    - In **Full**, it fills the first 32 bytes; rest is padding.
+
+Storage slots are mixed into the same table as Accounts. Addressing differs by schema:
+
+#### Legacy Schemas (Compact / Full)
+- **Cuckoo Key:** Full 52-byte composite key `address || slot_key`
+- **Payload:** 32-byte storage value only (no tag)
+- The entire 52-byte key is hashed to determine Cuckoo bucket positions
+
+#### Optimized48 Schema
+- **Cuckoo Key:** 8-byte tag derived as `keccak256(address || slot_key)[0..8]`
+- **Payload:** 8-byte tag (same derivation) + 32-byte storage value + 8-byte padding
+- The full 52-byte composite key is used only for:
+  1. Tag derivation (first 8 bytes of keccak hash)
+  2. Client-side verification (proves slot belongs to address)
+- Cuckoo addressing uses only the 8-byte tag, not the full 52-byte key
 
 ---
 

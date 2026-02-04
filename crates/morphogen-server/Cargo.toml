@@ -4,7 +4,7 @@
  edition = "2021"
 
  [dependencies]
- morphogen-core = { path = "../morphogen-core" }
+morphogen-core = { path = "../morphogen-core", default-features = false }
  morphogen-dpf = { path = "../morphogen-dpf", features = ["fss"] }
  morphogen-gpu-dpf = { path = "../morphogen-gpu-dpf", optional = true }
  morphogen-storage = { path = "../morphogen-storage" }
@@ -24,8 +24,8 @@
  metrics-exporter-prometheus = { version = "0.16", optional = true }
  clap = { version = "4.0", features = ["derive"], optional = true }
 
- [dev-dependencies]
- morphogen-client = { path = "../morphogen-client" }
+[dev-dependencies]
+morphogen-client = { path = "../morphogen-client", default-features = false }
  tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
  reqwest = { version = "0.12", features = ["json"] }
  tokio-tungstenite = "0.26"
@@ -40,7 +40,8 @@
  profiling = []
  streaming_stores = []
  parallel = []
- network = ["axum", "tokio", "serde", "serde_json", "hex", "tower", "tracing", "tracing-subscriber", "metrics", "metrics-exporter-prometheus", "dep:clap", "dep:morphogen-gpu-dpf"]
+network = ["axum", "tokio", "serde", "serde_json", "hex", "tower", "tracing", "tracing-subscriber", "metrics", "metrics-exporter-prometheus", "dep:clap", "dep:morphogen-gpu-dpf"]
+verifiable-pir = ["morphogen-core/verifiable-pir"]
 
  [lib]
  name = "morphogen_server"

@@ -20,6 +20,44 @@ cargo build --release --features avx512,parallel
 ./target/release/bench_scan --rows 78643200 --iterations 3 --warmup-iterations 1 --scan-only --parallel
 ```
 
+## Development Workflow (MANDATORY)
+
+This project uses mandatory tooling for task tracking and code quality:
+
+### backlog.md - Task Management
+```bash
+# View all tasks
+backlog task list
+
+# Work on a task
+backlog task edit TASK-X -s "In Progress"
+
+# Commit with task reference (auto-linked via git hook)
+git commit -m "feat: implement feature
+
+Addresses TASK-X"
+```
+
+### roborev - Continuous Code Review
+```bash
+# View latest reviews
+roborev list
+
+# Check specific commit
+roborev show COMMIT_SHA
+
+# Address findings
+roborev address JOB_ID
+```
+
+### Git Hook Setup
+The `.git/hooks/post-commit` hook automatically:
+1. Triggers roborev review for every commit
+2. Links commits to tasks when message includes "Addresses TASK-X"
+3. Updates zoekt search index
+
+**All commits must reference a task ID** and will be automatically reviewed.
+
 ## Architecture
 
 ```
@@ -38,7 +76,8 @@ crates/
 
 ## Documentation
 
-- [Kanban](docs/KANBAN.md) - Project status and tasks
+- [Kanban](docs/KANBAN.md) - Project status and tasks (historic)
+- [Backlog](backlog/) - Active task management (use `backlog` CLI)
 - [Protocol Spec](docs/morphogenesis_protocol.md) - PRD v3.2
 - [Paper](docs/morphogenesis_paper.md) - Epoch-Based Delta-PIR
 - [EDD](docs/morphogenesis_EDD.md) - Engineering design

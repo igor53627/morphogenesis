@@ -1,5 +1,5 @@
-use morphogen_core::cuckoo::CuckooAddresser;
 use hex;
+use morphogen_core::cuckoo::CuckooAddresser;
 
 fn main() {
     let num_rows = 1024;

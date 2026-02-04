@@ -16,7 +16,7 @@ use morphogen_gpu_dpf::storage::GpuPageMatrix;
 fn main() {
     let args: Vec<String> = env::args().collect();
     let use_gpu = args.iter().any(|arg| arg == "--gpu");
-    
+
     let mut domain_bits = 25;
     if let Some(idx) = args.iter().position(|arg| arg == "--domain") {
         if let Some(val) = args.get(idx + 1) {
@@ -33,13 +33,16 @@ fn main() {
     println!("Domain: {} bits", domain_bits);
     println!("Pages: {}", num_pages);
     println!("Data Size: {:.2} GB", size_gb);
-    println!("Mode: {}", if use_gpu { "GPU (CUDA)" } else { "CPU (Rayon)" });
+    println!(
+        "Mode: {}",
+        if use_gpu { "GPU (CUDA)" } else { "CPU (Rayon)" }
+    );
 
     // 1. Database Setup
     println!("\nAllocating {:.2}GB synthetic database...", size_gb);
     let start = Instant::now();
     // Use a simpler pattern to avoid slow random/mapped initialization
-    let db_data = vec![0u8; total_size]; 
+    let db_data = vec![0u8; total_size];
     println!("Allocation took {:.2}s", start.elapsed().as_secs_f64());
 
     // 2. Query Setup
@@ -55,12 +58,16 @@ fn main() {
             println!("\nInitializing GPU...");
             let scanner = GpuScanner::new(0).expect("Failed to create GpuScanner");
             let device = scanner.device.clone();
-            
-            println!("Uploading {:.2}GB to GPU (this will take a while over PCIe)...", size_gb);
+
+            println!(
+                "Uploading {:.2}GB to GPU (this will take a while over PCIe)...",
+                size_gb
+            );
             let upload_start = Instant::now();
             let gpu_db = GpuPageMatrix::new(device, &db_data).expect("Failed to upload to GPU");
             let upload_s = upload_start.elapsed().as_secs_f64();
-            println!("Upload took {:.2}s ({:.2} GB/s)", 
+            println!(
+                "Upload took {:.2}s ({:.2} GB/s)",
                 upload_s,
                 size_gb / upload_s
             );
@@ -68,11 +75,13 @@ fn main() {
             println!("\n=== Starting GPU Timed Runs (5 iterations) ===");
             for i in 0..5 {
                 let start = Instant::now();
-                let _result = unsafe { scanner.scan(&gpu_db, [&k0_0, &k1_0, &k2_0]) }.expect("GPU scan failed");
+                let _result = unsafe { scanner.scan(&gpu_db, [&k0_0, &k1_0, &k2_0]) }
+                    .expect("GPU scan failed");
                 let elapsed = start.elapsed();
                 let ms = elapsed.as_secs_f64() * 1000.0;
-                println!("Iter {}: {:.2} ms ({:.2} GB/s)", 
-                    i, 
+                println!(
+                    "Iter {}: {:.2} ms ({:.2} GB/s)",
+                    i,
                     ms,
                     size_gb / elapsed.as_secs_f64()
                 );
@@ -89,11 +98,13 @@ fn main() {
         println!("\n=== Starting CPU Timed Runs (3 iterations) ===");
         for i in 0..3 {
             let start = Instant::now();
-            let _result = eval_fused_3dpf_cpu([&k0_0, &k1_0, &k2_0], &pages).expect("CPU scan failed");
+            let _result =
+                eval_fused_3dpf_cpu([&k0_0, &k1_0, &k2_0], &pages).expect("CPU scan failed");
             let elapsed = start.elapsed();
             let ms = elapsed.as_secs_f64() * 1000.0;
-            println!("Iter {}: {:.2} ms ({:.2} GB/s)", 
-                i, 
+            println!(
+                "Iter {}: {:.2} ms ({:.2} GB/s)",
+                i,
                 ms,
                 size_gb / elapsed.as_secs_f64()
             );

@@ -251,8 +251,10 @@ fn e2e_full_client_server_flow() {
     let mut rng = rand::thread_rng();
     let query = generate_query(&mut rng, target_account, &metadata);
 
-    let results_a = morphogen_server::try_scan(&matrix_a, &delta_a, &query.keys_a, ROW_SIZE).unwrap();
-    let results_b = morphogen_server::try_scan(&matrix_b, &delta_b, &query.keys_b, ROW_SIZE).unwrap();
+    let results_a =
+        morphogen_server::try_scan(&matrix_a, &delta_a, &query.keys_a, ROW_SIZE).unwrap();
+    let results_b =
+        morphogen_server::try_scan(&matrix_b, &delta_b, &query.keys_b, ROW_SIZE).unwrap();
 
     let response_a = ServerResponse {
         epoch_id: metadata.epoch_id,

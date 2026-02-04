@@ -11,6 +11,8 @@
 //! 4. Client XORs server responses to get plaintext pages
 //! 5. Client extracts target row from each page locally
 
+#[cfg(feature = "verifiable-pir")]
+use morphogen_core::sumcheck::SumCheckProof;
 use morphogen_core::{CuckooAddresser, NUM_HASH_FUNCTIONS};
 pub use morphogen_dpf::page::{
     extract_row_from_page, generate_page_dpf_keys, xor_pages, PageAddress, PageDpfError,
@@ -38,18 +40,28 @@ pub struct PageQueryKeys {
 pub struct PageServerResponse {
     pub epoch_id: u64,
     pub pages: [Vec<u8>; QUERIES_PER_REQUEST],
+    #[cfg(feature = "verifiable-pir")]
+    pub proof: Option<SumCheckProof>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageAggregatedResult {
     pub epoch_id: u64,
     pub pages: [Vec<u8>; QUERIES_PER_REQUEST],
+    #[cfg(feature = "verifiable-pir")]
+    pub proofs: [Option<SumCheckProof>; 2], // Proof from A and B
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageAggregationError {
-    EpochMismatch { server_a: u64, server_b: u64 },
-    PageLengthMismatch { index: usize, len_a: usize, len_b: usize },
+    EpochMismatch {
+        server_a: u64,
+        server_b: u64,
+    },
+    PageLengthMismatch {
+        index: usize,
+        len_a: usize,
+        len_b: usize,
+    },
 }
 
 pub fn aggregate_page_responses(
@@ -84,6 +96,8 @@ pub fn aggregate_page_responses(
     Ok(PageAggregatedResult {
         epoch_id: response_a.epoch_id,
         pages,
+        #[cfg(feature = "verifiable-pir")]
+        proofs: [response_a.proof.clone(), response_b.proof.clone()],
     })
 }
 
@@ -91,13 +105,14 @@ pub fn generate_page_query(
     account_key: &[u8],
     metadata: &PageEpochMetadata,
 ) -> Result<PageQueryKeys, PageDpfError> {
-    let num_rows = metadata
-        .num_pages
-        .checked_mul(ROWS_PER_PAGE)
-        .ok_or(PageDpfError::InvalidDomainBits {
-            domain_bits: metadata.params.domain_bits,
-            reason: "num_pages * ROWS_PER_PAGE would overflow",
-        })?;
+    let num_rows =
+        metadata
+            .num_pages
+            .checked_mul(ROWS_PER_PAGE)
+            .ok_or(PageDpfError::InvalidDomainBits {
+                domain_bits: metadata.params.domain_bits,
+                reason: "num_pages * ROWS_PER_PAGE would overflow",
+            })?;
     let addresser = CuckooAddresser::with_seeds(num_rows, metadata.seeds);
     let row_positions = addresser.hash_indices(account_key);
 
@@ -128,13 +143,22 @@ pub fn extract_rows_from_pages(
     addresses: &[PageAddress; 3],
 ) -> Result<[Vec<u8>; 3], ExtractError> {
     let row0 = extract_row_from_page(&result.pages[0], addresses[0].row_offset)
-        .ok_or(ExtractError::InvalidRowOffset { index: 0, row_offset: addresses[0].row_offset })?
+        .ok_or(ExtractError::InvalidRowOffset {
+            index: 0,
+            row_offset: addresses[0].row_offset,
+        })?
         .to_vec();
     let row1 = extract_row_from_page(&result.pages[1], addresses[1].row_offset)
-        .ok_or(ExtractError::InvalidRowOffset { index: 1, row_offset: addresses[1].row_offset })?
+        .ok_or(ExtractError::InvalidRowOffset {
+            index: 1,
+            row_offset: addresses[1].row_offset,
+        })?
         .to_vec();
     let row2 = extract_row_from_page(&result.pages[2], addresses[2].row_offset)
-        .ok_or(ExtractError::InvalidRowOffset { index: 2, row_offset: addresses[2].row_offset })?
+        .ok_or(ExtractError::InvalidRowOffset {
+            index: 2,
+            row_offset: addresses[2].row_offset,
+        })?
         .to_vec();
     Ok([row0, row1, row2])
 }
@@ -205,9 +229,17 @@ mod tests {
                 }
 
                 if idx == target_page {
-                    assert_eq!(xor, [0xFF; 16], "key pair {} should XOR to 0xFF at target page {}", i, target_page);
+                    assert_eq!(
+                        xor, [0xFF; 16],
+                        "key pair {} should XOR to 0xFF at target page {}",
+                        i, target_page
+                    );
                 } else {
-                    assert_eq!(xor, [0x00; 16], "key pair {} should XOR to 0x00 at non-target page {}", i, idx);
+                    assert_eq!(
+                        xor, [0x00; 16],
+                        "key pair {} should XOR to 0x00 at non-target page {}",
+                        i, idx
+                    );
                 }
             }
         }
@@ -221,11 +253,23 @@ mod tests {
 
         let response_a = PageServerResponse {
             epoch_id: 1,
-            pages: [page_a.clone(), vec![0; PAGE_SIZE_BYTES], vec![0; PAGE_SIZE_BYTES]],
+            pages: [
+                page_a.clone(),
+                vec![0; PAGE_SIZE_BYTES],
+                vec![0; PAGE_SIZE_BYTES],
+            ],
+            #[cfg(feature = "verifiable-pir")]
+            proof: None,
         };
         let response_b = PageServerResponse {
             epoch_id: 1,
-            pages: [page_b.clone(), vec![0; PAGE_SIZE_BYTES], vec![0; PAGE_SIZE_BYTES]],
+            pages: [
+                page_b.clone(),
+                vec![0; PAGE_SIZE_BYTES],
+                vec![0; PAGE_SIZE_BYTES],
+            ],
+            #[cfg(feature = "verifiable-pir")]
+            proof: None,
         };
 
         let result = aggregate_page_responses(&response_a, &response_b).unwrap();
@@ -237,11 +281,23 @@ mod tests {
     fn aggregate_page_responses_epoch_mismatch() {
         let response_a = PageServerResponse {
             epoch_id: 1,
-            pages: [vec![0; PAGE_SIZE_BYTES], vec![0; PAGE_SIZE_BYTES], vec![0; PAGE_SIZE_BYTES]],
+            pages: [
+                vec![0; PAGE_SIZE_BYTES],
+                vec![0; PAGE_SIZE_BYTES],
+                vec![0; PAGE_SIZE_BYTES],
+            ],
+            #[cfg(feature = "verifiable-pir")]
+            proof: None,
         };
         let response_b = PageServerResponse {
             epoch_id: 2,
-            pages: [vec![0; PAGE_SIZE_BYTES], vec![0; PAGE_SIZE_BYTES], vec![0; PAGE_SIZE_BYTES]],
+            pages: [
+                vec![0; PAGE_SIZE_BYTES],
+                vec![0; PAGE_SIZE_BYTES],
+                vec![0; PAGE_SIZE_BYTES],
+            ],
+            #[cfg(feature = "verifiable-pir")]
+            proof: None,
         };
 
         let result = aggregate_page_responses(&response_a, &response_b);
@@ -269,19 +325,39 @@ mod tests {
         let result = PageAggregatedResult {
             epoch_id: 42,
             pages,
+            #[cfg(feature = "verifiable-pir")]
+            proofs: [None, None],
         };
 
         let addresses = [
-            PageAddress { page_index: 0, row_offset: 5 },
-            PageAddress { page_index: 1, row_offset: 10 },
-            PageAddress { page_index: 2, row_offset: 15 },
+            PageAddress {
+                page_index: 0,
+                row_offset: 5,
+            },
+            PageAddress {
+                page_index: 1,
+                row_offset: 10,
+            },
+            PageAddress {
+                page_index: 2,
+                row_offset: 15,
+            },
         ];
 
         let rows = extract_rows_from_pages(&result, &addresses).unwrap();
 
-        assert!(rows[0].iter().all(|&b| b == 5), "row0 should be filled with 5");
-        assert!(rows[1].iter().all(|&b| b == 26), "row1 should be filled with 26");
-        assert!(rows[2].iter().all(|&b| b == 47), "row2 should be filled with 47");
+        assert!(
+            rows[0].iter().all(|&b| b == 5),
+            "row0 should be filled with 5"
+        );
+        assert!(
+            rows[1].iter().all(|&b| b == 26),
+            "row1 should be filled with 26"
+        );
+        assert!(
+            rows[2].iter().all(|&b| b == 47),
+            "row2 should be filled with 47"
+        );
     }
 
     #[test]

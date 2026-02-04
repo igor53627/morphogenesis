@@ -3,12 +3,10 @@
 //! Uses ChaCha8-based DPF keys for high performance on GPU.
 
 use morphogen_core::CuckooAddresser;
-pub use morphogen_gpu_dpf::dpf::{
-    generate_chacha_dpf_keys, ChaChaKey, ChaChaParams,
-};
 pub use morphogen_dpf::page::{
     extract_row_from_page, PageAddress, PAGE_SIZE_BYTES, ROWS_PER_PAGE, ROW_SIZE_BYTES,
 };
+pub use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaKey, ChaChaParams};
 
 pub struct GpuPageQueryKeys {
     pub page_addresses: [PageAddress; 3],
@@ -22,12 +20,12 @@ pub fn generate_gpu_page_query(
     seeds: [u64; 3],
     domain_bits: usize,
 ) -> Result<GpuPageQueryKeys, morphogen_gpu_dpf::dpf::GpuDpfError> {
-    let num_rows = num_pages
-        .checked_mul(ROWS_PER_PAGE)
-        .ok_or(morphogen_gpu_dpf::dpf::GpuDpfError::InvalidDomainBits {
+    let num_rows = num_pages.checked_mul(ROWS_PER_PAGE).ok_or(
+        morphogen_gpu_dpf::dpf::GpuDpfError::InvalidDomainBits {
             bits: domain_bits,
             reason: "num_pages * ROWS_PER_PAGE would overflow",
-        })?;
+        },
+    )?;
     let addresser = CuckooAddresser::with_seeds(num_rows, seeds);
     let row_positions = addresser.hash_indices(account_key);
 

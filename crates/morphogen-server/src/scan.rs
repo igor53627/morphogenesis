@@ -7,7 +7,9 @@ pub const DEFAULT_MAX_RETRIES: usize = 1000;
 #[derive(Debug, PartialEq, Eq)]
 pub enum ScanError {
     LockPoisoned,
-    TooManyRetries { attempts: usize },
+    TooManyRetries {
+        attempts: usize,
+    },
     MatrixNotAligned {
         total_bytes: usize,
         unit_size: usize,
@@ -267,9 +269,8 @@ pub fn try_scan_pages_chunked(
         }
     }
 
-    let results: [Vec<u8>; 3] = std::array::from_fn(|i| {
-        keys[i].eval_and_accumulate_chunked(&page_refs, dpf_chunk_size)
-    });
+    let results: [Vec<u8>; 3] =
+        std::array::from_fn(|i| keys[i].eval_and_accumulate_chunked(&page_refs, dpf_chunk_size));
 
     Ok(results)
 }
@@ -345,7 +346,7 @@ pub fn scan_delta_for_gpu(
     page_size_bytes: usize,
 ) -> Result<[Vec<u8>; 3], ScanError> {
     let entries = delta.snapshot().map_err(|_| ScanError::LockPoisoned)?;
-    
+
     let mut results = [
         vec![0u8; page_size_bytes],
         vec![0u8; page_size_bytes],
@@ -365,7 +366,7 @@ pub fn scan_delta_for_gpu(
     for entry in entries {
         let page_idx = entry.row_idx / rows_per_page;
         let row_offset_in_page = (entry.row_idx % rows_per_page) * row_size;
-        
+
         // Ensure we don't write out of bounds
         if row_offset_in_page + row_size > page_size_bytes {
             continue; // Should not happen if invariants hold
@@ -1198,17 +1199,23 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    fn make_global_state(epoch_id: u64, total_size: usize, chunk_size: usize) -> Arc<GlobalState> {
+    fn make_global_state(
+        epoch_id: u64,
+        total_size: usize,
+        chunk_size: usize,
+        row_size: usize,
+    ) -> Arc<GlobalState> {
         let matrix = Arc::new(ChunkedMatrix::new(total_size, chunk_size));
         let snapshot = EpochSnapshot { epoch_id, matrix };
-        Arc::new(GlobalState::new(Arc::new(snapshot)))
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size, epoch_id));
+        Arc::new(GlobalState::new(Arc::new(snapshot), pending))
     }
 
     #[test]
     fn scan_consistent_returns_result() {
         let row_size = 4;
-        let global = make_global_state(0, 64, 32);
-        let pending = DeltaBuffer::new(row_size);
+        let global = make_global_state(0, 64, 32, row_size);
+        let pending = DeltaBuffer::new_with_epoch(row_size, 0);
 
         let mut rng = rand::thread_rng();
         let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
@@ -1226,8 +1233,8 @@ mod tests {
     #[test]
     fn scan_consistent_includes_pending_deltas() {
         let row_size = 4;
-        let global = make_global_state(0, 64, 32);
-        let pending = DeltaBuffer::new(row_size);
+        let global = make_global_state(0, 64, 32, row_size);
+        let pending = DeltaBuffer::new_with_epoch(row_size, 0);
         pending.push(0, vec![0xAB, 0xCD, 0xEF, 0x12]).unwrap();
 
         let mut rng = rand::thread_rng();
@@ -1253,8 +1260,8 @@ mod tests {
         use super::scan_consistent_with_max_retries;
 
         let row_size = 4;
-        let global = make_global_state(0, 64, 32);
-        let pending = DeltaBuffer::new(row_size);
+        let global = make_global_state(0, 64, 32, row_size);
+        let pending = DeltaBuffer::new_with_epoch(row_size, 0);
 
         let mut rng = rand::thread_rng();
         let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
@@ -1274,7 +1281,7 @@ mod tests {
         use super::scan_consistent_with_max_retries;
 
         let row_size = 4;
-        let global = make_global_state(0, 64, 32);
+        let global = make_global_state(0, 64, 32, row_size);
         let pending = DeltaBuffer::new(row_size);
 
         let mut rng = rand::thread_rng();
@@ -1292,7 +1299,7 @@ mod tests {
         use super::scan_consistent_with_max_retries;
 
         let row_size = 4;
-        let global = make_global_state(0, 64, 32);
+        let global = make_global_state(0, 64, 32, row_size);
         let pending = DeltaBuffer::new(row_size);
 
         pending.drain_for_epoch(1).expect("drain should succeed");
@@ -1315,8 +1322,8 @@ mod tests {
         use super::scan_consistent_with_max_retries;
 
         let row_size = 4;
-        let global = make_global_state(5, 64, 32);
-        let pending = DeltaBuffer::new(row_size);
+        let global = make_global_state(5, 64, 32, row_size);
+        let pending = DeltaBuffer::new_with_epoch(row_size, 5);
 
         pending.drain_for_epoch(5).expect("drain should succeed");
 
@@ -1343,10 +1350,16 @@ mod concurrency_tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    fn make_global_state(epoch_id: u64, total_size: usize, chunk_size: usize) -> Arc<GlobalState> {
+    fn make_global_state(
+        epoch_id: u64,
+        total_size: usize,
+        chunk_size: usize,
+        row_size: usize,
+    ) -> Arc<GlobalState> {
         let matrix = Arc::new(ChunkedMatrix::new(total_size, chunk_size));
         let snapshot = EpochSnapshot { epoch_id, matrix };
-        Arc::new(GlobalState::new(Arc::new(snapshot)))
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size, epoch_id));
+        Arc::new(GlobalState::new(Arc::new(snapshot), pending))
     }
 
     #[test]
@@ -1354,8 +1367,8 @@ mod concurrency_tests {
         let row_size = 4;
         let num_rows = 16;
         let total_size = row_size * num_rows;
-        let global = make_global_state(0, total_size, total_size);
-        let pending = Arc::new(DeltaBuffer::new(row_size));
+        let global = make_global_state(0, total_size, total_size, row_size);
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size, 0));
 
         let barrier = Arc::new(Barrier::new(3));
         let iterations = 100;
@@ -1471,8 +1484,8 @@ mod concurrency_tests {
         let row_size = 4;
         let num_rows = 16;
         let total_size = row_size * num_rows;
-        let global = make_global_state(0, total_size, total_size);
-        let pending = Arc::new(DeltaBuffer::new(row_size));
+        let global = make_global_state(0, total_size, total_size, row_size);
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size, 0));
 
         pending.push(0, vec![0xFF; row_size]).expect("push failed");
 
@@ -1550,7 +1563,8 @@ mod concurrency_tests {
             epoch_id: 0,
             matrix,
         };
-        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(page_size, 0));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
 
         let params = PageDpfParams::new(8).unwrap();
         let target_page = 42;
@@ -1562,8 +1576,10 @@ mod concurrency_tests {
         let keys_server0 = [k0_0, k1_0, k2_0];
         let keys_server1 = [k0_1, k1_1, k2_1];
 
-        let results0 = scan_pages_chunked(global.load().matrix.as_ref(), &keys_server0, page_size, 64);
-        let results1 = scan_pages_chunked(global.load().matrix.as_ref(), &keys_server1, page_size, 64);
+        let results0 =
+            scan_pages_chunked(global.load().matrix.as_ref(), &keys_server0, page_size, 64);
+        let results1 =
+            scan_pages_chunked(global.load().matrix.as_ref(), &keys_server1, page_size, 64);
 
         let mut page_result = vec![0u8; page_size];
         xor_pages(&results0[0], &results1[0], &mut page_result);

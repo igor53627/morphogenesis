@@ -93,15 +93,33 @@ impl ChunkedMatrix {
     }
 
     pub fn write_row(&mut self, row_idx: usize, row_size: usize, data: &[u8]) {
-        let row_offset = row_idx * row_size;
-        let chunk_idx = row_offset / self.chunk_size_bytes;
-        let offset_in_chunk = row_offset % self.chunk_size_bytes;
+        let global_offset = row_idx * row_size;
+        let mut chunk_idx = global_offset / self.chunk_size_bytes;
+        let mut offset_in_chunk = global_offset % self.chunk_size_bytes;
+        let mut data_offset = 0;
+        let mut remaining = data.len().min(row_size);
 
-        let chunk =
-            Arc::get_mut(&mut self.chunks[chunk_idx]).expect("chunk must be uniquely owned");
-        let slice = chunk.as_mut_slice();
-        let len = data.len().min(row_size);
-        slice[offset_in_chunk..offset_in_chunk + len].copy_from_slice(&data[..len]);
+        while remaining > 0 {
+            let chunk =
+                Arc::get_mut(&mut self.chunks[chunk_idx]).expect("chunk must be uniquely owned");
+            let slice = chunk.as_mut_slice();
+
+            // Calculate how much we can write to this chunk
+            let space_in_chunk = self.chunk_sizes[chunk_idx] - offset_in_chunk;
+            let write_len = remaining.min(space_in_chunk);
+
+            slice[offset_in_chunk..offset_in_chunk + write_len]
+                .copy_from_slice(&data[data_offset..data_offset + write_len]);
+
+            remaining -= write_len;
+            data_offset += write_len;
+
+            // Move to next chunk if needed
+            if remaining > 0 {
+                chunk_idx += 1;
+                offset_in_chunk = 0;
+            }
+        }
     }
 
     pub fn write_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {

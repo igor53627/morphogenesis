@@ -57,3 +57,7 @@ path = "src/bin/bench_sharded.rs"
 [[bin]]
 name = "bench_real_data"
 path = "src/bin/bench_real_data.rs"
+
+[[bin]]
+name = "bench_optimized"
+path = "src/bin/bench_optimized.rs"
