@@ -1,10 +1,10 @@
 ---
 id: TASK-1
 title: Implement eth_getStorageAt RPC method
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-02-03 14:29'
-updated_date: '2026-02-03 17:54'
+updated_date: '2026-02-04 14:05'
 labels: []
 dependencies: []
 references:

@@ -2,13 +2,21 @@
 
 High-throughput Private Information Retrieval for Ethereum light clients.
 
-## Performance
+## Current Status
+
+- Full mainnet matrix PIR on H100: **53.0 ms** latency, **1.3 TB/s** throughput
+- Subtree-optimized GPU kernel: **27.4 ms** on B200 (**2.51 TB/s**)
+- Storage lookups use 8-byte Cuckoo tags with full 52-byte verification
+- Verifiable PIR (sumcheck/binius) gated behind `verifiable-pir` feature
+
+## Performance (Latest)
 
 | Metric | Value |
 |--------|-------|
-| Scan throughput | **383 GB/s** |
-| Scan latency (75GB) | **~196ms** |
-| Target | 140 GB/s (exceeded 2.7x) |
+| GPU scan throughput (H100) | **1,300 GB/s** |
+| GPU scan latency (68.8 GB) | **53.0 ms** |
+| GPU scan throughput (B200) | **2,510 GB/s** |
+| GPU scan latency (68.8 GB) | **27.4 ms** |
 
 ## Quick Start
 
@@ -73,6 +81,7 @@ crates/
 - `avx512` - Enable AVX-512 SIMD optimizations
 - `parallel` - Enable multi-threaded chunk processing (rayon)
 - `profiling` - Enable detailed timing instrumentation
+- `verifiable-pir` - Enable sumcheck/binius proof plumbing
 
 ## Documentation
 
@@ -83,8 +92,14 @@ crates/
 - [EDD](docs/morphogenesis_EDD.md) - Engineering design
 - [Performance](docs/PERFORMANCE.md) - Optimization findings
 - [Profiling Guide](docs/PROFILING_GUIDE.md) - How to profile
-- [Cryptography & Core Mechanics](docs/CRYPTOGRAPHY.md) - Explaining the fused kernel and DPF logic
+- [Cryptography & Core Mechanics](docs/CRYPTOGRAPHY.md) - Fused kernel and DPF logic
 - [Crypto Analysis](docs/CRYPTO_ANALYSIS.md) - Why we use ChaCha8 over AES on GPUs
+- [Phase 79 Brief](docs/PHASE_79_BRIEF.md) - Kernel optimization summary
+- [Trace Explanation](docs/TRACE_EXPLANATION.md) - Sumcheck trace sizing
+
+## Experiments
+
+Modal benchmarks and data-prep scripts live in `experiments/`.
 
 ## Key Concepts
 
