@@ -1,4 +1,6 @@
-use binius_field::{BinaryField128b, Field};
+#![cfg(feature = "verifiable-pir")]
+
+use binius_field::BinaryField128b;
 use morphogen_core::sumcheck::SumCheckProver;
 use std::time::Instant;
 

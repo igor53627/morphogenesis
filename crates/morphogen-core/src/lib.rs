@@ -2,6 +2,7 @@ mod constants;
 pub mod cuckoo;
 pub mod delta;
 mod epoch;
+#[cfg(feature = "verifiable-pir")]
 pub mod sumcheck;
 
 pub use constants::{QueryMode, ROW_SIZE_BYTES, ROW_SIZE_PRIVACY_ONLY, ROW_SIZE_TRUSTLESS};

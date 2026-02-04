@@ -199,4 +199,53 @@ mod tests {
             SumCheckVerifier::verify(4, BinaryField128b::new(proof.sum), &proof, &challenges);
         assert!(is_valid);
     }
+
+    #[test]
+    #[should_panic]
+    fn sumcheck_prover_panics_on_challenge_length_mismatch() {
+        let n = 16;
+        let mut db = vec![BinaryField128b::ZERO; n];
+        let mut query = vec![BinaryField128b::ZERO; n];
+
+        for i in 0..n {
+            db[i] = BinaryField128b::new(i as u128);
+            query[i] = BinaryField128b::new((i + 1) as u128);
+        }
+
+        let prover = SumCheckProver::new(db, query);
+        let challenges: Vec<_> = (0..5)
+            .map(|i| BinaryField128b::new(i as u128 + 100))
+            .collect();
+
+        let _ = prover.prove(&challenges);
+    }
+
+    #[test]
+    fn sumcheck_verifier_rejects_challenge_length_mismatch() {
+        let n = 16;
+        let mut db = vec![BinaryField128b::ZERO; n];
+        let mut query = vec![BinaryField128b::ZERO; n];
+
+        for i in 0..n {
+            db[i] = BinaryField128b::new(i as u128);
+            query[i] = BinaryField128b::new((i + 1) as u128);
+        }
+
+        let prover = SumCheckProver::new(db, query);
+        let challenges: Vec<_> = (0..4)
+            .map(|i| BinaryField128b::new(i as u128 + 100))
+            .collect();
+        let proof = prover.prove(&challenges);
+
+        let bad_challenges: Vec<_> = (0..3)
+            .map(|i| BinaryField128b::new(i as u128 + 200))
+            .collect();
+        let is_valid = SumCheckVerifier::verify(
+            4,
+            BinaryField128b::new(proof.sum),
+            &proof,
+            &bad_challenges,
+        );
+        assert!(!is_valid);
+    }
 }

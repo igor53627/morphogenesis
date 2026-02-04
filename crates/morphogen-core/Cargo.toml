@@ -8,7 +8,7 @@
  morphogen-storage = { path = "../morphogen-storage" }
  alloy-primitives = { version = "1.5" }
  sha3 = "0.10"
- binius_field = { git = "https://github.com/IrreducibleOSS/binius" }
+binius_field = { git = "https://github.com/IrreducibleOSS/binius", optional = true }
  rand = "0.8"
  serde = { version = "1.0", features = ["derive"] }
  rayon = "1.8"
@@ -16,3 +16,17 @@
 [lib]
 name = "morphogen_core"
 path = "src/lib.rs"
+
+[features]
+default = []
+verifiable-pir = ["dep:binius_field"]
+
+[[bin]]
+name = "bench_sumcheck"
+path = "src/bin/bench_sumcheck.rs"
+required-features = ["verifiable-pir"]
+
+[[bin]]
+name = "bench_verifiable_dpf"
+path = "src/bin/bench_verifiable_dpf.rs"
+required-features = ["verifiable-pir"]

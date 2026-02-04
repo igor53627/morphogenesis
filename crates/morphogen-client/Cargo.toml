@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-morphogen-core = { path = "../morphogen-core" }
+morphogen-core = { path = "../morphogen-core", default-features = false }
 morphogen-dpf = { path = "../morphogen-dpf", features = ["fss"] }
 morphogen-gpu-dpf = { path = "../morphogen-gpu-dpf" }
 rand = "0.8"
@@ -15,9 +15,13 @@ anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 alloy-primitives = "1.5"
-binius_field = { git = "https://github.com/IrreducibleOSS/binius" }
+binius_field = { git = "https://github.com/IrreducibleOSS/binius", optional = true }
 
 [dev-dependencies]
 rand = "0.8"
 fss-rs = { path = "../morphogen-dpf/vendor/fss-rs", features = ["stable"] }
 mockito = "1.2"
+
+[features]
+default = []
+verifiable-pir = ["dep:binius_field", "morphogen-core/verifiable-pir"]

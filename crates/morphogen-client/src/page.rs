@@ -11,7 +11,9 @@
 //! 4. Client XORs server responses to get plaintext pages
 //! 5. Client extracts target row from each page locally
 
-use morphogen_core::{sumcheck::SumCheckProof, CuckooAddresser, NUM_HASH_FUNCTIONS};
+#[cfg(feature = "verifiable-pir")]
+use morphogen_core::sumcheck::SumCheckProof;
+use morphogen_core::{CuckooAddresser, NUM_HASH_FUNCTIONS};
 pub use morphogen_dpf::page::{
     extract_row_from_page, generate_page_dpf_keys, xor_pages, PageAddress, PageDpfError,
     PageDpfKey, PageDpfParams, PAGE_SIZE_BYTES, ROWS_PER_PAGE, ROW_SIZE_BYTES,
@@ -38,6 +40,7 @@ pub struct PageQueryKeys {
 pub struct PageServerResponse {
     pub epoch_id: u64,
     pub pages: [Vec<u8>; QUERIES_PER_REQUEST],
+    #[cfg(feature = "verifiable-pir")]
     pub proof: Option<SumCheckProof>,
 }
 
@@ -45,9 +48,9 @@ pub struct PageServerResponse {
 pub struct PageAggregatedResult {
     pub epoch_id: u64,
     pub pages: [Vec<u8>; QUERIES_PER_REQUEST],
+    #[cfg(feature = "verifiable-pir")]
     pub proofs: [Option<SumCheckProof>; 2], // Proof from A and B
 }
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageAggregationError {
     EpochMismatch {
@@ -93,6 +96,7 @@ pub fn aggregate_page_responses(
     Ok(PageAggregatedResult {
         epoch_id: response_a.epoch_id,
         pages,
+        #[cfg(feature = "verifiable-pir")]
         proofs: [response_a.proof.clone(), response_b.proof.clone()],
     })
 }
@@ -254,6 +258,7 @@ mod tests {
                 vec![0; PAGE_SIZE_BYTES],
                 vec![0; PAGE_SIZE_BYTES],
             ],
+            #[cfg(feature = "verifiable-pir")]
             proof: None,
         };
         let response_b = PageServerResponse {
@@ -263,6 +268,7 @@ mod tests {
                 vec![0; PAGE_SIZE_BYTES],
                 vec![0; PAGE_SIZE_BYTES],
             ],
+            #[cfg(feature = "verifiable-pir")]
             proof: None,
         };
 
@@ -280,6 +286,7 @@ mod tests {
                 vec![0; PAGE_SIZE_BYTES],
                 vec![0; PAGE_SIZE_BYTES],
             ],
+            #[cfg(feature = "verifiable-pir")]
             proof: None,
         };
         let response_b = PageServerResponse {
@@ -289,6 +296,7 @@ mod tests {
                 vec![0; PAGE_SIZE_BYTES],
                 vec![0; PAGE_SIZE_BYTES],
             ],
+            #[cfg(feature = "verifiable-pir")]
             proof: None,
         };
 
@@ -317,6 +325,7 @@ mod tests {
         let result = PageAggregatedResult {
             epoch_id: 42,
             pages,
+            #[cfg(feature = "verifiable-pir")]
             proofs: [None, None],
         };
 

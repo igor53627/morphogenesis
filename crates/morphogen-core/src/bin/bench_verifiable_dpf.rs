@@ -1,3 +1,5 @@
+#![cfg(feature = "verifiable-pir")]
+
 use binius_field::{BinaryField128b, Field};
 use morphogen_core::sumcheck::SumCheckProver;
 use rayon::prelude::*;

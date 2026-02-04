@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(all(test, feature = "verifiable-pir"))]
 mod tests {
     use binius_field::{BinaryField128b, Field};
     use morphogen_core::sumcheck::{SumCheckProver, SumCheckVerifier};

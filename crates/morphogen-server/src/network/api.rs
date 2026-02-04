@@ -21,7 +21,9 @@ use metrics::counter;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
-use morphogen_core::{sumcheck::SumCheckProof, GlobalState};
+#[cfg(feature = "verifiable-pir")]
+use morphogen_core::sumcheck::SumCheckProof;
+use morphogen_core::GlobalState;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -111,6 +113,7 @@ pub struct QueryResponse {
 ///
 /// Returns full pages (4KB each) that the client XORs with the other server's response.
 #[derive(Serialize)]
+#[cfg(feature = "verifiable-pir")]
 pub struct PageQueryResponse {
     pub epoch_id: u64,
     /// 3 page payloads (4KB each for standard page size)
@@ -119,6 +122,15 @@ pub struct PageQueryResponse {
     /// Verifiable PIR Sum-Check Proof (Round 0)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proof: Option<SumCheckProof>,
+}
+
+#[cfg(not(feature = "verifiable-pir"))]
+#[derive(Serialize)]
+pub struct PageQueryResponse {
+    pub epoch_id: u64,
+    /// 3 page payloads (4KB each for standard page size)
+    #[serde(with = "hex_bytes_vec")]
+    pub pages: Vec<Vec<u8>>,
 }
 
 #[derive(Deserialize)]
@@ -395,6 +407,7 @@ pub async fn page_query_handler(
     Ok(Json(PageQueryResponse {
         epoch_id,
         pages: results.to_vec(),
+        #[cfg(feature = "verifiable-pir")]
         proof: None,
     }))
 }
@@ -425,7 +438,8 @@ pub async fn page_query_gpu_handler(
     #[cfg(feature = "cuda")]
     if let (Some(scanner), Some(matrix_mutex)) = (&state.gpu_scanner, &state.gpu_matrix) {
         use crate::scan::scan_delta_for_gpu;
-        use morphogen_core::sumcheck::{RoundPolynomial, SumCheckProof};
+        #[cfg(feature = "verifiable-pir")]
+        use morphogen_core::sumcheck::SumCheckProof;
         use morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
 
         for _ in 0..10 {
@@ -487,22 +501,22 @@ pub async fn page_query_gpu_handler(
                     // For a full proof, we'd need to combine them or prove each separately.
                     // Here we package them as a single "proof" for the client to verify against C_D.
 
-                    // Interpret 16-byte verif results as u128
-                    let v0 = u128::from_le_bytes(results.verif0.try_into().unwrap_or([0; 16]));
-                    let v1 = u128::from_le_bytes(results.verif1.try_into().unwrap_or([0; 16]));
-                    let v2 = u128::from_le_bytes(results.verif2.try_into().unwrap_or([0; 16]));
+                    #[cfg(feature = "verifiable-pir")]
+                    let proof = {
+                        let v0 = u128::from_le_bytes(results.verif0.try_into().unwrap_or([0; 16]));
+                        let v1 = u128::from_le_bytes(results.verif1.try_into().unwrap_or([0; 16]));
+                        let v2 = u128::from_le_bytes(results.verif2.try_into().unwrap_or([0; 16]));
 
-                    // For the prototype, we return the XOR sum of verifiers as the "proof sum"
-                    // Real implementation would return a proof per key or a combined proof.
-                    // Let's just put v0 in the proof structure for now to wire it up.
-                    let proof = SumCheckProof {
-                        round_polynomials: vec![], // Populated in later rounds (on CPU/Client or next step)
-                        sum: v0 ^ v1 ^ v2,         // Aggregate for simple check
+                        SumCheckProof {
+                            round_polynomials: vec![], // Populated in later rounds (on CPU/Client or next step)
+                            sum: v0 ^ v1 ^ v2,         // Aggregate for simple check
+                        }
                     };
 
                     return Ok(Json(PageQueryResponse {
                         epoch_id: snapshot1.epoch_id,
                         pages: vec![results.page0, results.page1, results.page2],
+                        #[cfg(feature = "verifiable-pir")]
                         proof: Some(proof),
                     }));
                 }
@@ -541,6 +555,7 @@ pub async fn page_query_gpu_handler(
     Ok(Json(PageQueryResponse {
         epoch_id: snapshot.epoch_id,
         pages: vec![result.page0, result.page1, result.page2],
+        #[cfg(feature = "verifiable-pir")]
         proof: None, // No proof for CPU fallback yet
     }))
 }
@@ -769,6 +784,19 @@ mod tests {
         assert!(json.contains("\"num_pages\":1024"));
         assert!(json.contains("\"prg_keys\""));
         assert!(json.contains("0xaaaa"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "verifiable-pir"))]
+    fn page_query_response_omits_proof_field_without_feature() {
+        let response = PageQueryResponse {
+            epoch_id: 1,
+            pages: vec![vec![0u8; 8], vec![0u8; 8], vec![0u8; 8]],
+            #[cfg(feature = "verifiable-pir")]
+            proof: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("\"proof\""));
     }
 
     #[test]
