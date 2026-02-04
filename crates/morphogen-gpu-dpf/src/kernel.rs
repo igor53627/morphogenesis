@@ -18,11 +18,14 @@ use rayon::prelude::*;
 #[cfg(feature = "cuda")]
 use crate::storage::GpuPageMatrix;
 #[cfg(feature = "cuda")]
-use cudarc::driver::{CudaDevice, CudaFunction, CudaSlice, LaunchAsync, LaunchConfig, DriverError, sys::CUfunction_attribute};
-#[cfg(feature = "cuda")]
-use std::sync::Arc;
+use cudarc::driver::{
+    sys::CUfunction_attribute, CudaDevice, CudaFunction, CudaSlice, DriverError, LaunchAsync,
+    LaunchConfig,
+};
 #[cfg(feature = "cuda")]
 use std::collections::HashMap;
+#[cfg(feature = "cuda")]
+use std::sync::Arc;
 
 /// Size of each page in bytes.
 pub const PAGE_SIZE_BYTES: usize = 4096;
@@ -61,7 +64,12 @@ impl DpfKeyGpu {
         let mut cw_t_left = [0u8; MAX_DOMAIN_BITS];
         let mut cw_t_right = [0u8; MAX_DOMAIN_BITS];
 
-        for (i, cw) in key.correction_words.iter().enumerate().take(MAX_DOMAIN_BITS) {
+        for (i, cw) in key
+            .correction_words
+            .iter()
+            .enumerate()
+            .take(MAX_DOMAIN_BITS)
+        {
             cw_seed[i] = cw.seed_cw.words;
             cw_t_left[i] = cw.t_cw_left;
             cw_t_right[i] = cw.t_cw_right;
@@ -94,7 +102,7 @@ impl GpuScanner {
     /// Create a new GpuScanner by loading the fused kernel.
     pub fn new(device_ord: usize) -> Result<Self, DriverError> {
         let device = CudaDevice::new(device_ord)?;
-        
+
         // Load the PTX/CUBIN compiled by build.rs
         let ptx_path = concat!(env!("OUT_DIR"), "/fused_kernel.ptx");
         let ptx = std::fs::read_to_string(ptx_path).map_err(|e| {
@@ -116,32 +124,32 @@ impl GpuScanner {
             "fused_batch_pir_kernel_transposed_8",
             "fused_batch_pir_kernel_transposed_16",
         ];
-        
+
         device.load_ptx(ptx.into(), &module_name, &kernel_names)?;
-        
+
         let mut kernels = HashMap::new();
         let mut kernels_transposed = HashMap::new();
-        
+
         let setup_kernel = |name: &str, batch_size: usize| -> Result<CudaFunction, DriverError> {
-            let func = device.get_func(&module_name, name).expect("Kernel not found");
-            
+            let func = device
+                .get_func(&module_name, name)
+                .expect("Kernel not found");
+
             let accum_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
+            let verif_bytes = batch_size * 3 * 16; // uint4 per query/key
             let seed_bytes = batch_size * 3 * 32;
             let mask_bytes = THREADS_PER_BLOCK * batch_size * 3 * 16;
-            let required_shmem = accum_bytes + seed_bytes + mask_bytes;
-            
+            let required_shmem = accum_bytes + verif_bytes + seed_bytes + mask_bytes;
+
             unsafe {
-                // Best effort: set max shared memory. 
-                // If it exceeds hardware limits (e.g. Batch 16 on some GPUs), this might fail.
-                // We ignore the error here; the launch will fail if we actually try to use it.
                 let _ = func.set_attribute(
                     CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-                    required_shmem as i32
+                    required_shmem as i32,
                 );
             }
             Ok(func)
         };
-        
+
         for (i, &name) in [1, 2, 4, 8, 16].iter().zip(kernel_names.iter().take(5)) {
             kernels.insert(*i, setup_kernel(name, *i)?);
         }
@@ -185,23 +193,32 @@ impl GpuScanner {
         let total_queries = queries.len();
         let start = std::time::Instant::now();
 
-        // Flatten all keys first? 
+        // Flatten all keys first?
         // No, we process in chunks. We allocate output for ALL queries at once to minimize host overhead?
         // Or allocate per chunk?
         // Allocating one big output buffer is better.
         let total_output_bytes = total_queries * 3 * PAGE_SIZE_BYTES;
         let mut out_accumulators = self.device.alloc_zeros::<u8>(total_output_bytes)?;
 
+        let total_verif_bytes = total_queries * 3 * 16;
+        let mut out_verifiers = self.device.alloc_zeros::<u8>(total_verif_bytes)?;
+
         let mut processed = 0;
         while processed < total_queries {
             let remaining = total_queries - processed;
-            
+
             // Greedily pick largest batch size
-            let batch_size = if remaining >= 16 { 16 }
-            else if remaining >= 8 { 8 }
-            else if remaining >= 4 { 4 }
-            else if remaining >= 2 { 2 }
-            else { 1 };
+            let batch_size = if remaining >= 16 {
+                16
+            } else if remaining >= 8 {
+                8
+            } else if remaining >= 4 {
+                4
+            } else if remaining >= 2 {
+                2
+            } else {
+                1
+            };
 
             // Prepare keys for this batch
             let mut gpu_keys = Vec::with_capacity(batch_size * 3);
@@ -211,26 +228,34 @@ impl GpuScanner {
                 gpu_keys.push(DpfKeyGpu::from_chacha_key(&q[1]));
                 gpu_keys.push(DpfKeyGpu::from_chacha_key(&q[2]));
             }
-            let keys_slice: CudaSlice<u8> = self.device.htod_sync_copy(bytemuck::cast_slice(&gpu_keys))?;
+            let keys_slice: CudaSlice<u8> = self
+                .device
+                .htod_sync_copy(bytemuck::cast_slice(&gpu_keys))?;
 
             // Get slice of output buffer for this batch
             let out_offset = processed * 3 * PAGE_SIZE_BYTES;
             let out_len = batch_size * 3 * PAGE_SIZE_BYTES;
             let mut out_slice = out_accumulators.slice_mut(out_offset..out_offset + out_len);
 
+            let verif_offset = processed * 3 * 16;
+            let verif_len = batch_size * 3 * 16;
+            let mut verif_slice = out_verifiers.slice_mut(verif_offset..verif_offset + verif_len);
+
             // Launch kernel
-            let kernel_map = if transposed { &self.kernels_transposed } else { &self.kernels };
+            let kernel_map = if transposed {
+                &self.kernels_transposed
+            } else {
+                &self.kernels
+            };
             let func = kernel_map.get(&batch_size).expect("Kernel not found");
-            
-            // Shared memory: Accumulators + Tile Seeds + Mask Buffer
-            // Accumulators: BATCH * 3 * PAGE_SIZE
-            // Tile Seeds: BATCH * 3 * 32 bytes (approx DpfSeed size)
-            // Masks: THREADS (256) * BATCH * 3 * sizeof(uint4) (16)
+
+            // Shared memory: Accumulators + Verifiers + Tile Seeds + Mask Buffer
             let accum_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
+            let verif_bytes_sh = batch_size * 3 * 16;
             let seed_bytes = batch_size * 3 * 32;
             let mask_bytes = THREADS_PER_BLOCK * batch_size * 3 * 16;
-            let shared_mem_bytes = accum_bytes + seed_bytes + mask_bytes;
-            
+            let shared_mem_bytes = accum_bytes + verif_bytes_sh + seed_bytes + mask_bytes;
+
             let cfg = LaunchConfig {
                 grid_dim: (((num_pages + SUBTREE_SIZE - 1) / SUBTREE_SIZE) as u32, 1, 1),
                 block_dim: (THREADS_PER_BLOCK as u32, 1, 1),
@@ -241,8 +266,9 @@ impl GpuScanner {
                 db_pages,
                 &keys_slice,
                 &mut out_slice,
+                &mut verif_slice,
                 num_pages as i32,
-                batch_size as i32, // Passed but unused in template (except for validation if needed)
+                batch_size as i32,
             );
             func.clone().launch(cfg, params)?;
 
@@ -251,7 +277,8 @@ impl GpuScanner {
 
         // 4. Copy results back
         let flat_results = self.device.sync_reclaim(out_accumulators)?;
-        
+        let flat_verifs = self.device.sync_reclaim(out_verifiers)?;
+
         let total_ns = start.elapsed().as_nanos() as u64;
         let avg_ns = total_ns / total_queries as u64;
 
@@ -262,15 +289,23 @@ impl GpuScanner {
             let p0 = flat_results[base..base + PAGE_SIZE_BYTES].to_vec();
             let p1 = flat_results[base + PAGE_SIZE_BYTES..base + 2 * PAGE_SIZE_BYTES].to_vec();
             let p2 = flat_results[base + 2 * PAGE_SIZE_BYTES..base + 3 * PAGE_SIZE_BYTES].to_vec();
-            
+
+            let v_base = i * 3 * 16;
+            let v0 = flat_verifs[v_base..v_base + 16].to_vec();
+            let v1 = flat_verifs[v_base + 16..v_base + 32].to_vec();
+            let v2 = flat_verifs[v_base + 32..v_base + 48].to_vec();
+
             results.push(PirResult {
                 page0: p0,
                 page1: p1,
                 page2: p2,
+                verif0: v0,
+                verif1: v1,
+                verif2: v2,
                 timing: KernelTiming {
                     dpf_eval_ns: 0,
                     xor_accumulate_ns: 0,
-                    total_ns: avg_ns, 
+                    total_ns: avg_ns,
                 },
             });
         }
@@ -304,6 +339,9 @@ pub struct PirResult {
     pub page0: Vec<u8>,
     pub page1: Vec<u8>,
     pub page2: Vec<u8>,
+    pub verif0: Vec<u8>,
+    pub verif1: Vec<u8>,
+    pub verif2: Vec<u8>,
     pub timing: KernelTiming,
 }
 
@@ -370,7 +408,7 @@ pub fn eval_fused_3dpf_cpu(
             let mut acc0 = vec![0u8; PAGE_SIZE_BYTES];
             let mut acc1 = vec![0u8; PAGE_SIZE_BYTES];
             let mut acc2 = vec![0u8; PAGE_SIZE_BYTES];
-            
+
             let tile_start = tile * effective_subtree_size;
             let tile_end = (tile_start + effective_subtree_size).min(num_pages);
             let current_tile_size = tile_end - tile_start;
@@ -381,9 +419,15 @@ pub fn eval_fused_3dpf_cpu(
             let mut masks2 = vec![Seed128::ZERO; effective_subtree_size];
 
             // Note: error handling inside map is tricky, we panic for simplicity in this bench
-            keys[0].eval_subtree(tile_start, &mut masks0).expect("eval_subtree failed");
-            keys[1].eval_subtree(tile_start, &mut masks1).expect("eval_subtree failed");
-            keys[2].eval_subtree(tile_start, &mut masks2).expect("eval_subtree failed");
+            keys[0]
+                .eval_subtree(tile_start, &mut masks0)
+                .expect("eval_subtree failed");
+            keys[1]
+                .eval_subtree(tile_start, &mut masks1)
+                .expect("eval_subtree failed");
+            keys[2]
+                .eval_subtree(tile_start, &mut masks2)
+                .expect("eval_subtree failed");
 
             for i in 0..current_tile_size {
                 let page_idx = tile_start + i;
@@ -392,17 +436,23 @@ pub fn eval_fused_3dpf_cpu(
                 xor_page_masked(&mut acc1, page, &masks1[i]);
                 xor_page_masked(&mut acc2, page, &masks2[i]);
             }
-            
+
             (acc0, acc1, acc2)
         })
         .reduce(
-            || (vec![0u8; PAGE_SIZE_BYTES], vec![0u8; PAGE_SIZE_BYTES], vec![0u8; PAGE_SIZE_BYTES]),
+            || {
+                (
+                    vec![0u8; PAGE_SIZE_BYTES],
+                    vec![0u8; PAGE_SIZE_BYTES],
+                    vec![0u8; PAGE_SIZE_BYTES],
+                )
+            },
             |mut a, b| {
                 xor_pages(&mut a.0, &b.0);
                 xor_pages(&mut a.1, &b.1);
                 xor_pages(&mut a.2, &b.2);
                 a
-            }
+            },
         );
 
     // Note: Timing is less granular with parallelism, we estimate based on total wall time
@@ -412,9 +462,12 @@ pub fn eval_fused_3dpf_cpu(
         page0: acc0,
         page1: acc1,
         page2: acc2,
+        verif0: vec![0u8; 16],
+        verif1: vec![0u8; 16],
+        verif2: vec![0u8; 16],
         timing: KernelTiming {
             dpf_eval_ns: 0, // Not easily measured in parallel
-            xor_accumulate_ns: 0, 
+            xor_accumulate_ns: 0,
             total_ns,
         },
     })
@@ -577,7 +630,7 @@ mod tests {
     fn gpu_fused_3dpf_recovers_all_targets() {
         let scanner = GpuScanner::new(0).expect("Failed to create GpuScanner");
         let device = scanner.device.clone();
-        
+
         let params = crate::dpf::ChaChaParams::new(8).unwrap();
         let targets = [10, 100, 200];
 
@@ -591,7 +644,7 @@ mod tests {
         for p in &pages_data {
             pages_flat.extend_from_slice(p);
         }
-        
+
         let db = GpuPageMatrix::new(device, &pages_flat).expect("Failed to create GpuPageMatrix");
 
         let result0 = unsafe { scanner.scan(&db, [&k0_0, &k1_0, &k2_0]) }.expect("Scan 0 failed");
@@ -599,9 +652,24 @@ mod tests {
 
         // XOR to recover and verify
         for i in 0..PAGE_SIZE_BYTES {
-            assert_eq!(result0.page0[i] ^ result1.page0[i], pages_data[targets[0]][i], "Target 0 mismatch at byte {}", i);
-            assert_eq!(result0.page1[i] ^ result1.page1[i], pages_data[targets[1]][i], "Target 1 mismatch at byte {}", i);
-            assert_eq!(result0.page2[i] ^ result1.page2[i], pages_data[targets[2]][i], "Target 2 mismatch at byte {}", i);
+            assert_eq!(
+                result0.page0[i] ^ result1.page0[i],
+                pages_data[targets[0]][i],
+                "Target 0 mismatch at byte {}",
+                i
+            );
+            assert_eq!(
+                result0.page1[i] ^ result1.page1[i],
+                pages_data[targets[1]][i],
+                "Target 1 mismatch at byte {}",
+                i
+            );
+            assert_eq!(
+                result0.page2[i] ^ result1.page2[i],
+                pages_data[targets[2]][i],
+                "Target 2 mismatch at byte {}",
+                i
+            );
         }
         println!("GPU fused scan verified successfully!");
     }
