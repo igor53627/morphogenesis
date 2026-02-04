@@ -277,15 +277,9 @@ mod tests {
 
     #[test]
     fn storage_key_hashes_to_8_bytes() {
-        use alloy_primitives::keccak256;
-
         let address = [0x11u8; 20];
         let slot = [0x22u8; 32];
-        let mut storage_key = [0u8; 52];
-        storage_key[0..20].copy_from_slice(&address);
-        storage_key[20..52].copy_from_slice(&slot);
-        let expected = keccak256(&storage_key);
-        let expected_tag: [u8; 8] = expected[0..8].try_into().unwrap();
+        let expected_tag = [0x2b, 0xc0, 0xe4, 0x45, 0x3d, 0x02, 0x2b, 0x3e];
 
         let actual = storage_cuckoo_key(address, slot);
         assert_eq!(actual, expected_tag);

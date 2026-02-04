@@ -14,6 +14,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::watch;
 
+/// Type alias for stub GPU scanner (non-CUDA builds).
+type StubGpuScanner = Option<Arc<()>>;
+
+/// Type alias for stub GPU matrix (non-CUDA builds).
+type StubGpuMatrix = Option<Arc<std::sync::Mutex<Option<()>>>>;
+
 #[tokio::main]
 async fn main() {
     // 1. Initialize Telemetry
@@ -22,7 +28,7 @@ async fn main() {
 
     // 2. Configuration (Hardcoded for now, or env vars)
     let config = ServerConfig {
-        environment: Environment::Production,
+        environment: Environment::Prod,
         matrix_size_bytes: 108 * 1024 * 1024 * 1024, // 108GB
         chunk_size_bytes: 1024 * 1024 * 1024,        // 1GB
         row_size_bytes: 4096,                        // Page size
@@ -40,10 +46,10 @@ async fn main() {
         epoch_id: 0,
         matrix,
     };
-    let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
-    let pending = Arc::new(DeltaBuffer::new(config.row_size_bytes));
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(config.row_size_bytes, 0));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending.clone()));
 
-    let (epoch_tx, epoch_rx) = watch::channel(EpochMetadata {
+    let (_epoch_tx, epoch_rx) = watch::channel(EpochMetadata {
         epoch_id: 0,
         num_rows: (config.matrix_size_bytes / config.row_size_bytes),
         seeds: [0x1234, 0x5678, 0x9ABC],
@@ -69,11 +75,10 @@ async fn main() {
     };
 
     #[cfg(not(feature = "cuda"))]
-    let (gpu_scanner, gpu_matrix) = (None, None);
+    let (_gpu_scanner, _gpu_matrix): (StubGpuScanner, StubGpuMatrix) = (None, None);
 
     let state = Arc::new(AppState {
         global: global.clone(),
-        pending,
         row_size_bytes: config.row_size_bytes,
         num_rows: config.matrix_size_bytes / config.row_size_bytes,
         seeds: [0x1234, 0x5678, 0x9ABC],
@@ -92,7 +97,7 @@ async fn main() {
     });
 
     // 5. Epoch Manager (Background worker)
-    let epoch_manager = Arc::new(EpochManager::new(global, config.row_size_bytes).unwrap());
+    let _epoch_manager = Arc::new(EpochManager::new(global, config.row_size_bytes).unwrap());
     // Start merge worker... (omitted for brevity)
 
     // 6. Start Server

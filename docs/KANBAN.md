@@ -79,6 +79,7 @@ Critical fixes for production readiness:
 
 ## [IN PROGRESS]
 
+- [x] TASK-1: Document 8-byte storage cuckoo keys (DATA_STRUCTURES.md)
 - [x] Phase 71f: Optimize CPU `full_eval` to $O(N)$ (GGM tree expansion) - **DONE**
 - [x] Phase 71g: Implement `eval_fused_3dpf_cpu` with $O(N)$ optimization + Rayon - **DONE**
   - Result: **128 GB/s** on hsiao (64 threads)

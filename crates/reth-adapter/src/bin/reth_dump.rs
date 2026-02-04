@@ -1,5 +1,5 @@
 use clap::Parser;
-use reth_adapter::{build_matrix, AccountSource, RowScheme};
+use reth_adapter::{build_matrix, RowScheme};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -65,12 +65,12 @@ fn main() {
         return;
     }
 
-    if let Some(dict_path) = args.extract_code {
+    if let Some(_dict_path) = args.extract_code {
         println!("Mode: EXTRACT CODE");
-        let out_dir = args.output; // Reuse output as directory
+        let _out_dir = args.output; // Reuse output as directory
         #[cfg(feature = "reth")]
         {
-            reth_adapter::extract_code_from_dict(args.db.to_str().unwrap(), &dict_path, &out_dir);
+            reth_adapter::extract_code_from_dict(args.db.to_str().unwrap(), &_dict_path, &_out_dir);
         }
         #[cfg(not(feature = "reth"))]
         {

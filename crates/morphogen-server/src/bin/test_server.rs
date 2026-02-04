@@ -3,10 +3,7 @@
 
 use clap::Parser;
 use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
-use morphogen_server::{
-    network::{create_router, AppState, EpochMetadata, PagePirConfig},
-    Environment, ServerConfig,
-};
+use morphogen_server::network::{create_router, AppState, EpochMetadata};
 use morphogen_storage::ChunkedMatrix;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -60,10 +57,10 @@ async fn main() {
     };
 
     let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
-    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending.clone()));
 
     let seeds = [0x1234, 0x5678, 0x9ABC];
-    let (epoch_tx, epoch_rx) = watch::channel(EpochMetadata {
+    let (_epoch_tx, epoch_rx) = watch::channel(EpochMetadata {
         epoch_id: 1,
         num_rows: num_pages,
         seeds,

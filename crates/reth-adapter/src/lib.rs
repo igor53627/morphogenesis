@@ -1,7 +1,6 @@
 use alloy_primitives::keccak256;
 use morphogen_core::cuckoo::CuckooTable;
-use morphogen_storage::{AlignedMatrix, ChunkedMatrix};
-use std::sync::Arc;
+use morphogen_storage::ChunkedMatrix;
 
 #[cfg(feature = "reth")]
 use alloy_primitives::Address;
@@ -33,6 +32,60 @@ pub trait AccountSource {
             count += 1;
         }
         count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STORAGE_ADDRESS: [u8; 20] = [0x11; 20];
+    const STORAGE_SLOT: [u8; 32] = [0x22; 32];
+    const STORAGE_VALUE: [u8; 32] = [0x33; 32];
+
+    struct SingleStorageSource {
+        consumed: bool,
+    }
+
+    impl SingleStorageSource {
+        fn new() -> Self {
+            Self { consumed: false }
+        }
+    }
+
+    impl AccountSource for SingleStorageSource {
+        fn next_item(&mut self) -> Option<UbtItem> {
+            if self.consumed {
+                return None;
+            }
+            self.consumed = true;
+            Some(UbtItem::Storage {
+                address: STORAGE_ADDRESS,
+                key: STORAGE_SLOT,
+                value: STORAGE_VALUE,
+            })
+        }
+    }
+
+    #[test]
+    fn cuckoo_key_for_storage_matches_keccak_prefix() {
+        let short_key = cuckoo_key_for_storage(&STORAGE_ADDRESS, &STORAGE_SLOT);
+        assert_eq!(short_key.len(), 8);
+
+        let mut storage_key = [0u8; 52];
+        storage_key[0..20].copy_from_slice(&STORAGE_ADDRESS);
+        storage_key[20..52].copy_from_slice(&STORAGE_SLOT);
+        let expected_hash = keccak256(&storage_key);
+        let expected_tag: [u8; 8] = expected_hash[0..8].try_into().unwrap();
+        assert_eq!(short_key.as_slice(), &expected_tag);
+    }
+
+    #[test]
+    fn build_matrix_uses_8_byte_key_for_optimized48_storage() {
+        let mut source = SingleStorageSource::new();
+        let (_matrix, manifest, _indexer) =
+            build_matrix(&mut source, 1024, RowScheme::Optimized48, false);
+        assert_eq!(manifest.item_count, 1);
     }
 }
 
@@ -595,25 +648,27 @@ pub fn build_matrix(
                     key: slot,
                     value,
                 } => {
-                    // Compute 8-byte Cuckoo key from keccak(address || slot)[0..8]
-                    let cuckoo_key = cuckoo_key_for_storage(&address, &slot);
+                    let mut full_key = Vec::with_capacity(52);
+                    full_key.extend_from_slice(&address);
+                    full_key.extend_from_slice(&slot);
 
                     let mut p = vec![0u8; row_size];
 
                     match scheme {
                         RowScheme::Optimized48 => {
                             // [Value (32) | Tag (8) | Pad (8)]
-                            // Tag = same as cuckoo_key (keccak(address || slot)[0..8])
+                            // Tag = keccak(address || slot)[0..8]
+                            let cuckoo_key = cuckoo_key_for_storage(&address, &slot);
                             p[0..32].copy_from_slice(&value);
                             p[32..40].copy_from_slice(&cuckoo_key);
+                            (cuckoo_key, p)
                         }
                         _ => {
-                            // Legacy logic (Compact/Full): just value
+                            // Legacy logic (Compact/Full): keep full 52-byte key
                             p[0..32].copy_from_slice(&value);
+                            (full_key, p)
                         }
                     }
-
-                    (cuckoo_key, p)
                 }
             };
 

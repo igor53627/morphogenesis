@@ -59,7 +59,7 @@ impl SumCheckProver {
             .map(|(d, q)| *d * *q)
             .reduce(|| BinaryField128b::ZERO, |a, b| a + b);
 
-        for round in 0..self.num_vars {
+        for (round, &r) in challenges.iter().enumerate().take(self.num_vars) {
             let n = 1 << (self.num_vars - round - 1);
 
             // Calculate g(0), g(1), g(alpha) in parallel
@@ -99,7 +99,6 @@ impl SumCheckProver {
             });
 
             // Update current_db and current_query (Parallelized folding)
-            let r = challenges[round];
             let one_plus_r = BinaryField128b::ONE + r;
 
             // We fold in-place into the first half of the vectors
@@ -146,8 +145,7 @@ impl SumCheckVerifier {
         let mut expected_sum = sum;
         let alpha = BinaryField128b::new(2);
 
-        for i in 0..num_vars {
-            let poly = &proof.round_polynomials[i];
+        for (i, poly) in proof.round_polynomials.iter().enumerate().take(num_vars) {
             let evals = [
                 BinaryField128b::new(poly.evals[0]),
                 BinaryField128b::new(poly.evals[1]),

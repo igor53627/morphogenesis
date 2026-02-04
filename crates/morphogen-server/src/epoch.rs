@@ -930,10 +930,11 @@ mod tests {
         assert_eq!(next.epoch_id, 6);
     }
 
-    fn make_global_state(epoch_id: u64, _row_size: usize) -> Arc<GlobalState> {
+    fn make_global_state(epoch_id: u64, row_size: usize) -> Arc<GlobalState> {
         let matrix = Arc::new(ChunkedMatrix::new(64, 32));
         let snapshot = EpochSnapshot { epoch_id, matrix };
-        Arc::new(GlobalState::new(Arc::new(snapshot)))
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size, epoch_id));
+        Arc::new(GlobalState::new(Arc::new(snapshot), pending))
     }
 
     #[test]
@@ -1482,10 +1483,11 @@ mod async_tests {
     use std::time::Duration;
     use tokio::sync::watch;
 
-    fn make_global_state(epoch_id: u64, _row_size: usize) -> Arc<GlobalState> {
+    fn make_global_state(epoch_id: u64, row_size: usize) -> Arc<GlobalState> {
         let matrix = Arc::new(ChunkedMatrix::new(64, 32));
         let snapshot = EpochSnapshot { epoch_id, matrix };
-        Arc::new(GlobalState::new(Arc::new(snapshot)))
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size, epoch_id));
+        Arc::new(GlobalState::new(Arc::new(snapshot), pending))
     }
 
     #[tokio::test]

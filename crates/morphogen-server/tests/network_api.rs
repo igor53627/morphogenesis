@@ -35,8 +35,8 @@ fn test_state() -> Arc<AppState> {
         epoch_id: 42,
         matrix,
     };
-    let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
     let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending.clone()));
 
     let initial = EpochMetadata {
         epoch_id: 42,
@@ -48,7 +48,6 @@ fn test_state() -> Arc<AppState> {
     let (_tx, rx) = watch::channel(initial);
     Arc::new(AppState {
         global,
-        pending,
         row_size_bytes,
         num_rows: 100_000,
         seeds: [0x1234, 0x5678, 0x9ABC],
@@ -205,8 +204,8 @@ mod epoch {
                 epoch_id: 42,
                 matrix,
             };
-            let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
             let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
+            let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending.clone()));
 
             let initial = EpochMetadata {
                 epoch_id: 42,
@@ -218,7 +217,6 @@ mod epoch {
             let (_tx, rx) = watch::channel(initial);
             Arc::new(AppState {
                 global,
-                pending,
                 row_size_bytes,
                 num_rows: 100_000,
                 seeds: [0x1234, 0x5678, 0x9ABC],
@@ -351,8 +349,8 @@ mod query {
             epoch_id: 999,
             matrix,
         };
-        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
         let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 999));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending.clone()));
 
         let initial = EpochMetadata {
             epoch_id: 999,
@@ -364,7 +362,6 @@ mod query {
         let (_tx, rx) = watch::channel(initial);
         let state = Arc::new(AppState {
             global,
-            pending,
             row_size_bytes,
             num_rows: 1000,
             seeds: [1, 2, 3],
@@ -417,8 +414,8 @@ mod websocket_epoch {
             epoch_id: 42,
             matrix,
         };
-        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
         let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending.clone()));
 
         let initial = EpochMetadata {
             epoch_id: 42,
@@ -430,7 +427,6 @@ mod websocket_epoch {
         let (tx, rx) = watch::channel(initial);
         let state = Arc::new(AppState {
             global,
-            pending,
             row_size_bytes,
             num_rows: 100_000,
             seeds: [0x1234, 0x5678, 0x9ABC],
@@ -656,8 +652,8 @@ mod page_query {
             epoch_id: 42,
             matrix,
         };
-        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
         let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending.clone()));
 
         let params = PageDpfParams::new(8).unwrap();
         let page_config = PagePirConfig {
@@ -676,7 +672,6 @@ mod page_query {
         let (_tx, rx) = watch::channel(initial);
         let state = Arc::new(AppState {
             global,
-            pending,
             row_size_bytes,
             num_rows: num_pages * 16,
             seeds: [0x1234, 0x5678, 0x9ABC],
@@ -831,8 +826,8 @@ mod page_query {
             epoch_id: 42,
             matrix,
         };
-        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
         let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending.clone()));
 
         // Server uses these PRG keys
         let server_prg_keys = [[0xAA; 16], [0xBB; 16]];
@@ -852,7 +847,6 @@ mod page_query {
         let (_tx, rx) = watch::channel(initial);
         let state = Arc::new(AppState {
             global,
-            pending,
             row_size_bytes,
             num_rows: num_pages * 16,
             seeds: [0x1234, 0x5678, 0x9ABC],
@@ -1107,7 +1101,6 @@ mod gpu_query {
     use axum::body::Body;
     use axum::http::{header, Method, Request, StatusCode};
     use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
-    use morphogen_server::network::PagePirConfig;
     use tower::util::ServiceExt;
 
     // We can reuse test_state_with_pages from page_query module but we need to re-implement it
@@ -1135,8 +1128,8 @@ mod gpu_query {
             epoch_id: 42,
             matrix,
         };
-        let global = Arc::new(GlobalState::new(Arc::new(snapshot)));
         let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending.clone()));
 
         let initial = EpochMetadata {
             epoch_id: 42,
@@ -1148,7 +1141,6 @@ mod gpu_query {
         let (_tx, rx) = watch::channel(initial);
         Arc::new(AppState {
             global,
-            pending,
             row_size_bytes,
             num_rows: num_pages * 16,
             seeds: [0x1234, 0x5678, 0x9ABC],

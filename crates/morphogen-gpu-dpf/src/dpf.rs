@@ -168,7 +168,7 @@ impl ChaChaKey {
                 "Subtree size must be power of 2",
             ));
         }
-        if start % subtree_size != 0 {
+        if !start.is_multiple_of(subtree_size) {
             return Err(GpuDpfError::InvalidKeyFormat(
                 "Start index must be aligned to subtree size",
             ));

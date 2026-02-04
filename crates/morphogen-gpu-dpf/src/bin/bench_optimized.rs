@@ -34,7 +34,10 @@ fn main() {
     println!("╚════════════════════════════════════════════════════════════════════╝");
     println!();
     println!("Configuration:");
-    println!("  Domain:        {} bits ({} pages)", domain_bits, num_pages);
+    println!(
+        "  Domain:        {} bits ({} pages)",
+        domain_bits, num_pages
+    );
     println!("  Data Size:     {:.2} GB", size_gb);
     println!();
 
@@ -69,8 +72,10 @@ fn main() {
 
         println!("┌─────────┬────────────────────┬────────────────────┬────────────────┐");
         println!("│         │ Original           │ Optimized v1       │ Speedup        │");
-        println!("│ {:>7} │ {:>8} {:>8} │ {:>8} {:>8} │ {:>14} │",
-                 "Batch", "Lat(ms)", "GB/s", "Lat(ms)", "GB/s", "");
+        println!(
+            "│ {:>7} │ {:>8} {:>8} │ {:>8} {:>8} │ {:>14} │",
+            "Batch", "Lat(ms)", "GB/s", "Lat(ms)", "GB/s", ""
+        );
         println!("├─────────┼────────────────────┼────────────────────┼────────────────┤");
 
         for &batch_size in &batch_sizes {
@@ -91,18 +96,22 @@ fn main() {
             let orig_bw = size_gb * batch_size as f64 / (orig_lat / 1000.0);
 
             // Benchmark v1
-            let (v1_lat, v1_bw, speedup) = if unsafe { scanner.scan_batch_optimized(&gpu_db, &queries) }.is_ok() {
-                let start = Instant::now();
-                for _ in 0..iterations {
-                    unsafe { scanner.scan_batch_optimized(&gpu_db, &queries) }.unwrap();
-                }
-                let lat = start.elapsed().as_secs_f64() * 1000.0 / iterations as f64;
-                let bw = size_gb * batch_size as f64 / (lat / 1000.0);
-                let sp = orig_lat / lat;
-                (lat, bw, format!("{:.2}×", sp))
-            } else { (0.0, 0.0, "N/A".to_string()) };
+            let (v1_lat, v1_bw, speedup) =
+                if unsafe { scanner.scan_batch_optimized(&gpu_db, &queries) }.is_ok() {
+                    let start = Instant::now();
+                    for _ in 0..iterations {
+                        unsafe { scanner.scan_batch_optimized(&gpu_db, &queries) }.unwrap();
+                    }
+                    let lat = start.elapsed().as_secs_f64() * 1000.0 / iterations as f64;
+                    let bw = size_gb * batch_size as f64 / (lat / 1000.0);
+                    let sp = orig_lat / lat;
+                    (lat, bw, format!("{:.2}×", sp))
+                } else {
+                    (0.0, 0.0, "N/A".to_string())
+                };
 
-            println!("│ {:>7} │ {:>8.2} {:>8.0} │ {:>8.2} {:>8.0} │ {:>14} │",
+            println!(
+                "│ {:>7} │ {:>8.2} {:>8.0} │ {:>8.2} {:>8.0} │ {:>14} │",
                 batch_size, orig_lat, orig_bw, v1_lat, v1_bw, speedup
             );
         }

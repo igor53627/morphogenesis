@@ -432,11 +432,7 @@ impl PageDpfKey {
     /// * `chunk_size` - Number of DPF evaluations per chunk (e.g., 4096)
     ///
     /// Returns a response page where only the target page's data survives the masking.
-    pub fn eval_and_accumulate_chunked<'a>(
-        &self,
-        pages: &[&'a [u8]],
-        chunk_size: usize,
-    ) -> Vec<u8> {
+    pub fn eval_and_accumulate_chunked(&self, pages: &[&[u8]], chunk_size: usize) -> Vec<u8> {
         use fss_rs::dpf::Dpf;
         use fss_rs::group::Group;
 
@@ -504,9 +500,9 @@ impl PageDpfKey {
     /// Instrumented version of eval_and_accumulate_chunked that returns timing breakdown.
     ///
     /// Use this to measure bottleneck split between DPF evaluation and XOR accumulation.
-    pub fn eval_and_accumulate_chunked_timed<'a>(
+    pub fn eval_and_accumulate_chunked_timed(
         &self,
-        pages: &[&'a [u8]],
+        pages: &[&[u8]],
         chunk_size: usize,
     ) -> EvalTiming {
         use fss_rs::dpf::Dpf;

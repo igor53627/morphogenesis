@@ -1,8 +1,7 @@
 #[cfg(test)]
 mod tests {
     use binius_field::{BinaryField128b, Field};
-    use morphogen_core::sumcheck::{SumCheckProof, SumCheckProver, SumCheckVerifier};
-    use rand::thread_rng;
+    use morphogen_core::sumcheck::{SumCheckProver, SumCheckVerifier};
 
     #[test]
     fn test_client_verification_logic() {
@@ -65,9 +64,9 @@ mod tests {
             }
         }
 
-        let final_d = db_eval[0];
-        let final_q = query_eval[0];
-        let final_g = proof.round_polynomials.last().unwrap().evals[1]; // g(1)? No, we need g(r_last)
+        let _final_d = db_eval[0];
+        let _final_q = query_eval[0];
+        let _final_g = proof.round_polynomials.last().unwrap().evals[1]; // g(1)? No, we need g(r_last)
 
         // The verifier checks the reduction. The *final* check is implicit in the return value?
         // Wait, SumCheckVerifier::verify returns bool based on consistency.

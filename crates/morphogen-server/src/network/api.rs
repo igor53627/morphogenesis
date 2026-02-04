@@ -17,9 +17,9 @@ use axum::{
     Router,
 };
 #[cfg(feature = "metrics")]
-use metrics::{counter, histogram};
+use metrics::counter;
 #[cfg(feature = "tracing")]
-use tracing::{error, info, instrument};
+use tracing::instrument;
 
 use morphogen_core::{sumcheck::SumCheckProof, GlobalState};
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,76 @@ pub struct EpochMetadata {
     pub state_root: [u8; 32],
 }
 
-// ... existing code ...
+#[derive(Clone)]
+pub struct PagePirConfig {
+    pub domain_bits: usize,
+    pub rows_per_page: usize,
+    pub prg_keys: [[u8; 16]; 2],
+}
+
+#[derive(Clone)]
+pub struct AppState {
+    pub global: Arc<GlobalState>,
+    pub row_size_bytes: usize,
+    pub num_rows: usize,
+    pub seeds: [u64; 3],
+    pub block_number: u64,
+    pub state_root: [u8; 32],
+    pub epoch_rx: watch::Receiver<EpochMetadata>,
+    pub page_config: Option<PagePirConfig>,
+    #[cfg(feature = "cuda")]
+    pub gpu_scanner: Option<Arc<morphogen_gpu_dpf::kernel::GpuScanner>>,
+    #[cfg(feature = "cuda")]
+    pub gpu_matrix:
+        Option<Arc<std::sync::Mutex<Option<morphogen_gpu_dpf::storage::GpuPageMatrix>>>>,
+}
+
+#[derive(Serialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub epoch_id: u64,
+    pub block_number: u64,
+}
+
+#[derive(Deserialize)]
+pub struct StorageProofRequest {
+    #[serde(default, deserialize_with = "hex_bytes::deserialize_option")]
+    pub state_root: Option<[u8; 32]>,
+}
+
+#[derive(Serialize)]
+pub struct PagePirResponse {
+    pub domain_bits: usize,
+    pub rows_per_page: usize,
+    pub num_pages: usize,
+    #[serde(with = "hex_bytes_array")]
+    pub prg_keys: [[u8; 16]; 2],
+}
+
+#[derive(Serialize)]
+pub struct EpochMetadataResponse {
+    pub epoch_id: u64,
+    pub num_rows: usize,
+    pub seeds: [u64; 3],
+    pub block_number: u64,
+    #[serde(with = "hex_bytes")]
+    pub state_root: [u8; 32],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_pir: Option<PagePirResponse>,
+}
+
+#[derive(Deserialize)]
+pub struct QueryRequest {
+    #[serde(with = "hex_bytes_vec")]
+    pub keys: Vec<Vec<u8>>,
+}
+
+#[derive(Serialize)]
+pub struct QueryResponse {
+    pub epoch_id: u64,
+    #[serde(with = "hex_bytes_vec")]
+    pub payloads: Vec<Vec<u8>>,
+}
 
 /// Page-level PIR query response.
 ///
@@ -52,7 +121,86 @@ pub struct PageQueryResponse {
     pub proof: Option<SumCheckProof>,
 }
 
-// ... existing code ...
+#[derive(Deserialize)]
+pub struct PageQueryRequest {
+    #[serde(with = "hex_bytes_vec")]
+    pub keys: Vec<Vec<u8>>,
+}
+
+#[derive(Deserialize)]
+pub struct GpuPageQueryRequest {
+    #[serde(with = "hex_bytes_vec")]
+    pub keys: Vec<Vec<u8>>,
+}
+
+#[derive(Deserialize)]
+pub struct AdminSnapshotRequest {
+    #[serde(alias = "url")]
+    pub r2_url: String,
+}
+
+mod hex_bytes {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!("0x{}", hex::encode(bytes)))
+    }
+
+    pub fn deserialize_option<'de, D>(deserializer: D) -> Result<Option<[u8; 32]>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        match opt {
+            Some(s) => {
+                let hex_str = s.strip_prefix("0x").unwrap_or(&s);
+                let bytes = hex::decode(hex_str).map_err(serde::de::Error::custom)?;
+                if bytes.len() != 32 {
+                    return Err(serde::de::Error::custom(format!(
+                        "expected 32 bytes, got {}",
+                        bytes.len()
+                    )));
+                }
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&bytes);
+                Ok(Some(out))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+mod hex_bytes_vec {
+    use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S>(bytes: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded: Vec<String> = bytes
+            .iter()
+            .map(|b| format!("0x{}", hex::encode(b)))
+            .collect();
+        encoded.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let items: Vec<String> = Vec::deserialize(deserializer)?;
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let hex_str = item.strip_prefix("0x").unwrap_or(&item);
+            let bytes = hex::decode(hex_str).map_err(serde::de::Error::custom)?;
+            out.push(bytes);
+        }
+        Ok(out)
+    }
+}
 
 mod hex_bytes_array {
     use serde::{self, Serializer};
@@ -95,6 +243,15 @@ pub async fn epoch_handler(State(state): State<Arc<AppState>>) -> Json<EpochMeta
         state_root: state.state_root,
         page_pir,
     })
+}
+
+#[cfg_attr(feature = "tracing", instrument(skip(state, request)))]
+pub async fn admin_snapshot_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<AdminSnapshotRequest>,
+) -> Result<StatusCode, StatusCode> {
+    let _ = (state, request);
+    Ok(StatusCode::NOT_IMPLEMENTED)
 }
 
 fn scan_error_to_status(e: crate::scan::ScanError) -> StatusCode {
@@ -238,6 +395,7 @@ pub async fn page_query_handler(
     Ok(Json(PageQueryResponse {
         epoch_id,
         pages: results.to_vec(),
+        proof: None,
     }))
 }
 
