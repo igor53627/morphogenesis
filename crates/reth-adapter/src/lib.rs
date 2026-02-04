@@ -38,6 +38,7 @@ pub trait AccountSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use morphogen_core::cuckoo::CuckooAddresser;
 
     const STORAGE_ADDRESS: [u8; 20] = [0x11; 20];
     const STORAGE_SLOT: [u8; 32] = [0x22; 32];
@@ -83,9 +84,50 @@ mod tests {
     #[test]
     fn build_matrix_uses_8_byte_key_for_optimized48_storage() {
         let mut source = SingleStorageSource::new();
-        let (_matrix, manifest, _indexer) =
+        let (matrix, manifest, _indexer) =
             build_matrix(&mut source, 1024, RowScheme::Optimized48, false);
         assert_eq!(manifest.item_count, 1);
+
+        let expected_key = cuckoo_key_for_storage(&STORAGE_ADDRESS, &STORAGE_SLOT);
+        let addresser = CuckooAddresser::with_seeds(
+            1024,
+            [0x1234_5678, 0x9ABC_DEF0, 0xFEDC_BA98],
+        );
+        let short_indices = addresser.hash_indices(&expected_key);
+
+        let mut storage_key = [0u8; 52];
+        storage_key[0..20].copy_from_slice(&STORAGE_ADDRESS);
+        storage_key[20..52].copy_from_slice(&STORAGE_SLOT);
+        let long_indices = addresser.hash_indices(&storage_key);
+
+        let mut expected_payload = vec![0u8; 48];
+        expected_payload[0..32].copy_from_slice(&STORAGE_VALUE);
+        let tag_hash = keccak256(&storage_key);
+        expected_payload[32..40].copy_from_slice(&tag_hash[0..8]);
+
+        let chunk = matrix.chunk(0);
+        let chunk_slice = chunk.as_slice();
+        let row_size = 48;
+        let row_at = |row: usize| -> &[u8] {
+            let offset = row * row_size;
+            &chunk_slice[offset..offset + row_size]
+        };
+
+        let found_short = short_indices
+            .iter()
+            .any(|&idx| row_at(idx) == expected_payload.as_slice());
+        assert!(found_short, "expected 8-byte cuckoo key to be indexed");
+
+        let long_only = long_indices
+            .iter()
+            .filter(|idx| !short_indices.contains(idx));
+        for &idx in long_only {
+            assert_ne!(
+                row_at(idx),
+                expected_payload.as_slice(),
+                "unexpected payload at 52-byte key index"
+            );
+        }
     }
 }
 

@@ -59,7 +59,7 @@ impl SumCheckProver {
             .map(|(d, q)| *d * *q)
             .reduce(|| BinaryField128b::ZERO, |a, b| a + b);
 
-        for (round, &r) in challenges.iter().enumerate().take(self.num_vars) {
+        for (round, &r) in challenges.iter().enumerate() {
             let n = 1 << (self.num_vars - round - 1);
 
             // Calculate g(0), g(1), g(alpha) in parallel
@@ -138,14 +138,14 @@ impl SumCheckVerifier {
         proof: &SumCheckProof,
         challenges: &[BinaryField128b],
     ) -> bool {
-        if proof.round_polynomials.len() != num_vars {
+        if proof.round_polynomials.len() != num_vars || challenges.len() != num_vars {
             return false;
         }
 
         let mut expected_sum = sum;
         let alpha = BinaryField128b::new(2);
 
-        for (i, poly) in proof.round_polynomials.iter().enumerate().take(num_vars) {
+        for (i, poly) in proof.round_polynomials.iter().enumerate() {
             let evals = [
                 BinaryField128b::new(poly.evals[0]),
                 BinaryField128b::new(poly.evals[1]),
