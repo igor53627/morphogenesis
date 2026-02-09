@@ -1,8 +1,10 @@
+mod block_cache;
 mod code_resolver;
 mod evm;
 mod pir_db;
 
 use anyhow::Result;
+use block_cache::BlockCache;
 use clap::Parser;
 use code_resolver::CodeResolver;
 use jsonrpsee::server::{RpcModule, Server};
@@ -12,6 +14,7 @@ use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -60,19 +63,20 @@ struct AdapterState {
     http_client: reqwest::Client,
     pir_client: Arc<PirClient>,
     code_resolver: Arc<CodeResolver>,
+    block_cache: Arc<RwLock<BlockCache>>,
 }
 
 const PASSTHROUGH_METHODS: &[&str] = &[
     "eth_blockNumber",
     "eth_chainId",
     "eth_gasPrice",
-    "eth_estimateGas",
     "eth_sendRawTransaction",
     "net_version",
     "web3_clientVersion",
     // Wallet Essentials (History & Status)
-    "eth_getTransactionByHash",
-    "eth_getTransactionReceipt",
+    // NOTE: eth_getTransactionByHash and eth_getTransactionReceipt are now
+    // served from local block cache (private) with upstream fallback
+    // NOTE: eth_estimateGas is now private via local EVM execution
     "eth_getBlockByNumber",
     "eth_getBlockByHash",
     "eth_feeHistory",
@@ -118,12 +122,22 @@ async fn main() -> Result<()> {
         .connect_timeout(Duration::from_secs(5))
         .build()?;
 
+    let block_cache = Arc::new(RwLock::new(BlockCache::new()));
+
     let state = Arc::new(AdapterState {
         args: args.clone(),
         http_client,
         pir_client,
         code_resolver,
+        block_cache: block_cache.clone(),
     });
+
+    // Background task for block cache polling
+    block_cache::start_block_poller(
+        block_cache,
+        state.http_client.clone(),
+        args.upstream.clone(),
+    );
 
     // Background task for metadata refresh
     let state_clone = state.clone();
@@ -311,8 +325,15 @@ async fn main() -> Result<()> {
         })?;
 
         let mut slot = [0u8; 32];
-        // Pad slot to 32 bytes if shorter
-        let slot_bytes = hex::decode(slot_hex).map_err(|e| {
+        // Pad odd-length hex with leading zero for valid decoding
+        let slot_hex_padded;
+        let slot_hex_final = if slot_hex.len() % 2 != 0 {
+            slot_hex_padded = format!("0{}", slot_hex);
+            &slot_hex_padded
+        } else {
+            slot_hex
+        };
+        let slot_bytes = hex::decode(slot_hex_final).map_err(|e| {
             ErrorObjectOwned::owned(-32602, format!("Invalid slot: {}", e), None::<()>)
         })?;
         if slot_bytes.len() > 32 {
@@ -416,6 +437,136 @@ async fn main() -> Result<()> {
         }
     })?;
 
+    // Register eth_estimateGas (Private via local EVM execution)
+    module.register_async_method("eth_estimateGas", |params, state, _| async move {
+        let raw: Vec<Value> = params.parse()?;
+        if raw.is_empty() || raw.len() > 2 {
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                format!("expected 1-2 params, got {}", raw.len()),
+                None::<()>,
+            ));
+        }
+        let call_params = &raw[0];
+        let block = raw
+            .get(1)
+            .cloned()
+            .unwrap_or(Value::String("latest".into()));
+
+        info!("Private eth_estimateGas via local EVM");
+
+        match evm::execute_eth_estimate_gas(
+            Arc::clone(&state.pir_client),
+            Arc::clone(&state.code_resolver),
+            state.http_client.clone(),
+            state.args.upstream.clone(),
+            call_params,
+            &block,
+        )
+        .await
+        {
+            Ok(gas) => {
+                Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", gas)))
+            }
+            Err(evm::EthCallError::InvalidParams(msg)) => {
+                Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
+            }
+            Err(evm::EthCallError::Internal(e)) => {
+                error!("Private eth_estimateGas failed: {}", e);
+                if state.args.fallback_to_upstream {
+                    warn!("Falling back to upstream for eth_estimateGas (privacy degraded)");
+                    let params = serde_json::json!([call_params, block]);
+                    return proxy_to_upstream(
+                        &state.args.upstream,
+                        &state.http_client,
+                        "eth_estimateGas",
+                        params,
+                    )
+                    .await;
+                }
+                Err(ErrorObjectOwned::owned(
+                    -32000,
+                    format!("eth_estimateGas failed: {}", e),
+                    None::<()>,
+                ))
+            }
+        }
+    })?;
+
+    // Register eth_getTransactionByHash (Private via block cache, upstream fallback)
+    module.register_async_method("eth_getTransactionByHash", |params, state, _| async move {
+        let (hash_str,): (String,) = params.parse()?;
+        let hash_hex = hash_str.strip_prefix("0x").unwrap_or(&hash_str);
+        let hash_bytes = hex::decode(hash_hex).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("Invalid tx hash: {}", e), None::<()>)
+        })?;
+        if hash_bytes.len() != 32 {
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                format!("expected 32-byte tx hash, got {} bytes", hash_bytes.len()),
+                None::<()>,
+            ));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&hash_bytes);
+
+        // Check local cache first (private)
+        {
+            let cache = state.block_cache.read().await;
+            if let Some(tx) = cache.get_transaction(&hash) {
+                info!("Serving eth_getTransactionByHash from cache (private)");
+                return Ok::<Value, ErrorObjectOwned>(tx.clone());
+            }
+        }
+
+        // Cache miss: fall through to upstream (historical tx)
+        info!("Proxying eth_getTransactionByHash to upstream (not in cache)");
+        proxy_to_upstream(
+            &state.args.upstream,
+            &state.http_client,
+            "eth_getTransactionByHash",
+            serde_json::json!([hash_str]),
+        )
+        .await
+    })?;
+
+    // Register eth_getTransactionReceipt (Private via block cache, upstream fallback)
+    module.register_async_method("eth_getTransactionReceipt", |params, state, _| async move {
+        let (hash_str,): (String,) = params.parse()?;
+        let hash_hex = hash_str.strip_prefix("0x").unwrap_or(&hash_str);
+        let hash_bytes = hex::decode(hash_hex).map_err(|e| {
+            ErrorObjectOwned::owned(-32602, format!("Invalid tx hash: {}", e), None::<()>)
+        })?;
+        if hash_bytes.len() != 32 {
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                format!("expected 32-byte tx hash, got {} bytes", hash_bytes.len()),
+                None::<()>,
+            ));
+        }
+        let mut hash = [0u8; 32];
+        hash.copy_from_slice(&hash_bytes);
+
+        // Check local cache first (private)
+        {
+            let cache = state.block_cache.read().await;
+            if let Some(receipt) = cache.get_receipt(&hash) {
+                info!("Serving eth_getTransactionReceipt from cache (private)");
+                return Ok::<Value, ErrorObjectOwned>(receipt.clone());
+            }
+        }
+
+        // Cache miss: fall through to upstream (historical tx)
+        info!("Proxying eth_getTransactionReceipt to upstream (not in cache)");
+        proxy_to_upstream(
+            &state.args.upstream,
+            &state.http_client,
+            "eth_getTransactionReceipt",
+            serde_json::json!([hash_str]),
+        )
+        .await
+    })?;
+
     // Register passthrough methods
     for method in PASSTHROUGH_METHODS {
         let method_name = method.to_string();
@@ -510,6 +661,9 @@ mod tests {
         // Verify private methods are NOT in passthrough
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_getStorageAt"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_call"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_estimateGas"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_getTransactionByHash"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_getTransactionReceipt"));
 
         // Verify eth_getProof is still passthrough
         assert!(PASSTHROUGH_METHODS.contains(&"eth_getProof"));

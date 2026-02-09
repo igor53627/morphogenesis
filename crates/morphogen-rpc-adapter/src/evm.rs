@@ -27,7 +27,6 @@ struct BlockInfo {
     number: u64,
     timestamp: u64,
     gas_limit: u64,
-    basefee: u64,
 }
 
 /// Known named block tags per Ethereum JSON-RPC specification.
@@ -114,39 +113,24 @@ async fn fetch_block_info(
         u64::from_str_radix(hex, 16).map_err(|e| format!("invalid block field '{}': {}", field, e))
     };
 
-    // baseFeePerGas may be absent on pre-London blocks; default to 0 only if missing
-    let basefee = match result.get("baseFeePerGas") {
-        None => 0,
-        Some(v) => {
-            let s = v
-                .as_str()
-                .ok_or("baseFeePerGas: expected hex string")?;
-            let hex = s.strip_prefix("0x").unwrap_or(s);
-            u64::from_str_radix(hex, 16)
-                .map_err(|e| format!("invalid baseFeePerGas: {}", e))?
-        }
-    };
-
     Ok(BlockInfo {
         number: parse_hex_u64("number")?,
         timestamp: parse_hex_u64("timestamp")?,
         gas_limit: parse_hex_u64("gasLimit")?,
-        basefee,
     })
 }
 
-/// Execute an eth_call privately using revm with PIR-backed state.
-/// All account, storage, and code lookups go through PIR so the
-/// server never learns which addresses/slots are being accessed.
-pub async fn execute_eth_call(
-    pir_client: Arc<PirClient>,
-    code_resolver: Arc<CodeResolver>,
-    upstream_client: reqwest::Client,
-    upstream_url: String,
-    call_params: &Value,
-    block_tag: &Value,
-) -> Result<Bytes, EthCallError> {
-    // Parse call parameters before moving into blocking task
+/// Parsed call parameters for EVM execution.
+struct CallParams {
+    from: Address,
+    to: Option<Address>,
+    data: Bytes,
+    value: U256,
+    gas: u64,
+}
+
+/// Parse and validate call parameters from JSON-RPC input.
+fn parse_call_params(call_params: &Value) -> Result<CallParams, EthCallError> {
     let from = parse_address_strict(call_params.get("from"))
         .map_err(|e| EthCallError::InvalidParams(format!("invalid 'from': {}", e)))?
         .unwrap_or_default();
@@ -159,27 +143,38 @@ pub async fn execute_eth_call(
     let gas = parse_u64_strict(call_params.get("gas"))
         .map_err(|e| EthCallError::InvalidParams(format!("invalid 'gas': {}", e)))?
         .unwrap_or(30_000_000);
+    Ok(CallParams { from, to, data, value, gas })
+}
 
-    // Validate block tag early so input errors get the right error code
+/// Run EVM execution and return the raw ExecutionResult.
+/// Sets basefee=0 for simulation so calls with gas_price=0 don't fail
+/// (matches Geth's behavior for eth_call/eth_estimateGas).
+async fn run_evm(
+    pir_client: Arc<PirClient>,
+    code_resolver: Arc<CodeResolver>,
+    upstream_client: reqwest::Client,
+    upstream_url: String,
+    call_params: &Value,
+    block_tag: &Value,
+) -> Result<(ExecutionResult, CallParams), EthCallError> {
+    let parsed = parse_call_params(call_params)?;
+
     let validated_tag = validate_block_tag(block_tag)
         .map_err(EthCallError::InvalidParams)?;
 
-    // Fetch block env from upstream so NUMBER/TIMESTAMP/BASEFEE are accurate
     let block_info = fetch_block_info(&upstream_client, &upstream_url, &validated_tag)
         .await
         .map_err(EthCallError::Internal)?;
 
-    info!(
-        %from,
-        to = ?to,
-        data_len = data.len(),
-        block = block_info.number,
-        "Executing private eth_call via revm"
-    );
+    let from = parsed.from;
+    let to = parsed.to;
+    let data = parsed.data.clone();
+    let value = parsed.value;
+    let gas = parsed.gas;
 
     let handle = Handle::current();
 
-    tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         let pir_db = PirDatabase::new(
             pir_client,
             code_resolver,
@@ -206,7 +201,9 @@ pub async fn execute_eth_call(
                 b.number = U256::from(block_info.number);
                 b.timestamp = U256::from(block_info.timestamp);
                 b.gas_limit = block_info.gas_limit;
-                b.basefee = block_info.basefee;
+                // Set basefee=0 for simulation so calls with gas_price=0 don't fail
+                // with GasPriceLessThanBasefee. Matches Geth's eth_call behavior.
+                b.basefee = 0;
             })
             .build_mainnet();
 
@@ -214,22 +211,77 @@ pub async fn execute_eth_call(
             .transact(tx)
             .map_err(|e| EthCallError::Internal(format!("EVM execution failed: {:?}", e)))?;
 
-        match result.result {
-            ExecutionResult::Success { output, .. } => match output {
-                Output::Call(data) => Ok(data),
-                Output::Create(data, _) => Ok(data),
-            },
-            ExecutionResult::Revert { output, .. } => Err(EthCallError::Internal(format!(
-                "execution reverted: 0x{}",
-                hex::encode(&output)
-            ))),
-            ExecutionResult::Halt { reason, .. } => {
-                Err(EthCallError::Internal(format!("execution halted: {:?}", reason)))
-            }
-        }
+        Ok(result.result)
     })
     .await
-    .map_err(|e| EthCallError::Internal(format!("spawn_blocking: {}", e)))?
+    .map_err(|e| EthCallError::Internal(format!("spawn_blocking: {}", e)))??;
+
+    Ok((result, parsed))
+}
+
+/// Execute an eth_call privately using revm with PIR-backed state.
+/// All account, storage, and code lookups go through PIR so the
+/// server never learns which addresses/slots are being accessed.
+pub async fn execute_eth_call(
+    pir_client: Arc<PirClient>,
+    code_resolver: Arc<CodeResolver>,
+    upstream_client: reqwest::Client,
+    upstream_url: String,
+    call_params: &Value,
+    block_tag: &Value,
+) -> Result<Bytes, EthCallError> {
+    info!("Executing private eth_call via revm");
+
+    let (result, _) = run_evm(
+        pir_client, code_resolver, upstream_client, upstream_url,
+        call_params, block_tag,
+    ).await?;
+
+    match result {
+        ExecutionResult::Success { output, .. } => match output {
+            Output::Call(data) => Ok(data),
+            Output::Create(data, _) => Ok(data),
+        },
+        ExecutionResult::Revert { output, .. } => Err(EthCallError::Internal(format!(
+            "execution reverted: 0x{}",
+            hex::encode(&output)
+        ))),
+        ExecutionResult::Halt { reason, .. } => {
+            Err(EthCallError::Internal(format!("execution halted: {:?}", reason)))
+        }
+    }
+}
+
+/// Execute an eth_estimateGas privately using revm with PIR-backed state.
+/// Returns gas_used with a 20% safety margin (standard practice, matches Geth).
+pub async fn execute_eth_estimate_gas(
+    pir_client: Arc<PirClient>,
+    code_resolver: Arc<CodeResolver>,
+    upstream_client: reqwest::Client,
+    upstream_url: String,
+    call_params: &Value,
+    block_tag: &Value,
+) -> Result<u64, EthCallError> {
+    info!("Executing private eth_estimateGas via revm");
+
+    let (result, _) = run_evm(
+        pir_client, code_resolver, upstream_client, upstream_url,
+        call_params, block_tag,
+    ).await?;
+
+    match result {
+        ExecutionResult::Success { gas_used, .. } => {
+            // 20% safety margin, standard practice
+            Ok(gas_used * 120 / 100)
+        }
+        ExecutionResult::Revert { output, .. } => Err(EthCallError::Internal(format!(
+            "execution reverted: 0x{}",
+            hex::encode(&output)
+        ))),
+        ExecutionResult::Halt { reason, .. } => {
+            Err(EthCallError::Internal(format!("execution halted: {:?}", reason)))
+        }
+    }
 }
 
 /// Parse an address field. Returns Ok(None) if absent, Err if present but invalid.
