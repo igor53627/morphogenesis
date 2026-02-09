@@ -325,6 +325,14 @@ async fn main() -> Result<()> {
         })?;
 
         let mut slot = [0u8; 32];
+        // Reject oversized input before decoding (max 64 hex chars = 32 bytes)
+        if slot_hex.len() > 64 {
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                "Slot too long (max 32 bytes)".to_string(),
+                None::<()>,
+            ));
+        }
         // Pad odd-length hex with leading zero for valid decoding
         let slot_hex_padded;
         let slot_hex_final = if slot_hex.len() % 2 != 0 {
@@ -336,13 +344,6 @@ async fn main() -> Result<()> {
         let slot_bytes = hex::decode(slot_hex_final).map_err(|e| {
             ErrorObjectOwned::owned(-32602, format!("Invalid slot: {}", e), None::<()>)
         })?;
-        if slot_bytes.len() > 32 {
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                "Slot too long (max 32 bytes)".to_string(),
-                None::<()>,
-            ));
-        }
         // Copy to the end of the array (big-endian padding)
         let offset = 32 - slot_bytes.len();
         slot[offset..].copy_from_slice(&slot_bytes);
@@ -439,11 +440,14 @@ async fn main() -> Result<()> {
 
     // Register eth_estimateGas (Private via local EVM execution)
     module.register_async_method("eth_estimateGas", |params, state, _| async move {
+        // Accept 1-3 params: (call_obj, [block_tag], [state_overrides])
+        // State overrides (3rd param) are not supported locally but we accept
+        // and ignore them to avoid breaking clients that send them.
         let raw: Vec<Value> = params.parse()?;
-        if raw.is_empty() || raw.len() > 2 {
+        if raw.is_empty() || raw.len() > 3 {
             return Err(ErrorObjectOwned::owned(
                 -32602,
-                format!("expected 1-2 params, got {}", raw.len()),
+                format!("expected 1-3 params, got {}", raw.len()),
                 None::<()>,
             ));
         }
@@ -496,19 +500,9 @@ async fn main() -> Result<()> {
     // Register eth_getTransactionByHash (Private via block cache, upstream fallback)
     module.register_async_method("eth_getTransactionByHash", |params, state, _| async move {
         let (hash_str,): (String,) = params.parse()?;
-        let hash_hex = hash_str.strip_prefix("0x").unwrap_or(&hash_str);
-        let hash_bytes = hex::decode(hash_hex).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("Invalid tx hash: {}", e), None::<()>)
+        let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
+            ErrorObjectOwned::owned(-32602, "Invalid tx hash: expected 0x-prefixed 32-byte hex", None::<()>)
         })?;
-        if hash_bytes.len() != 32 {
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                format!("expected 32-byte tx hash, got {} bytes", hash_bytes.len()),
-                None::<()>,
-            ));
-        }
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&hash_bytes);
 
         // Check local cache first (private)
         {
@@ -533,19 +527,9 @@ async fn main() -> Result<()> {
     // Register eth_getTransactionReceipt (Private via block cache, upstream fallback)
     module.register_async_method("eth_getTransactionReceipt", |params, state, _| async move {
         let (hash_str,): (String,) = params.parse()?;
-        let hash_hex = hash_str.strip_prefix("0x").unwrap_or(&hash_str);
-        let hash_bytes = hex::decode(hash_hex).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("Invalid tx hash: {}", e), None::<()>)
+        let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
+            ErrorObjectOwned::owned(-32602, "Invalid tx hash: expected 0x-prefixed 32-byte hex", None::<()>)
         })?;
-        if hash_bytes.len() != 32 {
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                format!("expected 32-byte tx hash, got {} bytes", hash_bytes.len()),
-                None::<()>,
-            ));
-        }
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&hash_bytes);
 
         // Check local cache first (private)
         {
