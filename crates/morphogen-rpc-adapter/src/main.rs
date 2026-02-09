@@ -59,7 +59,10 @@ struct Args {
 
     /// Transaction relay URL for eth_sendRawTransaction.
     /// Defaults to Flashbots Protect so txs bypass the public mempool.
-    #[arg(long, default_value = "https://rpc.flashbots.net/?hint=hash&originId=morphogenesis")]
+    #[arg(
+        long,
+        default_value = "https://rpc.flashbots.net/?hint=hash&originId=morphogenesis"
+    )]
     tx_relay: String,
 }
 
@@ -106,9 +109,7 @@ const DROPPED_METHODS: &[(&str, &str)] = &[
 
 /// Methods relayed to a privacy-preserving endpoint instead of the regular upstream.
 /// eth_sendRawTransaction goes to Flashbots Protect to avoid public mempool exposure.
-const RELAY_METHODS: &[&str] = &[
-    "eth_sendRawTransaction",
-];
+const RELAY_METHODS: &[&str] = &["eth_sendRawTransaction"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -465,7 +466,9 @@ async fn main() -> Result<()> {
         let has_overrides = raw.len() == 3 && !raw[2].is_null() && raw[2] != serde_json::json!({});
         if has_overrides {
             if state.args.fallback_to_upstream {
-                warn!("eth_estimateGas with state overrides, proxying to upstream (privacy degraded)");
+                warn!(
+                    "eth_estimateGas with state overrides, proxying to upstream (privacy degraded)"
+                );
                 return proxy_to_upstream(
                     &state.args.upstream,
                     &state.http_client,
@@ -499,9 +502,7 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            Ok(gas) => {
-                Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", gas)))
-            }
+            Ok(gas) => Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", gas))),
             Err(evm::EthCallError::InvalidParams(msg)) => {
                 Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
             }
@@ -530,7 +531,11 @@ async fn main() -> Result<()> {
     module.register_async_method("eth_getTransactionByHash", |params, state, _| async move {
         let (hash_str,): (String,) = params.parse()?;
         let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
-            ErrorObjectOwned::owned(-32602, "Invalid tx hash: expected 32-byte hex string", None::<()>)
+            ErrorObjectOwned::owned(
+                -32602,
+                "Invalid tx hash: expected 32-byte hex string",
+                None::<()>,
+            )
         })?;
 
         // Check local cache first (private)
@@ -542,7 +547,14 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Cache miss: fall through to upstream (historical tx)
+        // Cache miss: respect fallback setting
+        if !state.args.fallback_to_upstream {
+            return Err(ErrorObjectOwned::owned(
+                -32000,
+                "transaction not found in local cache",
+                None::<()>,
+            ));
+        }
         info!("Proxying eth_getTransactionByHash to upstream (not in cache)");
         proxy_to_upstream(
             &state.args.upstream,
@@ -557,7 +569,11 @@ async fn main() -> Result<()> {
     module.register_async_method("eth_getTransactionReceipt", |params, state, _| async move {
         let (hash_str,): (String,) = params.parse()?;
         let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
-            ErrorObjectOwned::owned(-32602, "Invalid tx hash: expected 32-byte hex string", None::<()>)
+            ErrorObjectOwned::owned(
+                -32602,
+                "Invalid tx hash: expected 32-byte hex string",
+                None::<()>,
+            )
         })?;
 
         // Check local cache first (private)
@@ -569,7 +585,14 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Cache miss: fall through to upstream (historical tx)
+        // Cache miss: respect fallback setting
+        if !state.args.fallback_to_upstream {
+            return Err(ErrorObjectOwned::owned(
+                -32000,
+                "receipt not found in local cache",
+                None::<()>,
+            ));
+        }
         info!("Proxying eth_getTransactionReceipt to upstream (not in cache)");
         proxy_to_upstream(
             &state.args.upstream,
@@ -592,8 +615,15 @@ async fn main() -> Result<()> {
         }
         let filter_obj = &raw[0];
 
-        // If blockHash is present, proxy to upstream (out of scope)
+        // If blockHash is present, proxy to upstream (out of scope for cache)
         if filter_obj.get("blockHash").is_some() {
+            if !state.args.fallback_to_upstream {
+                return Err(ErrorObjectOwned::owned(
+                    -32000,
+                    "eth_getLogs by blockHash not supported without upstream fallback",
+                    None::<()>,
+                ));
+            }
             info!("eth_getLogs with blockHash, proxying to upstream");
             return proxy_to_upstream(
                 &state.args.upstream,
@@ -622,6 +652,13 @@ async fn main() -> Result<()> {
             Ok::<Value, ErrorObjectOwned>(Value::Array(logs))
         } else {
             drop(cache);
+            if !state.args.fallback_to_upstream {
+                return Err(ErrorObjectOwned::owned(
+                    -32000,
+                    "requested log range not fully cached",
+                    None::<()>,
+                ));
+            }
             warn!(
                 from = filter.from_block,
                 to = filter.to_block,
@@ -667,11 +704,14 @@ async fn main() -> Result<()> {
     })?;
 
     // Register eth_newPendingTransactionFilter (Private — filter stored locally)
-    module.register_async_method("eth_newPendingTransactionFilter", |_params, state, _| async move {
-        let id = state.block_cache.write().await.create_pending_tx_filter();
-        info!("Created private pending tx filter {}", id);
-        Ok::<Value, ErrorObjectOwned>(Value::String(id))
-    })?;
+    module.register_async_method(
+        "eth_newPendingTransactionFilter",
+        |_params, state, _| async move {
+            let id = state.block_cache.write().await.create_pending_tx_filter();
+            info!("Created private pending tx filter {}", id);
+            Ok::<Value, ErrorObjectOwned>(Value::String(id))
+        },
+    )?;
 
     // Register eth_uninstallFilter (Private)
     module.register_async_method("eth_uninstallFilter", |params, state, _| async move {
@@ -738,7 +778,13 @@ async fn main() -> Result<()> {
             let m = method_name.clone();
             async move {
                 info!("Relaying {} to privacy relay", m);
-                proxy_to_upstream(&state.args.tx_relay, &state.http_client, &m, params.parse()?).await
+                proxy_to_upstream(
+                    &state.args.tx_relay,
+                    &state.http_client,
+                    &m,
+                    params.parse()?,
+                )
+                .await
             }
         })?;
     }
@@ -859,8 +905,16 @@ mod tests {
         // No overlap with passthrough or dropped
         let dropped_names: Vec<&str> = DROPPED_METHODS.iter().map(|(name, _)| *name).collect();
         for method in RELAY_METHODS {
-            assert!(!PASSTHROUGH_METHODS.contains(method), "{} in both relay and passthrough", method);
-            assert!(!dropped_names.contains(method), "{} in both relay and dropped", method);
+            assert!(
+                !PASSTHROUGH_METHODS.contains(method),
+                "{} in both relay and passthrough",
+                method
+            );
+            assert!(
+                !dropped_names.contains(method),
+                "{} in both relay and dropped",
+                method
+            );
         }
     }
 
@@ -877,7 +931,11 @@ mod tests {
 
         // No overlap with passthrough
         for name in &dropped_names {
-            assert!(!PASSTHROUGH_METHODS.contains(name), "{} is in both dropped and passthrough", name);
+            assert!(
+                !PASSTHROUGH_METHODS.contains(name),
+                "{} is in both dropped and passthrough",
+                name
+            );
         }
     }
 }

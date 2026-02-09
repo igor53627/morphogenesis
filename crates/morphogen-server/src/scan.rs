@@ -1494,11 +1494,13 @@ mod concurrency_tests {
 
         let step1_barrier = Arc::new(Barrier::new(2));
         let step2_barrier = Arc::new(Barrier::new(2));
+        let step3_barrier = Arc::new(Barrier::new(2));
 
         let global_clone = global.clone();
         let pending_clone = pending.clone();
         let step1_clone = step1_barrier.clone();
         let step2_clone = step2_barrier.clone();
+        let step3_clone = step3_barrier.clone();
 
         let merger = thread::spawn(move || {
             step1_clone.wait();
@@ -1506,6 +1508,9 @@ mod concurrency_tests {
             let _entries = pending_clone.drain_for_epoch(1).expect("drain failed");
 
             step2_clone.wait();
+
+            // Wait for main thread to observe intermediate state before storing
+            step3_clone.wait();
 
             let matrix = Arc::new(ChunkedMatrix::new(total_size, total_size));
             let next = EpochSnapshot {
@@ -1533,6 +1538,9 @@ mod concurrency_tests {
             pending_epoch, matrix_epoch,
             "RACE DETECTED: pending_epoch != matrix_epoch"
         );
+
+        // Let merger proceed to store the new epoch
+        step3_barrier.wait();
 
         merger.join().expect("merger panicked");
 

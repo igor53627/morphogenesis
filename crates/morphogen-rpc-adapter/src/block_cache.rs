@@ -213,11 +213,12 @@ impl BlockCache {
     pub fn create_log_filter(&mut self, filter: LogFilter) -> String {
         self.cleanup_expired_filters();
         let hex_id = self.generate_filter_id();
+        let cursor = filter.from_block.saturating_sub(1);
         self.filters.insert(
             hex_id.clone(),
             StoredFilter {
                 kind: FilterKind::Log(filter),
-                last_polled_block: self.latest_block,
+                last_polled_block: cursor,
                 last_accessed: Instant::now(),
             },
         );
@@ -779,8 +780,7 @@ async fn fetch_receipts(
             return Ok(receipts);
         }
         Ok(Value::Null) => {
-            // Block not found or method returned null
-            return Ok(Vec::new());
+            debug!("eth_getBlockReceipts returned null, falling back to individual calls");
         }
         Err(e) => {
             debug!(
@@ -1285,7 +1285,7 @@ mod tests {
         );
         cache.insert_block(100, [0x01; 32], vec![], vec![([0xAA; 32], r1)]);
 
-        // Create log filter — cursor starts at latest (100)
+        // Create log filter — cursor starts at from_block - 1 (99)
         let filter = LogFilter {
             from_block: 100,
             to_block: u64::MAX,
@@ -1294,7 +1294,12 @@ mod tests {
         };
         let id = cache.create_log_filter(filter);
 
-        // No new blocks yet — changes should be empty
+        // First poll returns block 100's log (from_block is inclusive)
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["address"].as_str().unwrap(), "0xaaa");
+
+        // Polling again with no new blocks returns empty
         let changes = cache.get_filter_changes(&id).unwrap();
         assert!(changes.is_empty());
 
