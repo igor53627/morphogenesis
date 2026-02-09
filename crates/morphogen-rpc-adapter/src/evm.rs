@@ -293,6 +293,10 @@ fn parse_u64_strict(val: Option<&Value>) -> Result<Option<u64>, String> {
     if hex.is_empty() {
         return Err("invalid hex quantity: no digits after prefix".to_string());
     }
+    // Reject leading zeros per JSON-RPC quantity encoding (except "0x0")
+    if hex.len() > 1 && hex.starts_with('0') {
+        return Err(format!("invalid hex quantity '{}': leading zeros not allowed", s));
+    }
     u64::from_str_radix(hex, 16)
         .map(Some)
         .map_err(|e| e.to_string())
@@ -434,5 +438,11 @@ mod tests {
     #[test]
     fn parse_u64_rejects_no_prefix() {
         assert!(parse_u64_strict(Some(&json!("10"))).is_err());
+    }
+
+    #[test]
+    fn parse_u64_rejects_leading_zeros() {
+        assert!(parse_u64_strict(Some(&json!("0x00"))).is_err());
+        assert!(parse_u64_strict(Some(&json!("0x01"))).is_err());
     }
 }
