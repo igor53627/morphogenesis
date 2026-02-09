@@ -200,10 +200,7 @@ impl Database for PirDatabase {
                 Some(v) => v,
             };
             let hash_str = hash_val.as_str().ok_or_else(|| {
-                PirDbError(format!(
-                    "Block {} 'hash' field is not a string",
-                    number
-                ))
+                PirDbError(format!("Block {} 'hash' field is not a string", number))
             })?;
 
             let hash_hex = hash_str.strip_prefix("0x").unwrap_or(hash_str);

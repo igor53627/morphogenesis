@@ -49,9 +49,12 @@ fn validate_block_tag(block_tag: &Value) -> Result<String, String> {
         return Ok(s.to_string());
     }
     // Must be a hex quantity: "0x" followed by one or more hex digits
-    let hex = s
-        .strip_prefix("0x")
-        .ok_or_else(|| format!("invalid block tag '{}': expected named tag or hex quantity", s))?;
+    let hex = s.strip_prefix("0x").ok_or_else(|| {
+        format!(
+            "invalid block tag '{}': expected named tag or hex quantity",
+            s
+        )
+    })?;
     if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!(
             "invalid block tag '{}': expected named tag or hex quantity",
@@ -143,7 +146,13 @@ fn parse_call_params(call_params: &Value) -> Result<CallParams, EthCallError> {
     let gas = parse_u64_strict(call_params.get("gas"))
         .map_err(|e| EthCallError::InvalidParams(format!("invalid 'gas': {}", e)))?
         .unwrap_or(30_000_000);
-    Ok(CallParams { from, to, data, value, gas })
+    Ok(CallParams {
+        from,
+        to,
+        data,
+        value,
+        gas,
+    })
 }
 
 /// Maximum number of access-list entries to prefetch.
@@ -164,8 +173,7 @@ async fn prefetch_access_list(pir_client: &Arc<PirClient>, entries: &[Value]) {
     let mut storage_queries: Vec<([u8; 20], [u8; 32])> = Vec::new();
 
     for entry in entries {
-        if addresses.len() >= MAX_PREFETCH_ACCOUNTS
-            && storage_queries.len() >= MAX_PREFETCH_STORAGE
+        if addresses.len() >= MAX_PREFETCH_ACCOUNTS && storage_queries.len() >= MAX_PREFETCH_STORAGE
         {
             break;
         }
@@ -245,8 +253,7 @@ async fn run_evm(
 ) -> Result<(ExecutionResult, CallParams), EthCallError> {
     let parsed = parse_call_params(call_params)?;
 
-    let validated_tag = validate_block_tag(block_tag)
-        .map_err(EthCallError::InvalidParams)?;
+    let validated_tag = validate_block_tag(block_tag).map_err(EthCallError::InvalidParams)?;
 
     let block_info = fetch_block_info(&upstream_client, &upstream_url, &validated_tag)
         .await
@@ -327,9 +334,14 @@ pub async fn execute_eth_call(
     info!("Executing private eth_call via revm");
 
     let (result, _) = run_evm(
-        pir_client, code_resolver, upstream_client, upstream_url,
-        call_params, block_tag,
-    ).await?;
+        pir_client,
+        code_resolver,
+        upstream_client,
+        upstream_url,
+        call_params,
+        block_tag,
+    )
+    .await?;
 
     match result {
         ExecutionResult::Success { output, .. } => match output {
@@ -340,9 +352,10 @@ pub async fn execute_eth_call(
             "execution reverted: 0x{}",
             hex::encode(&output)
         ))),
-        ExecutionResult::Halt { reason, .. } => {
-            Err(EthCallError::Internal(format!("execution halted: {:?}", reason)))
-        }
+        ExecutionResult::Halt { reason, .. } => Err(EthCallError::Internal(format!(
+            "execution halted: {:?}",
+            reason
+        ))),
     }
 }
 
@@ -359,9 +372,14 @@ pub async fn execute_eth_estimate_gas(
     info!("Executing private eth_estimateGas via revm");
 
     let (result, _) = run_evm(
-        pir_client, code_resolver, upstream_client, upstream_url,
-        call_params, block_tag,
-    ).await?;
+        pir_client,
+        code_resolver,
+        upstream_client,
+        upstream_url,
+        call_params,
+        block_tag,
+    )
+    .await?;
 
     match result {
         ExecutionResult::Success { gas_used, .. } => {
@@ -372,9 +390,10 @@ pub async fn execute_eth_estimate_gas(
             "execution reverted: 0x{}",
             hex::encode(&output)
         ))),
-        ExecutionResult::Halt { reason, .. } => {
-            Err(EthCallError::Internal(format!("execution halted: {:?}", reason)))
-        }
+        ExecutionResult::Halt { reason, .. } => Err(EthCallError::Internal(format!(
+            "execution halted: {:?}",
+            reason
+        ))),
     }
 }
 
@@ -441,7 +460,10 @@ fn parse_u64_strict(val: Option<&Value>) -> Result<Option<u64>, String> {
     }
     // Reject leading zeros per JSON-RPC quantity encoding (except "0x0")
     if hex.len() > 1 && hex.starts_with('0') {
-        return Err(format!("invalid hex quantity '{}': leading zeros not allowed", s));
+        return Err(format!(
+            "invalid hex quantity '{}': leading zeros not allowed",
+            s
+        ));
     }
     u64::from_str_radix(hex, 16)
         .map(Some)

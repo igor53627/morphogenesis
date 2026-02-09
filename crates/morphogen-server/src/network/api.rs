@@ -406,11 +406,8 @@ pub async fn batch_query_handler(
     // All queries share the same consistent snapshot
     let mut results = Vec::with_capacity(n);
     for keys in &all_keys {
-        let mut payloads = crate::scan::scan_main_matrix(
-            snapshot1.matrix.as_ref(),
-            keys,
-            state.row_size_bytes,
-        );
+        let mut payloads =
+            crate::scan::scan_main_matrix(snapshot1.matrix.as_ref(), keys, state.row_size_bytes);
         // Apply delta entries
         for entry in &entries {
             for (k, key) in keys.iter().enumerate() {
@@ -690,10 +687,7 @@ fn ws_error_json(error: &str, code: &str) -> String {
     .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string())
 }
 
-fn handle_ws_single_query(
-    state: &AppState,
-    request: QueryRequest,
-) -> String {
+fn handle_ws_single_query(state: &AppState, request: QueryRequest) -> String {
     use crate::scan::scan_consistent;
     use morphogen_dpf::AesDpfKey;
 
@@ -737,10 +731,7 @@ fn handle_ws_single_query(
     }
 }
 
-fn handle_ws_batch_query(
-    state: &AppState,
-    request: BatchQueryRequest,
-) -> String {
+fn handle_ws_batch_query(state: &AppState, request: BatchQueryRequest) -> String {
     use crate::scan::scan_consistent;
     use morphogen_dpf::{AesDpfKey, DpfKey};
 
@@ -820,19 +811,13 @@ fn handle_ws_batch_query(
 
     let mut results = Vec::with_capacity(n);
     for keys in &all_keys {
-        let mut payloads = crate::scan::scan_main_matrix(
-            snapshot1.matrix.as_ref(),
-            keys,
-            state.row_size_bytes,
-        );
+        let mut payloads =
+            crate::scan::scan_main_matrix(snapshot1.matrix.as_ref(), keys, state.row_size_bytes);
         for entry in &entries {
             for (k, key) in keys.iter().enumerate() {
                 if key.eval_bit(entry.row_idx) {
                     if entry.diff.len() != payloads[k].len() {
-                        return ws_error_json(
-                            "delta length mismatch",
-                            "internal_error",
-                        );
+                        return ws_error_json("delta length mismatch", "internal_error");
                     }
                     for (d, s) in payloads[k].iter_mut().zip(entry.diff.iter()) {
                         *d ^= s;

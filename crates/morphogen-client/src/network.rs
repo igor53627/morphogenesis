@@ -629,10 +629,7 @@ impl PirClient {
             let mut chunk_error: Option<PirQueryError> = None;
 
             for chunk in miss_keys.chunks(MAX_BATCH_SIZE) {
-                match self
-                    .execute_batch_pir_query(chunk, &current_metadata)
-                    .await
-                {
+                match self.execute_batch_pir_query(chunk, &current_metadata).await {
                     Ok((response_epoch, batch_results)) => {
                         let mut cache = self.cache.lock().await;
                         for (j, key) in chunk.iter().enumerate() {
@@ -675,10 +672,7 @@ impl PirClient {
         ))
     }
 
-    pub async fn query_accounts_batch(
-        &self,
-        addresses: &[[u8; 20]],
-    ) -> Result<Vec<AccountData>> {
+    pub async fn query_accounts_batch(&self, addresses: &[[u8; 20]]) -> Result<Vec<AccountData>> {
         let keys: Vec<Vec<u8>> = addresses.iter().map(|a| a.to_vec()).collect();
         let all_payloads = self.execute_batch_pir_query_with_retry(&keys).await?;
 
