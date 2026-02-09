@@ -146,14 +146,30 @@ fn parse_call_params(call_params: &Value) -> Result<CallParams, EthCallError> {
     Ok(CallParams { from, to, data, value, gas })
 }
 
+/// Maximum number of access-list entries to prefetch.
+/// Caps memory/network cost from attacker-controlled input.
+const MAX_PREFETCH_ACCOUNTS: usize = 64;
+const MAX_PREFETCH_STORAGE: usize = 256;
+
 /// Parse and batch-prefetch all accounts and storage slots from an EIP-2930 access list.
 /// This populates the PirClient's internal cache so subsequent revm Database calls
 /// hit warm cache instead of making individual network round-trips.
+/// Deduplicates entries and enforces size caps to prevent abuse.
 async fn prefetch_access_list(pir_client: &Arc<PirClient>, entries: &[Value]) {
+    use std::collections::HashSet;
+
+    let mut seen_addrs: HashSet<[u8; 20]> = HashSet::new();
     let mut addresses: Vec<[u8; 20]> = Vec::new();
+    let mut seen_storage: HashSet<([u8; 20], [u8; 32])> = HashSet::new();
     let mut storage_queries: Vec<([u8; 20], [u8; 32])> = Vec::new();
 
     for entry in entries {
+        if addresses.len() >= MAX_PREFETCH_ACCOUNTS
+            && storage_queries.len() >= MAX_PREFETCH_STORAGE
+        {
+            break;
+        }
+
         let addr = match entry
             .get("address")
             .and_then(|v| v.as_str())
@@ -171,10 +187,15 @@ async fn prefetch_access_list(pir_client: &Arc<PirClient>, entries: &[Value]) {
             None => continue,
         };
 
-        addresses.push(addr);
+        if addresses.len() < MAX_PREFETCH_ACCOUNTS && seen_addrs.insert(addr) {
+            addresses.push(addr);
+        }
 
         if let Some(keys) = entry.get("storageKeys").and_then(|v| v.as_array()) {
             for key in keys {
+                if storage_queries.len() >= MAX_PREFETCH_STORAGE {
+                    break;
+                }
                 if let Some(slot_bytes) = key.as_str().and_then(|s| {
                     let hex = s.strip_prefix("0x").unwrap_or(s);
                     hex::decode(hex).ok()
@@ -182,7 +203,9 @@ async fn prefetch_access_list(pir_client: &Arc<PirClient>, entries: &[Value]) {
                     if slot_bytes.len() == 32 {
                         let mut slot = [0u8; 32];
                         slot.copy_from_slice(&slot_bytes);
-                        storage_queries.push((addr, slot));
+                        if seen_storage.insert((addr, slot)) {
+                            storage_queries.push((addr, slot));
+                        }
                     }
                 }
             }

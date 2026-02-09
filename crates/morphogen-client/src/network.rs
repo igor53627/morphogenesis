@@ -16,6 +16,8 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 2;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const DEFAULT_CACHE_CAPACITY: usize = 4096;
+/// Maximum queries per batch request, matching server's MAX_BATCH_SIZE.
+const MAX_BATCH_SIZE: usize = 32;
 
 fn storage_cuckoo_key(address: [u8; 20], slot: [u8; 32]) -> [u8; 8] {
     use alloy_primitives::keccak256;
@@ -575,6 +577,7 @@ impl PirClient {
 
     /// Execute a batch of PIR queries with caching and retry logic.
     /// Checks cache for each key; only queries misses over the network.
+    /// Chunks requests to respect server's MAX_BATCH_SIZE (32).
     async fn execute_batch_pir_query_with_retry(
         &self,
         keys: &[Vec<u8>],
@@ -584,76 +587,86 @@ impl PirClient {
             return Ok(vec![]);
         }
 
-        let metadata = self.get_metadata().await?;
-
-        // Partition into cached hits and uncached misses
-        let mut results: Vec<Option<[Vec<u8>; QUERIES_PER_REQUEST]>> = vec![None; n];
-        let mut miss_indices: Vec<usize> = Vec::new();
-        let mut miss_keys: Vec<Vec<u8>> = Vec::new();
-
-        {
-            let cache = self.cache.lock().await;
-            for (i, key) in keys.iter().enumerate() {
-                if let Some(cached) = cache.get(metadata.epoch_id, key) {
-                    debug!("PIR batch cache hit for key {}", i);
-                    results[i] = Some(cached.clone());
-                } else {
-                    miss_indices.push(i);
-                    miss_keys.push(key.clone());
-                }
-            }
-        }
-
-        if miss_keys.is_empty() {
-            return Ok(results.into_iter().map(|r| r.unwrap()).collect());
-        }
-
-        // Batch-query the misses with retry
         for attempt in 0..=MAX_RETRIES {
             let current_metadata = if attempt == 0 {
-                metadata.clone()
+                self.get_metadata().await?
             } else {
                 debug!(attempt, "Retrying batch PIR query, refreshing metadata");
                 match self.update_metadata().await {
                     Ok(m) => m,
                     Err(e) => {
                         warn!(attempt, error = %e, "Failed to refresh metadata on retry");
-                        metadata.clone()
+                        self.get_metadata().await?
                     }
                 }
             };
 
-            match self
-                .execute_batch_pir_query(&miss_keys, &current_metadata)
-                .await
+            // Partition into cached hits and uncached misses using current epoch
+            let mut results: Vec<Option<[Vec<u8>; QUERIES_PER_REQUEST]>> = vec![None; n];
+            let mut miss_indices: Vec<usize> = Vec::new();
+            let mut miss_keys: Vec<Vec<u8>> = Vec::new();
+
             {
-                Ok((response_epoch, batch_results)) => {
-                    let mut cache = self.cache.lock().await;
-                    for (j, miss_idx) in miss_indices.iter().enumerate() {
-                        cache.put(
-                            response_epoch,
-                            miss_keys[j].clone(),
-                            batch_results[j].clone(),
-                        );
-                        results[*miss_idx] = Some(batch_results[j].clone());
+                let cache = self.cache.lock().await;
+                for (i, key) in keys.iter().enumerate() {
+                    if let Some(cached) = cache.get(current_metadata.epoch_id, key) {
+                        debug!("PIR batch cache hit for key {}", i);
+                        results[i] = Some(cached.clone());
+                    } else {
+                        miss_indices.push(i);
+                        miss_keys.push(key.clone());
                     }
-                    return Ok(results.into_iter().map(|r| r.unwrap()).collect());
-                }
-                Err(e) => {
-                    if attempt < MAX_RETRIES && e.is_retryable() {
-                        let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
-                        warn!(
-                            attempt,
-                            delay_ms = delay.as_millis() as u64,
-                            error = %e,
-                            "Batch PIR query failed, retrying"
-                        );
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    return Err(anyhow!("Batch PIR query failed: {}", e));
                 }
             }
+
+            if miss_keys.is_empty() {
+                return Ok(results.into_iter().map(|r| r.unwrap()).collect());
+            }
+
+            // Chunk misses into batches of MAX_BATCH_SIZE to respect server limits
+            let mut all_batch_results: Vec<[Vec<u8>; QUERIES_PER_REQUEST]> =
+                Vec::with_capacity(miss_keys.len());
+            let mut chunk_error: Option<PirQueryError> = None;
+
+            for chunk in miss_keys.chunks(MAX_BATCH_SIZE) {
+                match self
+                    .execute_batch_pir_query(chunk, &current_metadata)
+                    .await
+                {
+                    Ok((response_epoch, batch_results)) => {
+                        let mut cache = self.cache.lock().await;
+                        for (j, key) in chunk.iter().enumerate() {
+                            cache.put(response_epoch, key.clone(), batch_results[j].clone());
+                        }
+                        all_batch_results.extend(batch_results);
+                    }
+                    Err(e) => {
+                        chunk_error = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            if let Some(e) = chunk_error {
+                if attempt < MAX_RETRIES && e.is_retryable() {
+                    let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
+                    warn!(
+                        attempt,
+                        delay_ms = delay.as_millis() as u64,
+                        error = %e,
+                        "Batch PIR query failed, retrying"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(anyhow!("Batch PIR query failed: {}", e));
+            }
+
+            // Reassemble results in original order
+            for (j, miss_idx) in miss_indices.iter().enumerate() {
+                results[*miss_idx] = Some(all_batch_results[j].clone());
+            }
+            return Ok(results.into_iter().map(|r| r.unwrap()).collect());
         }
 
         Err(anyhow!(

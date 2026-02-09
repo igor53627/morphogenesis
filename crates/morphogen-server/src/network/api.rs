@@ -379,19 +379,27 @@ pub async fn batch_query_handler(
     if snapshot2.epoch_id != epoch1 || pending_epoch != epoch1 {
         // Epoch changed during snapshot — fall back to per-query scan_consistent
         let mut results = Vec::with_capacity(n);
+        let mut batch_epoch: Option<u64> = None;
         for keys in &all_keys {
-            let (payloads, _) = crate::scan::scan_consistent(
+            let (payloads, query_epoch) = crate::scan::scan_consistent(
                 state.global.as_ref(),
                 state.global.load_pending().as_ref(),
                 keys,
                 state.row_size_bytes,
             )
             .map_err(scan_error_to_status)?;
+            match batch_epoch {
+                None => batch_epoch = Some(query_epoch),
+                Some(e) if e != query_epoch => {
+                    return Err(StatusCode::SERVICE_UNAVAILABLE);
+                }
+                _ => {}
+            }
             results.push(BatchQueryResult {
                 payloads: payloads.to_vec(),
             });
         }
-        let epoch_id = state.global.load().epoch_id;
+        let epoch_id = batch_epoch.unwrap_or_else(|| state.global.load().epoch_id);
         return Ok(Json(BatchQueryResponse { epoch_id, results }));
     }
 
@@ -407,6 +415,9 @@ pub async fn batch_query_handler(
         for entry in &entries {
             for (k, key) in keys.iter().enumerate() {
                 if key.eval_bit(entry.row_idx) {
+                    if entry.diff.len() != payloads[k].len() {
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
                     for (d, s) in payloads[k].iter_mut().zip(entry.diff.iter()) {
                         *d ^= s;
                     }
@@ -765,8 +776,9 @@ fn handle_ws_batch_query(
     let snapshot2 = state.global.load();
 
     if snapshot2.epoch_id != epoch1 || pending_epoch != epoch1 {
-        // Fallback: per-query scan_consistent
+        // Fallback: per-query scan_consistent, tracking epoch consistency
         let mut results = Vec::with_capacity(n);
+        let mut batch_epoch: Option<u64> = None;
         for keys in &all_keys {
             match scan_consistent(
                 state.global.as_ref(),
@@ -774,13 +786,34 @@ fn handle_ws_batch_query(
                 keys,
                 state.row_size_bytes,
             ) {
-                Ok((payloads, _)) => results.push(BatchQueryResult {
-                    payloads: payloads.to_vec(),
-                }),
-                Err(e) => return ws_error_json(&format!("scan error: {}", e), "internal_error"),
+                Ok((payloads, query_epoch)) => {
+                    match batch_epoch {
+                        None => batch_epoch = Some(query_epoch),
+                        Some(e) if e != query_epoch => {
+                            return ws_error_json(
+                                "epoch changed during batch scan",
+                                "too_many_retries",
+                            );
+                        }
+                        _ => {}
+                    }
+                    results.push(BatchQueryResult {
+                        payloads: payloads.to_vec(),
+                    });
+                }
+                Err(e) => {
+                    use crate::scan::ScanError;
+                    let code = match e {
+                        ScanError::TooManyRetries { .. } => "too_many_retries",
+                        ScanError::LockPoisoned
+                        | ScanError::MatrixNotAligned { .. }
+                        | ScanError::ChunkNotAligned { .. } => "internal_error",
+                    };
+                    return ws_error_json(&format!("scan error: {}", e), code);
+                }
             }
         }
-        let epoch_id = state.global.load().epoch_id;
+        let epoch_id = batch_epoch.unwrap_or_else(|| state.global.load().epoch_id);
         return serde_json::to_string(&BatchQueryResponse { epoch_id, results })
             .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string());
     }
@@ -795,6 +828,12 @@ fn handle_ws_batch_query(
         for entry in &entries {
             for (k, key) in keys.iter().enumerate() {
                 if key.eval_bit(entry.row_idx) {
+                    if entry.diff.len() != payloads[k].len() {
+                        return ws_error_json(
+                            "delta length mismatch",
+                            "internal_error",
+                        );
+                    }
                     for (d, s) in payloads[k].iter_mut().zip(entry.diff.iter()) {
                         *d ^= s;
                     }
