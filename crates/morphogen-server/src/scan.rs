@@ -232,6 +232,7 @@ fn xor_into(dest: &mut [u8], src: &[u8]) {
 ///
 /// # Errors
 /// Returns `ScanError::ChunkNotAligned` if any chunk is not page-aligned.
+#[cfg(any(feature = "network", test))]
 pub fn try_scan_pages_chunked(
     matrix: &ChunkedMatrix,
     keys: &[morphogen_dpf::page::PageDpfKey; 3],
@@ -290,6 +291,7 @@ pub fn scan_pages_chunked(
 /// Page-level PIR scan with epoch consistency.
 ///
 /// Ensures the scan sees a consistent view even during epoch transitions.
+#[cfg(feature = "network")]
 pub fn scan_pages_consistent(
     global: &GlobalState,
     keys: &[morphogen_dpf::page::PageDpfKey; 3],
@@ -306,6 +308,7 @@ pub fn scan_pages_consistent(
 }
 
 /// Page-level PIR scan with configurable retry limit.
+#[cfg(feature = "network")]
 pub fn scan_pages_consistent_with_max_retries(
     global: &GlobalState,
     keys: &[morphogen_dpf::page::PageDpfKey; 3],

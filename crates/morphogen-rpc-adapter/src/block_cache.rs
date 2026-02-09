@@ -62,7 +62,13 @@ impl BlockCache {
         }
     }
 
-    pub fn insert_block(&mut self, block_number: u64, block_hash: [u8; 32], txs: Vec<([u8; 32], Value)>, receipts: Vec<([u8; 32], Value)>) {
+    pub fn insert_block(
+        &mut self,
+        block_number: u64,
+        block_hash: [u8; 32],
+        txs: Vec<([u8; 32], Value)>,
+        receipts: Vec<([u8; 32], Value)>,
+    ) {
         let mut tx_hashes = Vec::with_capacity(txs.len());
         for (hash, tx) in txs {
             tx_hashes.push(hash);
@@ -187,9 +193,8 @@ impl BlockCache {
     /// Remove filters that haven't been accessed in FILTER_EXPIRY_SECS.
     pub fn cleanup_expired_filters(&mut self) {
         let now = Instant::now();
-        self.filters.retain(|_, f| {
-            now.duration_since(f.last_accessed).as_secs() < FILTER_EXPIRY_SECS
-        });
+        self.filters
+            .retain(|_, f| now.duration_since(f.last_accessed).as_secs() < FILTER_EXPIRY_SECS);
     }
 
     /// Generate an unguessable random hex filter ID (u64 quantity for client compat).
@@ -208,11 +213,14 @@ impl BlockCache {
     pub fn create_log_filter(&mut self, filter: LogFilter) -> String {
         self.cleanup_expired_filters();
         let hex_id = self.generate_filter_id();
-        self.filters.insert(hex_id.clone(), StoredFilter {
-            kind: FilterKind::Log(filter),
-            last_polled_block: self.latest_block,
-            last_accessed: Instant::now(),
-        });
+        self.filters.insert(
+            hex_id.clone(),
+            StoredFilter {
+                kind: FilterKind::Log(filter),
+                last_polled_block: self.latest_block,
+                last_accessed: Instant::now(),
+            },
+        );
         hex_id
     }
 
@@ -220,11 +228,14 @@ impl BlockCache {
     pub fn create_block_filter(&mut self) -> String {
         self.cleanup_expired_filters();
         let hex_id = self.generate_filter_id();
-        self.filters.insert(hex_id.clone(), StoredFilter {
-            kind: FilterKind::Block,
-            last_polled_block: self.latest_block,
-            last_accessed: Instant::now(),
-        });
+        self.filters.insert(
+            hex_id.clone(),
+            StoredFilter {
+                kind: FilterKind::Block,
+                last_polled_block: self.latest_block,
+                last_accessed: Instant::now(),
+            },
+        );
         hex_id
     }
 
@@ -232,11 +243,14 @@ impl BlockCache {
     pub fn create_pending_tx_filter(&mut self) -> String {
         self.cleanup_expired_filters();
         let hex_id = self.generate_filter_id();
-        self.filters.insert(hex_id.clone(), StoredFilter {
-            kind: FilterKind::PendingTransaction,
-            last_polled_block: self.latest_block,
-            last_accessed: Instant::now(),
-        });
+        self.filters.insert(
+            hex_id.clone(),
+            StoredFilter {
+                kind: FilterKind::PendingTransaction,
+                last_polled_block: self.latest_block,
+                last_accessed: Instant::now(),
+            },
+        );
         hex_id
     }
 
@@ -260,11 +274,15 @@ impl BlockCache {
                     from_block: from_exclusive.saturating_add(1),
                     to_block: to_inclusive,
                     addresses: log_filter.addresses.clone(),
-                    topics: log_filter.topics.iter().map(|t| match t {
-                        TopicFilter::Any => TopicFilter::Any,
-                        TopicFilter::Exact(s) => TopicFilter::Exact(s.clone()),
-                        TopicFilter::OneOf(v) => TopicFilter::OneOf(v.clone()),
-                    }).collect(),
+                    topics: log_filter
+                        .topics
+                        .iter()
+                        .map(|t| match t {
+                            TopicFilter::Any => TopicFilter::Any,
+                            TopicFilter::Exact(s) => TopicFilter::Exact(s.clone()),
+                            TopicFilter::OneOf(v) => TopicFilter::OneOf(v.clone()),
+                        })
+                        .collect(),
                 };
                 Some(self.get_logs(&scan_filter))
             }
@@ -295,11 +313,15 @@ impl BlockCache {
                     from_block: log_filter.from_block,
                     to_block: self.latest_block.min(log_filter.to_block),
                     addresses: log_filter.addresses.clone(),
-                    topics: log_filter.topics.iter().map(|t| match t {
-                        TopicFilter::Any => TopicFilter::Any,
-                        TopicFilter::Exact(s) => TopicFilter::Exact(s.clone()),
-                        TopicFilter::OneOf(v) => TopicFilter::OneOf(v.clone()),
-                    }).collect(),
+                    topics: log_filter
+                        .topics
+                        .iter()
+                        .map(|t| match t {
+                            TopicFilter::Any => TopicFilter::Any,
+                            TopicFilter::Exact(s) => TopicFilter::Exact(s.clone()),
+                            TopicFilter::OneOf(v) => TopicFilter::OneOf(v.clone()),
+                        })
+                        .collect(),
                 };
                 Some(Some(self.get_logs(&scan_filter)))
             }
@@ -317,7 +339,10 @@ impl BlockCache {
         let mut result = Vec::new();
         for block in &self.cached_blocks {
             if block.number > from_exclusive && block.number <= to_inclusive {
-                result.push(Value::String(format!("0x{}", hex::encode(block.block_hash))));
+                result.push(Value::String(format!(
+                    "0x{}",
+                    hex::encode(block.block_hash)
+                )));
             }
         }
         result
@@ -373,8 +398,9 @@ pub fn parse_log_filter_object(filter_obj: &Value, latest: u64) -> Result<LogFil
         Some("safe") | Some("finalized") => {
             return Err("\"safe\" and \"finalized\" block tags are not supported; use an explicit block number".to_string());
         }
-        Some(hex) => parse_hex_block_number(hex)
-            .ok_or_else(|| format!("invalid fromBlock: {}", hex))?,
+        Some(hex) => {
+            parse_hex_block_number(hex).ok_or_else(|| format!("invalid fromBlock: {}", hex))?
+        }
     };
 
     let to_block = match filter_obj.get("toBlock").and_then(|v| v.as_str()) {
@@ -383,8 +409,9 @@ pub fn parse_log_filter_object(filter_obj: &Value, latest: u64) -> Result<LogFil
         Some("safe") | Some("finalized") => {
             return Err("\"safe\" and \"finalized\" block tags are not supported; use an explicit block number".to_string());
         }
-        Some(hex) => parse_hex_block_number(hex)
-            .ok_or_else(|| format!("invalid toBlock: {}", hex))?,
+        Some(hex) => {
+            parse_hex_block_number(hex).ok_or_else(|| format!("invalid toBlock: {}", hex))?
+        }
     };
 
     if from_block > to_block {
@@ -402,12 +429,22 @@ pub fn parse_log_filter_object(filter_obj: &Value, latest: u64) -> Result<LogFil
             for v in arr {
                 match v.as_str() {
                     Some(s) => addrs.push(s.to_lowercase()),
-                    None => return Err(format!("invalid address in array: expected string, got {}", v)),
+                    None => {
+                        return Err(format!(
+                            "invalid address in array: expected string, got {}",
+                            v
+                        ))
+                    }
                 }
             }
             Some(addrs) // empty list = match nothing
         }
-        Some(other) => return Err(format!("invalid address field: expected string or array, got {}", other)),
+        Some(other) => {
+            return Err(format!(
+                "invalid address field: expected string or array, got {}",
+                other
+            ))
+        }
     };
 
     let topics = match filter_obj.get("topics") {
@@ -423,7 +460,12 @@ pub fn parse_log_filter_object(filter_obj: &Value, latest: u64) -> Result<LogFil
                         for v in alts {
                             match v.as_str() {
                                 Some(s) => options.push(s.to_lowercase()),
-                                None => return Err(format!("invalid topic in alternatives array: expected string, got {}", v)),
+                                None => {
+                                    return Err(format!(
+                                    "invalid topic in alternatives array: expected string, got {}",
+                                    v
+                                ))
+                                }
                             }
                         }
                         if options.is_empty() {
@@ -431,12 +473,22 @@ pub fn parse_log_filter_object(filter_obj: &Value, latest: u64) -> Result<LogFil
                         }
                         result.push(TopicFilter::OneOf(options));
                     }
-                    other => return Err(format!("invalid topic filter: expected null, string, or array, got {}", other)),
+                    other => {
+                        return Err(format!(
+                            "invalid topic filter: expected null, string, or array, got {}",
+                            other
+                        ))
+                    }
                 }
             }
             result
         }
-        Some(other) => return Err(format!("invalid topics field: expected array, got {}", other)),
+        Some(other) => {
+            return Err(format!(
+                "invalid topics field: expected array, got {}",
+                other
+            ))
+        }
     };
 
     Ok(LogFilter {
@@ -462,14 +514,12 @@ pub fn log_matches_filter(log: &Value, filter: &LogFilter) -> bool {
     }
 
     // Topic filters
-    let log_topics = log
-        .get("topics")
-        .and_then(|t| t.as_array());
+    let log_topics = log.get("topics").and_then(|t| t.as_array());
     for (i, topic_filter) in filter.topics.iter().enumerate() {
         match topic_filter {
             TopicFilter::Any => {
                 // Wildcard still implies the position exists per EIP-1474
-                if log_topics.map_or(true, |t| t.get(i).is_none()) {
+                if log_topics.is_none_or(|t| t.get(i).is_none()) {
                     return false;
                 }
             }
@@ -515,7 +565,10 @@ pub fn start_block_poller(
             match poll_new_blocks(&cache, &client, &upstream_url).await {
                 Ok(new_blocks) => {
                     if consecutive_failures > 0 {
-                        info!("Block cache poller recovered after {} failures", consecutive_failures);
+                        info!(
+                            "Block cache poller recovered after {} failures",
+                            consecutive_failures
+                        );
                     }
                     consecutive_failures = 0;
                     if new_blocks > 0 {
@@ -532,8 +585,11 @@ pub fn start_block_poller(
                     consecutive_failures += 1;
                     if consecutive_failures <= 3 {
                         warn!(consecutive_failures, "Block cache poll failed: {}", e);
-                    } else if consecutive_failures % 10 == 0 {
-                        error!(consecutive_failures, "Block cache poll repeatedly failing: {}", e);
+                    } else if consecutive_failures.is_multiple_of(10) {
+                        error!(
+                            consecutive_failures,
+                            "Block cache poll repeatedly failing: {}", e
+                        );
                     }
                 }
             }
@@ -552,7 +608,13 @@ async fn poll_new_blocks(
     upstream_url: &str,
 ) -> Result<u64, String> {
     // Get current block number
-    let block_num_result = rpc_call(client, upstream_url, "eth_blockNumber", serde_json::json!([])).await?;
+    let block_num_result = rpc_call(
+        client,
+        upstream_url,
+        "eth_blockNumber",
+        serde_json::json!([]),
+    )
+    .await?;
     let block_num_str = block_num_result
         .as_str()
         .ok_or("eth_blockNumber: expected hex string")?;
@@ -578,13 +640,17 @@ async fn poll_new_blocks(
         // to detect same-height reorgs
         let check_hex = format!("0x{:x}", cached_num);
         let check_block = rpc_call(
-            client, upstream_url, "eth_getBlockByNumber",
+            client,
+            upstream_url,
+            "eth_getBlockByNumber",
             serde_json::json!([check_hex, false]),
-        ).await?;
+        )
+        .await?;
         if !check_block.is_null() {
-            match check_block.get("hash")
+            match check_block
+                .get("hash")
                 .and_then(|h| h.as_str())
-                .and_then(|s| parse_tx_hash(s))
+                .and_then(parse_tx_hash)
             {
                 Some(upstream_hash) if upstream_hash != cached_hash => {
                     warn!(
@@ -633,16 +699,18 @@ async fn poll_new_blocks(
             upstream_url,
             "eth_getBlockByNumber",
             serde_json::json!([block_hex, true]),
-        ).await?;
+        )
+        .await?;
 
         if block.is_null() {
             debug!(block_num, "Block not found (may not be finalized yet)");
             break;
         }
 
-        let block_hash = match block.get("hash")
+        let block_hash = match block
+            .get("hash")
             .and_then(|h| h.as_str())
-            .and_then(|s| parse_tx_hash(s))
+            .and_then(parse_tx_hash)
         {
             Some(h) => h,
             None => {
@@ -650,7 +718,8 @@ async fn poll_new_blocks(
             }
         };
 
-        let txs_array = block.get("transactions")
+        let txs_array = block
+            .get("transactions")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
@@ -668,9 +737,13 @@ async fn poll_new_blocks(
         }
 
         // Try eth_getBlockReceipts first (efficient), fall back to individual calls
-        let receipts = fetch_receipts(client, upstream_url, &block_hex, &tx_hashes_for_receipts).await?;
+        let receipts =
+            fetch_receipts(client, upstream_url, &block_hex, &tx_hashes_for_receipts).await?;
 
-        cache.write().await.insert_block(block_num, block_hash, txs, receipts);
+        cache
+            .write()
+            .await
+            .insert_block(block_num, block_hash, txs, receipts);
         new_blocks += 1;
     }
 
@@ -686,7 +759,14 @@ async fn fetch_receipts(
     tx_hashes: &[[u8; 32]],
 ) -> Result<Vec<([u8; 32], Value)>, String> {
     // Try eth_getBlockReceipts (supported by most modern nodes)
-    match rpc_call(client, upstream_url, "eth_getBlockReceipts", serde_json::json!([block_hex])).await {
+    match rpc_call(
+        client,
+        upstream_url,
+        "eth_getBlockReceipts",
+        serde_json::json!([block_hex]),
+    )
+    .await
+    {
         Ok(Value::Array(receipts_array)) => {
             let mut receipts = Vec::with_capacity(receipts_array.len());
             for receipt in receipts_array {
@@ -703,7 +783,10 @@ async fn fetch_receipts(
             return Ok(Vec::new());
         }
         Err(e) => {
-            debug!("eth_getBlockReceipts not available ({}), falling back to individual calls", e);
+            debug!(
+                "eth_getBlockReceipts not available ({}), falling back to individual calls",
+                e
+            );
         }
         _ => {
             debug!("eth_getBlockReceipts returned unexpected type, falling back");
@@ -714,7 +797,14 @@ async fn fetch_receipts(
     let mut receipts = Vec::with_capacity(tx_hashes.len());
     for hash in tx_hashes {
         let hash_hex = format!("0x{}", hex::encode(hash));
-        match rpc_call(client, upstream_url, "eth_getTransactionReceipt", serde_json::json!([hash_hex])).await {
+        match rpc_call(
+            client,
+            upstream_url,
+            "eth_getTransactionReceipt",
+            serde_json::json!([hash_hex]),
+        )
+        .await
+        {
             Ok(receipt) if !receipt.is_null() => {
                 receipts.push((*hash, receipt));
             }
@@ -758,7 +848,10 @@ async fn rpc_call(
         .map_err(|e| format!("{} parse failed: {}", method, e))?;
 
     if let Some(err) = json.get("error") {
-        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown");
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown");
         return Err(format!("{} RPC error: {}", method, msg));
     }
 
@@ -777,7 +870,12 @@ mod tests {
         let tx = serde_json::json!({"hash": "0xaa", "value": "0x1"});
         let receipt = serde_json::json!({"transactionHash": "0xaa", "status": "0x1"});
 
-        cache.insert_block(100, blk_hash, vec![(hash, tx.clone())], vec![(hash, receipt.clone())]);
+        cache.insert_block(
+            100,
+            blk_hash,
+            vec![(hash, tx.clone())],
+            vec![(hash, receipt.clone())],
+        );
 
         assert_eq!(cache.latest_block(), 100);
         assert_eq!(cache.get_transaction(&hash), Some(&tx));
@@ -822,9 +920,24 @@ mod tests {
         let hash_b = [0xBB; 32];
         let hash_c = [0xCC; 32];
 
-        cache.insert_block(100, [0x01; 32], vec![(hash_a, serde_json::json!({}))], vec![(hash_a, serde_json::json!({}))]);
-        cache.insert_block(101, [0x02; 32], vec![(hash_b, serde_json::json!({}))], vec![(hash_b, serde_json::json!({}))]);
-        cache.insert_block(102, [0x03; 32], vec![(hash_c, serde_json::json!({}))], vec![(hash_c, serde_json::json!({}))]);
+        cache.insert_block(
+            100,
+            [0x01; 32],
+            vec![(hash_a, serde_json::json!({}))],
+            vec![(hash_a, serde_json::json!({}))],
+        );
+        cache.insert_block(
+            101,
+            [0x02; 32],
+            vec![(hash_b, serde_json::json!({}))],
+            vec![(hash_b, serde_json::json!({}))],
+        );
+        cache.insert_block(
+            102,
+            [0x03; 32],
+            vec![(hash_c, serde_json::json!({}))],
+            vec![(hash_c, serde_json::json!({}))],
+        );
 
         assert_eq!(cache.latest_block(), 102);
 
@@ -901,14 +1014,16 @@ mod tests {
     fn log_filter_address_single() {
         let log = make_log("0xabc123", &["0xtopic1"]);
         let filter = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: Some(vec!["0xabc123".to_string()]),
             topics: vec![],
         };
         assert!(log_matches_filter(&log, &filter));
 
         let filter_miss = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: Some(vec!["0xdef456".to_string()]),
             topics: vec![],
         };
@@ -919,7 +1034,8 @@ mod tests {
     fn log_filter_address_list() {
         let log = make_log("0xabc123", &[]);
         let filter = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: Some(vec!["0xdef456".to_string(), "0xabc123".to_string()]),
             topics: vec![],
         };
@@ -930,7 +1046,8 @@ mod tests {
     fn log_filter_address_wildcard() {
         let log = make_log("0xabc123", &[]);
         let filter = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: None,
             topics: vec![],
         };
@@ -941,7 +1058,8 @@ mod tests {
     fn log_filter_address_case_insensitive() {
         let log = make_log("0xAbC123", &[]);
         let filter = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: Some(vec!["0xabc123".to_string()]),
             topics: vec![],
         };
@@ -952,14 +1070,16 @@ mod tests {
     fn log_filter_topic_exact() {
         let log = make_log("0xabc", &["0xdead", "0xbeef"]);
         let filter = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: None,
             topics: vec![TopicFilter::Exact("0xdead".to_string())],
         };
         assert!(log_matches_filter(&log, &filter));
 
         let filter_miss = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: None,
             topics: vec![TopicFilter::Exact("0xbeef".to_string())],
         };
@@ -970,7 +1090,8 @@ mod tests {
     fn log_filter_topic_any() {
         let log = make_log("0xabc", &["0xdead", "0xbeef"]);
         let filter = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: None,
             topics: vec![TopicFilter::Any, TopicFilter::Exact("0xbeef".to_string())],
         };
@@ -981,16 +1102,24 @@ mod tests {
     fn log_filter_topic_one_of() {
         let log = make_log("0xabc", &["0xdead"]);
         let filter = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: None,
-            topics: vec![TopicFilter::OneOf(vec!["0xcafe".to_string(), "0xdead".to_string()])],
+            topics: vec![TopicFilter::OneOf(vec![
+                "0xcafe".to_string(),
+                "0xdead".to_string(),
+            ])],
         };
         assert!(log_matches_filter(&log, &filter));
 
         let filter_miss = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: None,
-            topics: vec![TopicFilter::OneOf(vec!["0xcafe".to_string(), "0xbabe".to_string()])],
+            topics: vec![TopicFilter::OneOf(vec![
+                "0xcafe".to_string(),
+                "0xbabe".to_string(),
+            ])],
         };
         assert!(!log_matches_filter(&log, &filter_miss));
     }
@@ -1000,7 +1129,8 @@ mod tests {
         // Log has only 1 topic, filter asks for topic at position 1
         let log = make_log("0xabc", &["0xdead"]);
         let filter = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: None,
             topics: vec![TopicFilter::Any, TopicFilter::Exact("0xbeef".to_string())],
         };
@@ -1011,15 +1141,20 @@ mod tests {
     fn log_filter_mixed_address_and_topics() {
         let log = make_log("0xabc", &["0xdead", "0xbeef"]);
         let filter = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: Some(vec!["0xabc".to_string()]),
-            topics: vec![TopicFilter::Exact("0xdead".to_string()), TopicFilter::Exact("0xbeef".to_string())],
+            topics: vec![
+                TopicFilter::Exact("0xdead".to_string()),
+                TopicFilter::Exact("0xbeef".to_string()),
+            ],
         };
         assert!(log_matches_filter(&log, &filter));
 
         // Wrong address
         let filter_wrong_addr = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: Some(vec!["0xdef".to_string()]),
             topics: vec![TopicFilter::Exact("0xdead".to_string())],
         };
@@ -1034,8 +1169,14 @@ mod tests {
         let log2 = make_log("0xbbb", &["0xevent2"]);
         let log3 = make_log("0xaaa", &["0xevent3"]);
 
-        let r1 = make_receipt_with_logs("0xaa00000000000000000000000000000000000000000000000000000000000000", vec![log1.clone()]);
-        let r2 = make_receipt_with_logs("0xbb00000000000000000000000000000000000000000000000000000000000000", vec![log2.clone(), log3.clone()]);
+        let r1 = make_receipt_with_logs(
+            "0xaa00000000000000000000000000000000000000000000000000000000000000",
+            vec![log1.clone()],
+        );
+        let r2 = make_receipt_with_logs(
+            "0xbb00000000000000000000000000000000000000000000000000000000000000",
+            vec![log2.clone(), log3.clone()],
+        );
 
         let h1 = [0xAA; 32];
         let h2 = [0xBB; 32];
@@ -1044,7 +1185,8 @@ mod tests {
 
         // All logs (no filter)
         let filter_all = LogFilter {
-            from_block: 100, to_block: 101,
+            from_block: 100,
+            to_block: 101,
             addresses: None,
             topics: vec![],
         };
@@ -1052,7 +1194,8 @@ mod tests {
 
         // Filter by address
         let filter_aaa = LogFilter {
-            from_block: 100, to_block: 101,
+            from_block: 100,
+            to_block: 101,
             addresses: Some(vec!["0xaaa".to_string()]),
             topics: vec![],
         };
@@ -1061,7 +1204,8 @@ mod tests {
 
         // Filter by single block
         let filter_block = LogFilter {
-            from_block: 101, to_block: 101,
+            from_block: 101,
+            to_block: 101,
             addresses: None,
             topics: vec![],
         };
@@ -1087,7 +1231,8 @@ mod tests {
         cache.insert_block(100, [0x01; 32], vec![], vec![]);
 
         let filter = LogFilter {
-            from_block: 100, to_block: 100,
+            from_block: 100,
+            to_block: 100,
             addresses: Some(vec!["0xnothere".to_string()]),
             topics: vec![],
         };
@@ -1099,10 +1244,7 @@ mod tests {
         let mut cache = BlockCache::new();
         for i in 0..=(MAX_CACHED_BLOCKS as u64) {
             let log = make_log(&format!("0x{:x}", i), &[]);
-            let receipt = make_receipt_with_logs(
-                &format!("0x{:0>64x}", i),
-                vec![log],
-            );
+            let receipt = make_receipt_with_logs(&format!("0x{:0>64x}", i), vec![log]);
             let mut hash = [0u8; 32];
             hash[0] = i as u8;
             cache.insert_block(i, [i as u8; 32], vec![], vec![(hash, receipt)]);
@@ -1118,7 +1260,10 @@ mod tests {
     fn logs_cleaned_on_invalidate() {
         let mut cache = BlockCache::new();
         let log = make_log("0xabc", &[]);
-        let receipt = make_receipt_with_logs("0xaa00000000000000000000000000000000000000000000000000000000000000", vec![log]);
+        let receipt = make_receipt_with_logs(
+            "0xaa00000000000000000000000000000000000000000000000000000000000000",
+            vec![log],
+        );
         cache.insert_block(100, [0x01; 32], vec![], vec![([0xAA; 32], receipt)]);
 
         assert!(cache.logs.contains_key(&100));
@@ -1313,8 +1458,10 @@ mod tests {
 
         let id1 = cache.create_block_filter();
         let id2 = cache.create_log_filter(LogFilter {
-            from_block: 100, to_block: 100,
-            addresses: None, topics: vec![],
+            from_block: 100,
+            to_block: 100,
+            addresses: None,
+            topics: vec![],
         });
         let id3 = cache.create_pending_tx_filter();
 
@@ -1336,7 +1483,8 @@ mod tests {
         // Filter [null] should NOT match a log with empty topics
         let log_no_topics = serde_json::json!({"address": "0xabc", "topics": [], "data": "0x"});
         let filter = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: None,
             topics: vec![TopicFilter::Any],
         };
@@ -1345,7 +1493,8 @@ mod tests {
         // Filter [null, null] should NOT match a log with only 1 topic
         let log_one_topic = make_log("0xabc", &["0xdead"]);
         let filter2 = LogFilter {
-            from_block: 0, to_block: 0,
+            from_block: 0,
+            to_block: 0,
             addresses: None,
             topics: vec![TopicFilter::Any, TopicFilter::Any],
         };
@@ -1363,8 +1512,10 @@ mod tests {
 
         // Create a log filter with to_block=100 when latest is already 101
         let filter = LogFilter {
-            from_block: 99, to_block: 100,
-            addresses: None, topics: vec![],
+            from_block: 99,
+            to_block: 100,
+            addresses: None,
+            topics: vec![],
         };
         let id = cache.create_log_filter(filter);
 
@@ -1383,14 +1534,22 @@ mod tests {
         let mut cache = BlockCache::new();
         let log1 = make_log("0xaaa", &[]);
         let log2 = make_log("0xaaa", &[]);
-        let r1 = make_receipt_with_logs("0xaa00000000000000000000000000000000000000000000000000000000000000", vec![log1]);
-        let r2 = make_receipt_with_logs("0xbb00000000000000000000000000000000000000000000000000000000000000", vec![log2]);
+        let r1 = make_receipt_with_logs(
+            "0xaa00000000000000000000000000000000000000000000000000000000000000",
+            vec![log1],
+        );
+        let r2 = make_receipt_with_logs(
+            "0xbb00000000000000000000000000000000000000000000000000000000000000",
+            vec![log2],
+        );
         cache.insert_block(100, [0x01; 32], vec![], vec![([0xAA; 32], r1)]);
         cache.insert_block(101, [0x02; 32], vec![], vec![([0xBB; 32], r2)]);
 
         let filter = LogFilter {
-            from_block: 100, to_block: 100,
-            addresses: None, topics: vec![],
+            from_block: 100,
+            to_block: 100,
+            addresses: None,
+            topics: vec![],
         };
         let id = cache.create_log_filter(filter);
 

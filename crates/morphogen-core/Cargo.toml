@@ -30,3 +30,8 @@ required-features = ["verifiable-pir"]
 name = "bench_verifiable_dpf"
 path = "src/bin/bench_verifiable_dpf.rs"
 required-features = ["verifiable-pir"]
+
+[[bin]]
+name = "bench_binius_dotprod"
+path = "src/bin/bench_binius_dotprod.rs"
+required-features = ["verifiable-pir"]
