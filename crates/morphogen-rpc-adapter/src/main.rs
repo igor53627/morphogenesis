@@ -1,4 +1,6 @@
 mod code_resolver;
+mod evm;
+mod pir_db;
 
 use anyhow::Result;
 use clap::Parser;
@@ -56,8 +58,8 @@ struct Args {
 struct AdapterState {
     args: Args,
     http_client: reqwest::Client,
-    pir_client: PirClient,
-    code_resolver: CodeResolver,
+    pir_client: Arc<PirClient>,
+    code_resolver: Arc<CodeResolver>,
 }
 
 const PASSTHROUGH_METHODS: &[&str] = &[
@@ -66,7 +68,6 @@ const PASSTHROUGH_METHODS: &[&str] = &[
     "eth_gasPrice",
     "eth_estimateGas",
     "eth_sendRawTransaction",
-    "eth_call", // Still passthrough for now until Phase 2
     "net_version",
     "web3_clientVersion",
     // Wallet Essentials (History & Status)
@@ -103,8 +104,14 @@ async fn main() -> Result<()> {
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     let server = Server::builder().build(addr).await?;
 
-    let pir_client = PirClient::new(args.pir_server_a.clone(), args.pir_server_b.clone());
-    let code_resolver = CodeResolver::new(args.dict_url.clone(), args.cas_url.clone());
+    let pir_client = Arc::new(PirClient::new(
+        args.pir_server_a.clone(),
+        args.pir_server_b.clone(),
+    ));
+    let code_resolver = Arc::new(CodeResolver::new(
+        args.dict_url.clone(),
+        args.cas_url.clone(),
+    ));
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.upstream_timeout))
@@ -352,6 +359,46 @@ async fn main() -> Result<()> {
         }
     })?;
 
+    // Register eth_call (Private via local EVM execution)
+    module.register_async_method("eth_call", |params, state, _| async move {
+        let (call_params, _block): (Value, Value) = params.parse()?;
+
+        info!("Private eth_call via local EVM");
+
+        match evm::execute_eth_call(
+            Arc::clone(&state.pir_client),
+            Arc::clone(&state.code_resolver),
+            state.http_client.clone(),
+            state.args.upstream.clone(),
+            &call_params,
+        )
+        .await
+        {
+            Ok(output) => {
+                Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{}", hex::encode(&output))))
+            }
+            Err(e) => {
+                error!("Private eth_call failed: {}", e);
+                if state.args.fallback_to_upstream {
+                    warn!("Falling back to upstream for eth_call (privacy degraded)");
+                    let params = serde_json::json!([call_params, _block]);
+                    return proxy_to_upstream(
+                        &state.args.upstream,
+                        &state.http_client,
+                        "eth_call",
+                        params,
+                    )
+                    .await;
+                }
+                Err(ErrorObjectOwned::owned(
+                    -32000,
+                    format!("eth_call failed: {}", e),
+                    None::<()>,
+                ))
+            }
+        }
+    })?;
+
     // Register passthrough methods
     for method in PASSTHROUGH_METHODS {
         let method_name = method.to_string();
@@ -443,8 +490,9 @@ mod tests {
     fn test_passthrough_methods_include_filter_apis() {
         // Test against actual production allowlist (prevents regression)
 
-        // Verify eth_getStorageAt is now private (NOT in passthrough)
+        // Verify private methods are NOT in passthrough
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_getStorageAt"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_call"));
 
         // Verify eth_getProof is still passthrough
         assert!(PASSTHROUGH_METHODS.contains(&"eth_getProof"));

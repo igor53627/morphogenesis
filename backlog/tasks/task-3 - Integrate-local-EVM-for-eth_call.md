@@ -1,7 +1,7 @@
 ---
 id: TASK-3
 title: Integrate local EVM for eth_call
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-03 14:30'
 labels: []
