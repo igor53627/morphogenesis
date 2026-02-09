@@ -404,6 +404,360 @@ impl PirClient {
         Err(anyhow!("PIR query failed after {} retries", MAX_RETRIES))
     }
 
+    /// Send a batch of PIR queries to both servers and aggregate the results.
+    /// Returns (response_epoch_id, Vec<aggregated_payloads>).
+    async fn execute_batch_pir_query(
+        &self,
+        keys: &[Vec<u8>],
+        metadata: &EpochMetadata,
+    ) -> Result<(u64, Vec<[Vec<u8>; QUERIES_PER_REQUEST]>), PirQueryError> {
+        let n = keys.len();
+        if n == 0 {
+            return Ok((metadata.epoch_id, vec![]));
+        }
+
+        // Generate N query key sets
+        let mut all_query_keys = Vec::with_capacity(n);
+        {
+            let mut rng = thread_rng();
+            for key in keys {
+                all_query_keys.push(generate_query(&mut rng, key, metadata));
+            }
+        }
+
+        // Build batch requests for each server
+        let queries_a: Vec<serde_json::Value> = all_query_keys
+            .iter()
+            .map(|qk| {
+                serde_json::json!({
+                    "keys": qk.keys_a.iter()
+                        .map(|k| format!("0x{}", hex::encode(k.to_bytes())))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let queries_b: Vec<serde_json::Value> = all_query_keys
+            .iter()
+            .map(|qk| {
+                serde_json::json!({
+                    "keys": qk.keys_b.iter()
+                        .map(|k| format!("0x{}", hex::encode(k.to_bytes())))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let req_a = self
+            .http_client
+            .post(format!("{}/query/batch", self.server_a_url))
+            .json(&serde_json::json!({ "queries": queries_a }))
+            .send();
+
+        let req_b = self
+            .http_client
+            .post(format!("{}/query/batch", self.server_b_url))
+            .json(&serde_json::json!({ "queries": queries_b }))
+            .send();
+
+        let (resp_a, resp_b) = tokio::try_join!(req_a, req_b).map_err(|e| {
+            if is_transient(&e) {
+                PirQueryError::Transient(e.to_string())
+            } else {
+                PirQueryError::Permanent(format!("PIR batch request failed: {}", e))
+            }
+        })?;
+
+        if !resp_a.status().is_success() {
+            let status = resp_a.status();
+            return Err(if status.is_server_error() {
+                PirQueryError::Transient(format!("Server A returned {}", status))
+            } else {
+                PirQueryError::Permanent(format!("Server A returned {}", status))
+            });
+        }
+        if !resp_b.status().is_success() {
+            let status = resp_b.status();
+            return Err(if status.is_server_error() {
+                PirQueryError::Transient(format!("Server B returned {}", status))
+            } else {
+                PirQueryError::Permanent(format!("Server B returned {}", status))
+            });
+        }
+
+        #[derive(Deserialize)]
+        struct BatchResult {
+            payloads: Vec<String>,
+        }
+
+        #[derive(Deserialize)]
+        struct BatchResponse {
+            epoch_id: u64,
+            results: Vec<BatchResult>,
+        }
+
+        let json_a: BatchResponse = resp_a.json().await.map_err(|e| {
+            PirQueryError::Permanent(format!("Failed to parse server A batch response: {}", e))
+        })?;
+        let json_b: BatchResponse = resp_b.json().await.map_err(|e| {
+            PirQueryError::Permanent(format!("Failed to parse server B batch response: {}", e))
+        })?;
+
+        // Validate epoch consistency
+        if json_a.epoch_id != json_b.epoch_id {
+            return Err(PirQueryError::EpochMismatch {
+                server_a: json_a.epoch_id,
+                server_b: json_b.epoch_id,
+            });
+        }
+        if json_a.epoch_id != metadata.epoch_id {
+            return Err(PirQueryError::StaleMetadata {
+                expected: metadata.epoch_id,
+                got: json_a.epoch_id,
+            });
+        }
+
+        if json_a.results.len() != n || json_b.results.len() != n {
+            return Err(PirQueryError::Permanent(format!(
+                "Batch result count mismatch: expected {}, got a={}, b={}",
+                n,
+                json_a.results.len(),
+                json_b.results.len()
+            )));
+        }
+
+        let parse_payloads =
+            |payloads: Vec<String>| -> Result<[Vec<u8>; QUERIES_PER_REQUEST], PirQueryError> {
+                if payloads.len() != QUERIES_PER_REQUEST {
+                    return Err(PirQueryError::Permanent(format!(
+                        "Invalid payload count: got {}, expected {}",
+                        payloads.len(),
+                        QUERIES_PER_REQUEST
+                    )));
+                }
+                let mut out: [Vec<u8>; QUERIES_PER_REQUEST] = Default::default();
+                for (i, p) in payloads.into_iter().enumerate() {
+                    let hex_p = p.strip_prefix("0x").unwrap_or(&p);
+                    out[i] = hex::decode(hex_p).map_err(|e| {
+                        PirQueryError::Permanent(format!("Hex decode error: {}", e))
+                    })?;
+                }
+                Ok(out)
+            };
+
+        // XOR corresponding payloads
+        let mut aggregated = Vec::with_capacity(n);
+        for (result_a, result_b) in json_a.results.into_iter().zip(json_b.results.into_iter()) {
+            let payloads_a = parse_payloads(result_a.payloads)?;
+            let payloads_b = parse_payloads(result_b.payloads)?;
+
+            let mut xored: [Vec<u8>; QUERIES_PER_REQUEST] = Default::default();
+            for i in 0..QUERIES_PER_REQUEST {
+                if payloads_a[i].len() != payloads_b[i].len() {
+                    return Err(PirQueryError::Permanent(format!(
+                        "Payload length mismatch at index {}: a={}, b={}",
+                        i,
+                        payloads_a[i].len(),
+                        payloads_b[i].len()
+                    )));
+                }
+                xored[i] = payloads_a[i]
+                    .iter()
+                    .zip(payloads_b[i].iter())
+                    .map(|(&a, &b)| a ^ b)
+                    .collect();
+            }
+            aggregated.push(xored);
+        }
+
+        Ok((json_a.epoch_id, aggregated))
+    }
+
+    /// Execute a batch of PIR queries with caching and retry logic.
+    /// Checks cache for each key; only queries misses over the network.
+    async fn execute_batch_pir_query_with_retry(
+        &self,
+        keys: &[Vec<u8>],
+    ) -> Result<Vec<[Vec<u8>; QUERIES_PER_REQUEST]>> {
+        let n = keys.len();
+        if n == 0 {
+            return Ok(vec![]);
+        }
+
+        let metadata = self.get_metadata().await?;
+
+        // Partition into cached hits and uncached misses
+        let mut results: Vec<Option<[Vec<u8>; QUERIES_PER_REQUEST]>> = vec![None; n];
+        let mut miss_indices: Vec<usize> = Vec::new();
+        let mut miss_keys: Vec<Vec<u8>> = Vec::new();
+
+        {
+            let cache = self.cache.lock().await;
+            for (i, key) in keys.iter().enumerate() {
+                if let Some(cached) = cache.get(metadata.epoch_id, key) {
+                    debug!("PIR batch cache hit for key {}", i);
+                    results[i] = Some(cached.clone());
+                } else {
+                    miss_indices.push(i);
+                    miss_keys.push(key.clone());
+                }
+            }
+        }
+
+        if miss_keys.is_empty() {
+            return Ok(results.into_iter().map(|r| r.unwrap()).collect());
+        }
+
+        // Batch-query the misses with retry
+        for attempt in 0..=MAX_RETRIES {
+            let current_metadata = if attempt == 0 {
+                metadata.clone()
+            } else {
+                debug!(attempt, "Retrying batch PIR query, refreshing metadata");
+                match self.update_metadata().await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(attempt, error = %e, "Failed to refresh metadata on retry");
+                        metadata.clone()
+                    }
+                }
+            };
+
+            match self
+                .execute_batch_pir_query(&miss_keys, &current_metadata)
+                .await
+            {
+                Ok((response_epoch, batch_results)) => {
+                    let mut cache = self.cache.lock().await;
+                    for (j, miss_idx) in miss_indices.iter().enumerate() {
+                        cache.put(
+                            response_epoch,
+                            miss_keys[j].clone(),
+                            batch_results[j].clone(),
+                        );
+                        results[*miss_idx] = Some(batch_results[j].clone());
+                    }
+                    return Ok(results.into_iter().map(|r| r.unwrap()).collect());
+                }
+                Err(e) => {
+                    if attempt < MAX_RETRIES && e.is_retryable() {
+                        let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
+                        warn!(
+                            attempt,
+                            delay_ms = delay.as_millis() as u64,
+                            error = %e,
+                            "Batch PIR query failed, retrying"
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(anyhow!("Batch PIR query failed: {}", e));
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "Batch PIR query failed after {} retries",
+            MAX_RETRIES
+        ))
+    }
+
+    pub async fn query_accounts_batch(
+        &self,
+        addresses: &[[u8; 20]],
+    ) -> Result<Vec<AccountData>> {
+        let keys: Vec<Vec<u8>> = addresses.iter().map(|a| a.to_vec()).collect();
+        let all_payloads = self.execute_batch_pir_query_with_retry(&keys).await?;
+
+        let mut results = Vec::with_capacity(addresses.len());
+        for payloads in &all_payloads {
+            let mut found = false;
+            for payload in payloads.iter() {
+                if let Some(data) = AccountData::from_bytes(payload) {
+                    if data.balance > 0 || data.nonce > 0 || data.code_id.unwrap_or(0) > 0 {
+                        results.push(data);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if !found {
+                results.push(AccountData {
+                    nonce: 0,
+                    balance: 0,
+                    code_hash: None,
+                    code_id: None,
+                });
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub async fn query_storages_batch(
+        &self,
+        queries: &[([u8; 20], [u8; 32])],
+    ) -> Result<Vec<StorageData>> {
+        use alloy_primitives::keccak256;
+
+        let keys: Vec<Vec<u8>> = queries
+            .iter()
+            .map(|(address, slot)| storage_query_key(*address, *slot).to_vec())
+            .collect();
+
+        let all_payloads = self.execute_batch_pir_query_with_retry(&keys).await?;
+
+        let mut results = Vec::with_capacity(queries.len());
+        for (i, payloads) in all_payloads.iter().enumerate() {
+            let (address, slot) = &queries[i];
+
+            // Compute expected tag
+            let mut storage_key = [0u8; 52];
+            storage_key[0..20].copy_from_slice(address);
+            storage_key[20..52].copy_from_slice(slot);
+            let tag_hash = keccak256(storage_key);
+            let expected_tag: [u8; 8] = tag_hash[0..8].try_into().unwrap();
+
+            let mut found = false;
+
+            // Find payload with matching tag (Optimized48)
+            for payload in payloads.iter() {
+                if let Some(data) = StorageData::from_bytes(payload) {
+                    if let Some(tag) = data.tag {
+                        if tag == expected_tag {
+                            results.push(data);
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if !found {
+                // Legacy fallback: single non-zero 32-byte payload
+                let mut legacy_candidates: Vec<StorageData> = Vec::new();
+                for payload in payloads.iter() {
+                    if let Some(data) = StorageData::from_bytes(payload) {
+                        if data.tag.is_none() && data.value != [0u8; 32] {
+                            legacy_candidates.push(data);
+                        }
+                    }
+                }
+
+                if legacy_candidates.len() == 1 {
+                    results.push(legacy_candidates.into_iter().next().unwrap());
+                } else {
+                    results.push(StorageData {
+                        value: [0u8; 32],
+                        tag: None,
+                    });
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     pub async fn query_account(&self, address: [u8; 20]) -> Result<AccountData> {
         let payloads = self.execute_pir_query_with_retry(&address).await?;
 
@@ -559,5 +913,66 @@ mod tests {
         }
         .is_retryable());
         assert!(!PirQueryError::Permanent("bad data".into()).is_retryable());
+    }
+
+    #[tokio::test]
+    async fn batch_cache_partitioning() {
+        let client = PirClient::new(
+            "http://localhost:1".to_string(),
+            "http://localhost:2".to_string(),
+        );
+
+        // Pre-populate cache with one key
+        let epoch_id = 42;
+        let key1 = vec![0x11; 20];
+        let payloads1 = make_payloads();
+
+        {
+            let mut cache = client.cache.lock().await;
+            cache.put(epoch_id, key1.clone(), payloads1.clone());
+        }
+
+        // Set metadata so cache can match
+        {
+            let mut lock = client.metadata.write().await;
+            *lock = Some(Arc::new(EpochMetadata {
+                epoch_id,
+                num_rows: 1000,
+                seeds: [1, 2, 3],
+                block_number: 100,
+                state_root: [0u8; 32],
+            }));
+        }
+
+        // Verify cache hit works
+        {
+            let cache = client.cache.lock().await;
+            assert!(cache.get(epoch_id, &key1).is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_empty_returns_empty() {
+        let client = PirClient::new(
+            "http://localhost:1".to_string(),
+            "http://localhost:2".to_string(),
+        );
+
+        // Set metadata
+        {
+            let mut lock = client.metadata.write().await;
+            *lock = Some(Arc::new(EpochMetadata {
+                epoch_id: 1,
+                num_rows: 1000,
+                seeds: [1, 2, 3],
+                block_number: 100,
+                state_root: [0u8; 32],
+            }));
+        }
+
+        let keys: Vec<Vec<u8>> = vec![];
+        let result = client.execute_batch_pir_query_with_retry(&keys).await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
     }
 }

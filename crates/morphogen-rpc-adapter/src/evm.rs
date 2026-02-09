@@ -146,6 +146,69 @@ fn parse_call_params(call_params: &Value) -> Result<CallParams, EthCallError> {
     Ok(CallParams { from, to, data, value, gas })
 }
 
+/// Parse and batch-prefetch all accounts and storage slots from an EIP-2930 access list.
+/// This populates the PirClient's internal cache so subsequent revm Database calls
+/// hit warm cache instead of making individual network round-trips.
+async fn prefetch_access_list(pir_client: &Arc<PirClient>, entries: &[Value]) {
+    let mut addresses: Vec<[u8; 20]> = Vec::new();
+    let mut storage_queries: Vec<([u8; 20], [u8; 32])> = Vec::new();
+
+    for entry in entries {
+        let addr = match entry
+            .get("address")
+            .and_then(|v| v.as_str())
+            .and_then(|s| {
+                let hex = s.strip_prefix("0x").unwrap_or(s);
+                hex::decode(hex).ok()
+            })
+            .filter(|b| b.len() == 20)
+        {
+            Some(bytes) => {
+                let mut addr = [0u8; 20];
+                addr.copy_from_slice(&bytes);
+                addr
+            }
+            None => continue,
+        };
+
+        addresses.push(addr);
+
+        if let Some(keys) = entry.get("storageKeys").and_then(|v| v.as_array()) {
+            for key in keys {
+                if let Some(slot_bytes) = key.as_str().and_then(|s| {
+                    let hex = s.strip_prefix("0x").unwrap_or(s);
+                    hex::decode(hex).ok()
+                }) {
+                    if slot_bytes.len() == 32 {
+                        let mut slot = [0u8; 32];
+                        slot.copy_from_slice(&slot_bytes);
+                        storage_queries.push((addr, slot));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fire both batch queries concurrently
+    let accounts_fut = async {
+        if !addresses.is_empty() {
+            if let Err(e) = pir_client.query_accounts_batch(&addresses).await {
+                info!("Access list account prefetch failed (non-fatal): {}", e);
+            }
+        }
+    };
+
+    let storage_fut = async {
+        if !storage_queries.is_empty() {
+            if let Err(e) = pir_client.query_storages_batch(&storage_queries).await {
+                info!("Access list storage prefetch failed (non-fatal): {}", e);
+            }
+        }
+    };
+
+    tokio::join!(accounts_fut, storage_fut);
+}
+
 /// Run EVM execution and return the raw ExecutionResult.
 /// Sets basefee=0 for simulation so calls with gas_price=0 don't fail
 /// (matches Geth's behavior for eth_call/eth_estimateGas).
@@ -165,6 +228,14 @@ async fn run_evm(
     let block_info = fetch_block_info(&upstream_client, &upstream_url, &validated_tag)
         .await
         .map_err(EthCallError::Internal)?;
+
+    // Access-list prefetch: batch-fetch all listed accounts and storage slots
+    // to populate the PirClient cache before EVM execution begins.
+    if let Some(access_list) = call_params.get("accessList") {
+        if let Some(entries) = access_list.as_array() {
+            prefetch_access_list(&pir_client, entries).await;
+        }
+    }
 
     let from = parsed.from;
     let to = parsed.to;

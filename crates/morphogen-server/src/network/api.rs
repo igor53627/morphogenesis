@@ -109,6 +109,26 @@ pub struct QueryResponse {
     pub payloads: Vec<Vec<u8>>,
 }
 
+/// Maximum number of queries in a single batch request.
+pub const MAX_BATCH_SIZE: usize = 32;
+
+#[derive(Deserialize)]
+pub struct BatchQueryRequest {
+    pub queries: Vec<QueryRequest>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchQueryResponse {
+    pub epoch_id: u64,
+    pub results: Vec<BatchQueryResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchQueryResult {
+    #[serde(with = "hex_bytes_vec")]
+    pub payloads: Vec<Vec<u8>>,
+}
+
 /// Page-level PIR query response.
 ///
 /// Returns full pages (4KB each) that the client XORs with the other server's response.
@@ -312,6 +332,95 @@ pub async fn query_handler(
     Ok(Json(QueryResponse {
         epoch_id,
         payloads: results.to_vec(),
+    }))
+}
+
+#[cfg_attr(feature = "tracing", instrument(skip(state, request)))]
+pub async fn batch_query_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BatchQueryRequest>,
+) -> Result<Json<BatchQueryResponse>, StatusCode> {
+    #[cfg(feature = "metrics")]
+    counter!("pir_query_count_total", "type" => "batch").increment(1);
+
+    use morphogen_dpf::{AesDpfKey, DpfKey};
+
+    let n = request.queries.len();
+    if n == 0 || n > MAX_BATCH_SIZE {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    // Validate all queries have exactly 3 keys and parse DPF keys upfront
+    let mut all_keys: Vec<[AesDpfKey; 3]> = Vec::with_capacity(n);
+    for query in &request.queries {
+        if query.keys.len() != 3 {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        let keys: [AesDpfKey; 3] = match (
+            AesDpfKey::from_bytes(&query.keys[0]),
+            AesDpfKey::from_bytes(&query.keys[1]),
+            AesDpfKey::from_bytes(&query.keys[2]),
+        ) {
+            (Ok(k0), Ok(k1), Ok(k2)) => [k0, k1, k2],
+            _ => return Err(StatusCode::BAD_REQUEST),
+        };
+        all_keys.push(keys);
+    }
+
+    // Take a consistent snapshot once for all queries
+    let snapshot1 = state.global.load();
+    let epoch1 = snapshot1.epoch_id;
+    let pending = state.global.load_pending();
+    let (pending_epoch, entries) = pending
+        .snapshot_with_epoch()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let snapshot2 = state.global.load();
+
+    if snapshot2.epoch_id != epoch1 || pending_epoch != epoch1 {
+        // Epoch changed during snapshot — fall back to per-query scan_consistent
+        let mut results = Vec::with_capacity(n);
+        for keys in &all_keys {
+            let (payloads, _) = crate::scan::scan_consistent(
+                state.global.as_ref(),
+                state.global.load_pending().as_ref(),
+                keys,
+                state.row_size_bytes,
+            )
+            .map_err(scan_error_to_status)?;
+            results.push(BatchQueryResult {
+                payloads: payloads.to_vec(),
+            });
+        }
+        let epoch_id = state.global.load().epoch_id;
+        return Ok(Json(BatchQueryResponse { epoch_id, results }));
+    }
+
+    // All queries share the same consistent snapshot
+    let mut results = Vec::with_capacity(n);
+    for keys in &all_keys {
+        let mut payloads = crate::scan::scan_main_matrix(
+            snapshot1.matrix.as_ref(),
+            keys,
+            state.row_size_bytes,
+        );
+        // Apply delta entries
+        for entry in &entries {
+            for (k, key) in keys.iter().enumerate() {
+                if key.eval_bit(entry.row_idx) {
+                    for (d, s) in payloads[k].iter_mut().zip(entry.diff.iter()) {
+                        *d ^= s;
+                    }
+                }
+            }
+        }
+        results.push(BatchQueryResult {
+            payloads: payloads.to_vec(),
+        });
+    }
+
+    Ok(Json(BatchQueryResponse {
+        epoch_id: epoch1,
+        results,
     }))
 }
 
@@ -570,10 +679,141 @@ fn ws_error_json(error: &str, code: &str) -> String {
     .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string())
 }
 
-async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
+fn handle_ws_single_query(
+    state: &AppState,
+    request: QueryRequest,
+) -> String {
     use crate::scan::scan_consistent;
     use morphogen_dpf::AesDpfKey;
 
+    if request.keys.len() != 3 {
+        return ws_error_json("expected exactly 3 keys", "bad_request");
+    }
+
+    let keys_result = (
+        AesDpfKey::from_bytes(&request.keys[0]),
+        AesDpfKey::from_bytes(&request.keys[1]),
+        AesDpfKey::from_bytes(&request.keys[2]),
+    );
+
+    match keys_result {
+        (Ok(k0), Ok(k1), Ok(k2)) => {
+            let keys = [k0, k1, k2];
+            match scan_consistent(
+                state.global.as_ref(),
+                state.global.load_pending().as_ref(),
+                &keys,
+                state.row_size_bytes,
+            ) {
+                Ok((results, epoch_id)) => serde_json::to_string(&QueryResponse {
+                    epoch_id,
+                    payloads: results.to_vec(),
+                })
+                .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string()),
+                Err(e) => {
+                    use crate::scan::ScanError;
+                    let code = match e {
+                        ScanError::TooManyRetries { .. } => "too_many_retries",
+                        ScanError::LockPoisoned => "internal_error",
+                        ScanError::MatrixNotAligned { .. } => "internal_error",
+                        ScanError::ChunkNotAligned { .. } => "internal_error",
+                    };
+                    ws_error_json(&format!("scan error: {}", e), code)
+                }
+            }
+        }
+        _ => ws_error_json("invalid key format", "bad_request"),
+    }
+}
+
+fn handle_ws_batch_query(
+    state: &AppState,
+    request: BatchQueryRequest,
+) -> String {
+    use crate::scan::scan_consistent;
+    use morphogen_dpf::{AesDpfKey, DpfKey};
+
+    let n = request.queries.len();
+    if n == 0 || n > MAX_BATCH_SIZE {
+        return ws_error_json("batch size must be 1..=32", "bad_request");
+    }
+
+    let mut all_keys: Vec<[AesDpfKey; 3]> = Vec::with_capacity(n);
+    for query in &request.queries {
+        if query.keys.len() != 3 {
+            return ws_error_json("each query must have exactly 3 keys", "bad_request");
+        }
+        match (
+            AesDpfKey::from_bytes(&query.keys[0]),
+            AesDpfKey::from_bytes(&query.keys[1]),
+            AesDpfKey::from_bytes(&query.keys[2]),
+        ) {
+            (Ok(k0), Ok(k1), Ok(k2)) => all_keys.push([k0, k1, k2]),
+            _ => return ws_error_json("invalid key format", "bad_request"),
+        }
+    }
+
+    // Try consistent snapshot for all queries
+    let snapshot1 = state.global.load();
+    let epoch1 = snapshot1.epoch_id;
+    let pending = state.global.load_pending();
+    let snapshot_result = pending.snapshot_with_epoch();
+    let (pending_epoch, entries) = match snapshot_result {
+        Ok(r) => r,
+        Err(_) => return ws_error_json("internal error", "internal_error"),
+    };
+    let snapshot2 = state.global.load();
+
+    if snapshot2.epoch_id != epoch1 || pending_epoch != epoch1 {
+        // Fallback: per-query scan_consistent
+        let mut results = Vec::with_capacity(n);
+        for keys in &all_keys {
+            match scan_consistent(
+                state.global.as_ref(),
+                state.global.load_pending().as_ref(),
+                keys,
+                state.row_size_bytes,
+            ) {
+                Ok((payloads, _)) => results.push(BatchQueryResult {
+                    payloads: payloads.to_vec(),
+                }),
+                Err(e) => return ws_error_json(&format!("scan error: {}", e), "internal_error"),
+            }
+        }
+        let epoch_id = state.global.load().epoch_id;
+        return serde_json::to_string(&BatchQueryResponse { epoch_id, results })
+            .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string());
+    }
+
+    let mut results = Vec::with_capacity(n);
+    for keys in &all_keys {
+        let mut payloads = crate::scan::scan_main_matrix(
+            snapshot1.matrix.as_ref(),
+            keys,
+            state.row_size_bytes,
+        );
+        for entry in &entries {
+            for (k, key) in keys.iter().enumerate() {
+                if key.eval_bit(entry.row_idx) {
+                    for (d, s) in payloads[k].iter_mut().zip(entry.diff.iter()) {
+                        *d ^= s;
+                    }
+                }
+            }
+        }
+        results.push(BatchQueryResult {
+            payloads: payloads.to_vec(),
+        });
+    }
+
+    serde_json::to_string(&BatchQueryResponse {
+        epoch_id: epoch1,
+        results,
+    })
+    .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string())
+}
+
+async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
     while let Some(Ok(msg)) = socket.recv().await {
         if let Message::Text(text) = msg {
             if text.len() > MAX_WS_MESSAGE_BYTES {
@@ -582,45 +822,14 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
                 continue;
             }
 
-            let response = match serde_json::from_str::<QueryRequest>(&text) {
-                Ok(request) if request.keys.len() == 3 => {
-                    let keys_result = (
-                        AesDpfKey::from_bytes(&request.keys[0]),
-                        AesDpfKey::from_bytes(&request.keys[1]),
-                        AesDpfKey::from_bytes(&request.keys[2]),
-                    );
-
-                    match keys_result {
-                        (Ok(k0), Ok(k1), Ok(k2)) => {
-                            let keys = [k0, k1, k2];
-                            match scan_consistent(
-                                state.global.as_ref(),
-                                state.global.load_pending().as_ref(),
-                                &keys,
-                                state.row_size_bytes,
-                            ) {
-                                Ok((results, epoch_id)) => serde_json::to_string(&QueryResponse {
-                                    epoch_id,
-                                    payloads: results.to_vec(),
-                                })
-                                .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string()),
-                                Err(e) => {
-                                    use crate::scan::ScanError;
-                                    let code = match e {
-                                        ScanError::TooManyRetries { .. } => "too_many_retries",
-                                        ScanError::LockPoisoned => "internal_error",
-                                        ScanError::MatrixNotAligned { .. } => "internal_error",
-                                        ScanError::ChunkNotAligned { .. } => "internal_error",
-                                    };
-                                    ws_error_json(&format!("scan error: {}", e), code)
-                                }
-                            }
-                        }
-                        _ => ws_error_json("invalid key format", "bad_request"),
-                    }
+            // Try batch request first (has "queries" field), fall back to single query
+            let response = if let Ok(batch) = serde_json::from_str::<BatchQueryRequest>(&text) {
+                handle_ws_batch_query(&state, batch)
+            } else {
+                match serde_json::from_str::<QueryRequest>(&text) {
+                    Ok(request) => handle_ws_single_query(&state, request),
+                    Err(e) => ws_error_json(&e.to_string(), "bad_request"),
                 }
-                Ok(_) => ws_error_json("expected exactly 3 keys", "bad_request"),
-                Err(e) => ws_error_json(&e.to_string(), "bad_request"),
             };
 
             if socket.send(Message::Text(response.into())).await.is_err() {
@@ -630,11 +839,10 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
-/// Maximum request body size: 16KB for row queries, 8KB for page queries
-/// Row query: 3 keys × 25 bytes = 75 bytes + JSON overhead ≈ 500 bytes
-/// Page query: 3 keys × 500 bytes = 1500 bytes + JSON overhead ≈ 4KB
-/// Using 16KB as a safe upper bound with room for future expansion
-pub const MAX_REQUEST_BODY_SIZE: usize = 16 * 1024;
+/// Maximum request body size: 64KB
+/// Batch queries: up to 32 queries × 3 keys × ~55 hex chars ≈ 5KB
+/// Using 64KB as a safe upper bound with room for batch queries
+pub const MAX_REQUEST_BODY_SIZE: usize = 64 * 1024;
 
 /// Maximum WebSocket message size (same limit as HTTP body)
 pub const MAX_WS_MESSAGE_BYTES: usize = MAX_REQUEST_BODY_SIZE;
@@ -665,6 +873,7 @@ pub fn create_router_with_concurrency(
 
     let scan_routes = Router::new()
         .route("/query", post(query_handler))
+        .route("/query/batch", post(batch_query_handler))
         .route("/query/page", post(page_query_handler))
         .route("/query/page/gpu", post(page_query_gpu_handler))
         .layer(ConcurrencyLimitLayer::new(max_concurrent));
@@ -831,5 +1040,127 @@ mod tests {
         // Keys shorter than 25 bytes should be rejected
         use morphogen_dpf::AES_DPF_KEY_SIZE;
         assert_eq!(AES_DPF_KEY_SIZE, 25);
+    }
+
+    #[test]
+    fn batch_request_deserializes() {
+        let json = r#"{"queries":[{"keys":["0xaabb","0xccdd","0xeeff"]}]}"#;
+        let request: BatchQueryRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.queries.len(), 1);
+        assert_eq!(request.queries[0].keys.len(), 3);
+    }
+
+    #[test]
+    fn batch_response_serializes_correctly() {
+        let response = BatchQueryResponse {
+            epoch_id: 42,
+            results: vec![
+                BatchQueryResult {
+                    payloads: vec![vec![0xDE, 0xAD], vec![0xBE, 0xEF], vec![0xCA, 0xFE]],
+                },
+                BatchQueryResult {
+                    payloads: vec![vec![0x11], vec![0x22], vec![0x33]],
+                },
+            ],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"epoch_id\":42"));
+        assert!(json.contains("\"results\""));
+        assert!(json.contains("\"0xdead\""));
+        assert!(json.contains("\"0x11\""));
+    }
+
+    #[tokio::test]
+    async fn batch_query_empty_returns_bad_request() {
+        let state = test_state();
+        let request = BatchQueryRequest { queries: vec![] };
+        let result = batch_query_handler(State(state), Json(request)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn batch_query_too_large_returns_bad_request() {
+        let state = test_state();
+        let queries: Vec<QueryRequest> = (0..MAX_BATCH_SIZE + 1)
+            .map(|_| QueryRequest {
+                keys: vec![vec![0u8; 25], vec![0u8; 25], vec![0u8; 25]],
+            })
+            .collect();
+        let request = BatchQueryRequest { queries };
+        let result = batch_query_handler(State(state), Json(request)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn batch_query_wrong_key_count_returns_bad_request() {
+        let state = test_state();
+        let request = BatchQueryRequest {
+            queries: vec![QueryRequest {
+                keys: vec![vec![0u8; 25], vec![0u8; 25]], // only 2 keys
+            }],
+        };
+        let result = batch_query_handler(State(state), Json(request)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn batch_query_of_one_returns_single_result() {
+        use morphogen_dpf::AesDpfKey;
+
+        let state = test_state();
+        let mut rng = rand::thread_rng();
+        let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (k1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (k2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+
+        let request = BatchQueryRequest {
+            queries: vec![QueryRequest {
+                keys: vec![
+                    k0.to_bytes().to_vec(),
+                    k1.to_bytes().to_vec(),
+                    k2.to_bytes().to_vec(),
+                ],
+            }],
+        };
+        let result = batch_query_handler(State(state), Json(request)).await;
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.results.len(), 1);
+        assert_eq!(response.results[0].payloads.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn batch_query_of_three_returns_three_results() {
+        use morphogen_dpf::AesDpfKey;
+
+        let state = test_state();
+        let mut rng = rand::thread_rng();
+
+        let mut queries = Vec::new();
+        for target in [0, 1, 2] {
+            let (k0, _) = AesDpfKey::generate_pair(&mut rng, target);
+            let (k1, _) = AesDpfKey::generate_pair(&mut rng, target + 1);
+            let (k2, _) = AesDpfKey::generate_pair(&mut rng, target + 2);
+            queries.push(QueryRequest {
+                keys: vec![
+                    k0.to_bytes().to_vec(),
+                    k1.to_bytes().to_vec(),
+                    k2.to_bytes().to_vec(),
+                ],
+            });
+        }
+
+        let request = BatchQueryRequest { queries };
+        let result = batch_query_handler(State(state), Json(request)).await;
+        assert!(result.is_ok());
+        let response = result.unwrap().0;
+        assert_eq!(response.results.len(), 3);
+        assert_eq!(response.epoch_id, 42);
+        for r in &response.results {
+            assert_eq!(r.payloads.len(), 3);
+        }
     }
 }
