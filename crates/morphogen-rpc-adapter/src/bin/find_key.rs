@@ -1,4 +1,3 @@
-use hex;
 use morphogen_core::cuckoo::CuckooAddresser;
 
 fn main() {

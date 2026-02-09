@@ -61,7 +61,7 @@ pub fn aggregate_responses(
 
     let mut payloads: [Vec<u8>; QUERIES_PER_REQUEST] = Default::default();
 
-    for i in 0..QUERIES_PER_REQUEST {
+    for (i, payload) in payloads.iter_mut().enumerate() {
         let a = &response_a.payloads[i];
         let b = &response_b.payloads[i];
 
@@ -73,7 +73,7 @@ pub fn aggregate_responses(
             });
         }
 
-        payloads[i] = a.iter().zip(b.iter()).map(|(&x, &y)| x ^ y).collect();
+        *payload = a.iter().zip(b.iter()).map(|(&x, &y)| x ^ y).collect();
     }
 
     Ok(AggregatedResult {

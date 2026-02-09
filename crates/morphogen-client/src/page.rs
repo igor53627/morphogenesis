@@ -77,7 +77,7 @@ pub fn aggregate_page_responses(
 
     let mut pages: [Vec<u8>; QUERIES_PER_REQUEST] = Default::default();
 
-    for i in 0..QUERIES_PER_REQUEST {
+    for (i, page) in pages.iter_mut().enumerate() {
         let a = &response_a.pages[i];
         let b = &response_b.pages[i];
 
@@ -89,8 +89,8 @@ pub fn aggregate_page_responses(
             });
         }
 
-        pages[i] = vec![0u8; a.len()];
-        xor_pages(a, b, &mut pages[i]);
+        *page = vec![0u8; a.len()];
+        xor_pages(a, b, page);
     }
 
     Ok(PageAggregatedResult {

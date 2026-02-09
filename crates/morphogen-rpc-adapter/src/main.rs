@@ -43,6 +43,14 @@ struct Args {
     /// Metadata refresh interval in seconds
     #[arg(long, default_value_t = 12)]
     refresh_interval: u64,
+
+    /// Upstream request timeout in seconds
+    #[arg(long, default_value_t = 15)]
+    upstream_timeout: u64,
+
+    /// Fall back to upstream RPC when PIR servers are unavailable
+    #[arg(long, default_value_t = false)]
+    fallback_to_upstream: bool,
 }
 
 struct AdapterState {
@@ -98,9 +106,14 @@ async fn main() -> Result<()> {
     let pir_client = PirClient::new(args.pir_server_a.clone(), args.pir_server_b.clone());
     let code_resolver = CodeResolver::new(args.dict_url.clone(), args.cas_url.clone());
 
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(args.upstream_timeout))
+        .connect_timeout(Duration::from_secs(5))
+        .build()?;
+
     let state = Arc::new(AdapterState {
         args: args.clone(),
-        http_client: reqwest::Client::new(),
+        http_client,
         pir_client,
         code_resolver,
     });
@@ -108,13 +121,29 @@ async fn main() -> Result<()> {
     // Background task for metadata refresh
     let state_clone = state.clone();
     tokio::spawn(async move {
+        let mut consecutive_failures = 0u32;
         loop {
             match state_clone.pir_client.update_metadata().await {
-                Ok(m) => info!(
-                    "Updated PIR metadata: epoch={}, block={}",
-                    m.epoch_id, m.block_number
-                ),
-                Err(e) => warn!("Failed to update PIR metadata: {}", e),
+                Ok(m) => {
+                    if consecutive_failures > 0 {
+                        info!(
+                            "PIR metadata recovered after {} failures: epoch={}, block={}",
+                            consecutive_failures, m.epoch_id, m.block_number
+                        );
+                    }
+                    consecutive_failures = 0;
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    if consecutive_failures <= 3 {
+                        warn!(consecutive_failures, "Failed to update PIR metadata: {}", e);
+                    } else if consecutive_failures.is_multiple_of(10) {
+                        error!(
+                            consecutive_failures,
+                            "PIR metadata refresh repeatedly failing: {}", e
+                        );
+                    }
+                }
             }
             sleep(Duration::from_secs(state_clone.args.refresh_interval)).await;
         }
@@ -124,7 +153,7 @@ async fn main() -> Result<()> {
 
     // Register eth_getBalance (Private)
     module.register_async_method("eth_getBalance", |params, state, _| async move {
-        let (address_str, _block): (String, Value) = params.parse()?;
+        let (address_str, block): (String, Value) = params.parse()?;
         let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
         let mut address = [0u8; 20];
         hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
@@ -133,17 +162,35 @@ async fn main() -> Result<()> {
 
         info!("Private eth_getBalance for 0x{}", address_hex);
 
-        let account = state.pir_client.query_account(address).await.map_err(|e| {
-            error!("PIR query failed: {}", e);
-            ErrorObjectOwned::owned(-32000, "Internal PIR error".to_string(), None::<()>)
-        })?;
-
-        Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", account.balance)))
+        match state.pir_client.query_account(address).await {
+            Ok(account) => {
+                Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", account.balance)))
+            }
+            Err(e) => {
+                error!("PIR query failed for eth_getBalance: {}", e);
+                if state.args.fallback_to_upstream {
+                    warn!("Falling back to upstream for eth_getBalance (privacy degraded)");
+                    let params = serde_json::json!([address_str, block]);
+                    return proxy_to_upstream(
+                        &state.args.upstream,
+                        &state.http_client,
+                        "eth_getBalance",
+                        params,
+                    )
+                    .await;
+                }
+                Err(ErrorObjectOwned::owned(
+                    -32000,
+                    "PIR servers unavailable".to_string(),
+                    None::<()>,
+                ))
+            }
+        }
     })?;
 
     // Register eth_getTransactionCount (Private)
     module.register_async_method("eth_getTransactionCount", |params, state, _| async move {
-        let (address_str, _block): (String, Value) = params.parse()?;
+        let (address_str, block): (String, Value) = params.parse()?;
         let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
         let mut address = [0u8; 20];
         hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
@@ -152,17 +199,37 @@ async fn main() -> Result<()> {
 
         info!("Private eth_getTransactionCount for 0x{}", address_hex);
 
-        let account = state.pir_client.query_account(address).await.map_err(|e| {
-            error!("PIR query failed: {}", e);
-            ErrorObjectOwned::owned(-32000, "Internal PIR error".to_string(), None::<()>)
-        })?;
-
-        Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", account.nonce)))
+        match state.pir_client.query_account(address).await {
+            Ok(account) => {
+                Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", account.nonce)))
+            }
+            Err(e) => {
+                error!("PIR query failed for eth_getTransactionCount: {}", e);
+                if state.args.fallback_to_upstream {
+                    warn!(
+                        "Falling back to upstream for eth_getTransactionCount (privacy degraded)"
+                    );
+                    let params = serde_json::json!([address_str, block]);
+                    return proxy_to_upstream(
+                        &state.args.upstream,
+                        &state.http_client,
+                        "eth_getTransactionCount",
+                        params,
+                    )
+                    .await;
+                }
+                Err(ErrorObjectOwned::owned(
+                    -32000,
+                    "PIR servers unavailable".to_string(),
+                    None::<()>,
+                ))
+            }
+        }
     })?;
 
     // Register eth_getCode (Private via CAS)
     module.register_async_method("eth_getCode", |params, state, _| async move {
-        let (address_str, _block): (String, Value) = params.parse()?;
+        let (address_str, block): (String, Value) = params.parse()?;
         let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
         let mut address = [0u8; 20];
         hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
@@ -172,10 +239,28 @@ async fn main() -> Result<()> {
         info!("Private eth_getCode for 0x{}", address_hex);
 
         // 1. PIR Query for Account Data
-        let account = state.pir_client.query_account(address).await.map_err(|e| {
-            error!("PIR query failed: {}", e);
-            ErrorObjectOwned::owned(-32000, "Internal PIR error".to_string(), None::<()>)
-        })?;
+        let account = match state.pir_client.query_account(address).await {
+            Ok(a) => a,
+            Err(e) => {
+                error!("PIR query failed for eth_getCode: {}", e);
+                if state.args.fallback_to_upstream {
+                    warn!("Falling back to upstream for eth_getCode (privacy degraded)");
+                    let params = serde_json::json!([address_str, block]);
+                    return proxy_to_upstream(
+                        &state.args.upstream,
+                        &state.http_client,
+                        "eth_getCode",
+                        params,
+                    )
+                    .await;
+                }
+                return Err(ErrorObjectOwned::owned(
+                    -32000,
+                    "PIR servers unavailable".to_string(),
+                    None::<()>,
+                ));
+            }
+        };
 
         // 2. Resolve CodeID -> CodeHash -> Bytecode
         let bytecode = if let Some(code_id) = account.code_id {
@@ -209,7 +294,7 @@ async fn main() -> Result<()> {
 
     // Register eth_getStorageAt (Private via PIR)
     module.register_async_method("eth_getStorageAt", |params, state, _| async move {
-        let (address_str, slot_str, _block): (String, String, Value) = params.parse()?;
+        let (address_str, slot_str, block): (String, String, Value) = params.parse()?;
         let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
         let slot_hex = slot_str.strip_prefix("0x").unwrap_or(&slot_str);
 
@@ -234,18 +319,37 @@ async fn main() -> Result<()> {
         let offset = 32 - slot_bytes.len();
         slot[offset..].copy_from_slice(&slot_bytes);
 
-        info!("Private eth_getStorageAt for 0x{} slot 0x{}", address_hex, hex::encode(slot));
+        info!(
+            "Private eth_getStorageAt for 0x{} slot 0x{}",
+            address_hex,
+            hex::encode(slot)
+        );
 
-        let storage = state
-            .pir_client
-            .query_storage(address, slot)
-            .await
-            .map_err(|e| {
+        match state.pir_client.query_storage(address, slot).await {
+            Ok(storage) => Ok::<Value, ErrorObjectOwned>(Value::String(format!(
+                "0x{}",
+                hex::encode(storage.value)
+            ))),
+            Err(e) => {
                 error!("PIR storage query failed: {}", e);
-                ErrorObjectOwned::owned(-32000, "Internal PIR error".to_string(), None::<()>)
-            })?;
-
-        Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{}", hex::encode(storage.value))))
+                if state.args.fallback_to_upstream {
+                    warn!("Falling back to upstream for eth_getStorageAt (privacy degraded)");
+                    let params = serde_json::json!([address_str, slot_str, block]);
+                    return proxy_to_upstream(
+                        &state.args.upstream,
+                        &state.http_client,
+                        "eth_getStorageAt",
+                        params,
+                    )
+                    .await;
+                }
+                Err(ErrorObjectOwned::owned(
+                    -32000,
+                    "PIR servers unavailable".to_string(),
+                    None::<()>,
+                ))
+            }
+        }
     })?;
 
     // Register passthrough methods
@@ -267,6 +371,9 @@ async fn main() -> Result<()> {
 
     info!("Morphogenesis RPC Adapter listening on {}", addr);
     info!("Upstream RPC: {}", args.upstream);
+    if args.fallback_to_upstream {
+        warn!("Fallback to upstream enabled - privacy will be degraded when PIR is unavailable");
+    }
 
     let handle = server.start(module);
     handle.stopped().await;
@@ -289,12 +396,23 @@ async fn proxy_to_upstream(
         "params": params
     });
 
-    let response = client
-        .post(url)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>))?;
+    let response = client.post(url).json(&request).send().await.map_err(|e| {
+        if e.is_timeout() {
+            ErrorObjectOwned::owned(
+                -32000,
+                format!("Upstream timeout for {}", method),
+                None::<()>,
+            )
+        } else if e.is_connect() {
+            ErrorObjectOwned::owned(
+                -32000,
+                format!("Upstream connection failed for {}", method),
+                None::<()>,
+            )
+        } else {
+            ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>)
+        }
+    })?;
 
     let json: Value = response
         .json()

@@ -89,10 +89,7 @@ mod tests {
         assert_eq!(manifest.item_count, 1);
 
         let expected_key = cuckoo_key_for_storage(&STORAGE_ADDRESS, &STORAGE_SLOT);
-        let addresser = CuckooAddresser::with_seeds(
-            1024,
-            [0x1234_5678, 0x9ABC_DEF0, 0xFEDC_BA98],
-        );
+        let addresser = CuckooAddresser::with_seeds(1024, [0x1234_5678, 0x9ABC_DEF0, 0xFEDC_BA98]);
         let short_indices = addresser.hash_indices(&expected_key);
 
         let mut storage_key = [0u8; 52];

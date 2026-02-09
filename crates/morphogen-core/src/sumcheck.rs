@@ -240,12 +240,8 @@ mod tests {
         let bad_challenges: Vec<_> = (0..3)
             .map(|i| BinaryField128b::new(i as u128 + 200))
             .collect();
-        let is_valid = SumCheckVerifier::verify(
-            4,
-            BinaryField128b::new(proof.sum),
-            &proof,
-            &bad_challenges,
-        );
+        let is_valid =
+            SumCheckVerifier::verify(4, BinaryField128b::new(proof.sum), &proof, &bad_challenges);
         assert!(!is_valid);
     }
 }
