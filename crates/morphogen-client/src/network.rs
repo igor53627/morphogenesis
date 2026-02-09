@@ -80,11 +80,54 @@ impl PirCache {
             self.epoch_id = epoch_id;
         }
         if self.entries.len() >= self.capacity {
-            // Simple eviction: clear when full (good enough for epoch-bounded caches)
             debug!(capacity = self.capacity, "Cache full, clearing");
             self.entries.clear();
         }
         self.entries.insert(key, payloads);
+    }
+}
+
+/// Internal error type for PIR queries, enabling structured retry decisions.
+enum PirQueryError {
+    /// Transient network error (timeout, connection refused)
+    Transient(String),
+    /// Servers returned different epochs from each other
+    EpochMismatch { server_a: u64, server_b: u64 },
+    /// Server response epoch doesn't match the metadata epoch used for query
+    StaleMetadata { expected: u64, got: u64 },
+    /// Non-retryable error
+    Permanent(String),
+}
+
+impl std::fmt::Display for PirQueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transient(msg) => write!(f, "transient: {}", msg),
+            Self::EpochMismatch { server_a, server_b } => {
+                write!(
+                    f,
+                    "epoch mismatch: server_a={}, server_b={}",
+                    server_a, server_b
+                )
+            }
+            Self::StaleMetadata { expected, got } => {
+                write!(
+                    f,
+                    "stale metadata: expected epoch {}, servers returned {}",
+                    expected, got
+                )
+            }
+            Self::Permanent(msg) => write!(f, "{}", msg),
+        }
+    }
+}
+
+impl PirQueryError {
+    fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transient(_) | Self::EpochMismatch { .. } | Self::StaleMetadata { .. }
+        )
     }
 }
 
@@ -98,7 +141,7 @@ pub struct PirClient {
 
 /// Determines whether a reqwest error is transient and worth retrying.
 fn is_transient(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout() || err.is_request()
+    err.is_connect() || err.is_timeout()
 }
 
 impl PirClient {
@@ -107,7 +150,13 @@ impl PirClient {
             .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
             .timeout(DEFAULT_REQUEST_TIMEOUT)
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|e| {
+                warn!(
+                    "Failed to build HTTP client with timeouts ({}), using defaults",
+                    e
+                );
+                reqwest::Client::new()
+            });
 
         Self {
             server_a_url,
@@ -120,12 +169,21 @@ impl PirClient {
 
     pub async fn update_metadata(&self) -> Result<Arc<EpochMetadata>> {
         let url = format!("{}/epoch", self.server_a_url);
-        let resp: RawEpochResponse = self
+        let resp = self
             .http_client
             .get(&url)
             .send()
             .await
-            .map_err(|e| anyhow!("Failed to fetch epoch metadata from {}: {}", url, e))?
+            .map_err(|e| anyhow!("Failed to fetch epoch metadata from {}: {}", url, e))?;
+
+        if !resp.status().is_success() {
+            return Err(anyhow!(
+                "Epoch metadata request failed with status {}",
+                resp.status()
+            ));
+        }
+
+        let resp: RawEpochResponse = resp
             .json()
             .await
             .map_err(|e| anyhow!("Failed to parse epoch metadata: {}", e))?;
@@ -167,12 +225,12 @@ impl PirClient {
     }
 
     /// Send a PIR query to both servers and aggregate the results.
-    /// Returns raw aggregated payloads.
+    /// Returns (response_epoch_id, aggregated_payloads).
     async fn execute_pir_query(
         &self,
         key: &[u8],
         metadata: &EpochMetadata,
-    ) -> Result<[Vec<u8>; QUERIES_PER_REQUEST]> {
+    ) -> Result<(u64, [Vec<u8>; QUERIES_PER_REQUEST]), PirQueryError> {
         let query_keys = {
             let mut rng = thread_rng();
             generate_query(&mut rng, key, metadata)
@@ -192,11 +250,29 @@ impl PirClient {
 
         let (resp_a, resp_b) = tokio::try_join!(req_a, req_b).map_err(|e| {
             if is_transient(&e) {
-                anyhow!("PIR server connection failed (transient): {}", e)
+                PirQueryError::Transient(e.to_string())
             } else {
-                anyhow!("PIR server request failed: {}", e)
+                PirQueryError::Permanent(format!("PIR server request failed: {}", e))
             }
         })?;
+
+        // Check HTTP status before parsing JSON
+        if !resp_a.status().is_success() {
+            let status = resp_a.status();
+            return Err(if status.is_server_error() {
+                PirQueryError::Transient(format!("Server A returned {}", status))
+            } else {
+                PirQueryError::Permanent(format!("Server A returned {}", status))
+            });
+        }
+        if !resp_b.status().is_success() {
+            let status = resp_b.status();
+            return Err(if status.is_server_error() {
+                PirQueryError::Transient(format!("Server B returned {}", status))
+            } else {
+                PirQueryError::Permanent(format!("Server B returned {}", status))
+            });
+        }
 
         #[derive(Deserialize)]
         struct QueryResponse {
@@ -204,30 +280,31 @@ impl PirClient {
             payloads: Vec<String>,
         }
 
-        let json_a: QueryResponse = resp_a
-            .json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse server A response: {}", e))?;
-        let json_b: QueryResponse = resp_b
-            .json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse server B response: {}", e))?;
+        let json_a: QueryResponse = resp_a.json().await.map_err(|e| {
+            PirQueryError::Permanent(format!("Failed to parse server A response: {}", e))
+        })?;
+        let json_b: QueryResponse = resp_b.json().await.map_err(|e| {
+            PirQueryError::Permanent(format!("Failed to parse server B response: {}", e))
+        })?;
 
-        let parse_payloads = |payloads: Vec<String>| -> Result<[Vec<u8>; QUERIES_PER_REQUEST]> {
-            if payloads.len() != QUERIES_PER_REQUEST {
-                return Err(anyhow!(
-                    "Invalid payload count: got {}, expected {}",
-                    payloads.len(),
-                    QUERIES_PER_REQUEST
-                ));
-            }
-            let mut out: [Vec<u8>; QUERIES_PER_REQUEST] = Default::default();
-            for (i, p) in payloads.into_iter().enumerate() {
-                let hex_p = p.strip_prefix("0x").unwrap_or(&p);
-                out[i] = hex::decode(hex_p)?;
-            }
-            Ok(out)
-        };
+        let parse_payloads =
+            |payloads: Vec<String>| -> Result<[Vec<u8>; QUERIES_PER_REQUEST], PirQueryError> {
+                if payloads.len() != QUERIES_PER_REQUEST {
+                    return Err(PirQueryError::Permanent(format!(
+                        "Invalid payload count: got {}, expected {}",
+                        payloads.len(),
+                        QUERIES_PER_REQUEST
+                    )));
+                }
+                let mut out: [Vec<u8>; QUERIES_PER_REQUEST] = Default::default();
+                for (i, p) in payloads.into_iter().enumerate() {
+                    let hex_p = p.strip_prefix("0x").unwrap_or(&p);
+                    out[i] = hex::decode(hex_p).map_err(|e| {
+                        PirQueryError::Permanent(format!("Hex decode error: {}", e))
+                    })?;
+                }
+                Ok(out)
+            };
 
         let server_resp_a = ServerResponse {
             epoch_id: json_a.epoch_id,
@@ -242,32 +319,34 @@ impl PirClient {
         let aggregated =
             aggregate_responses(&server_resp_a, &server_resp_b).map_err(|e| match e {
                 AggregationError::EpochMismatch { server_a, server_b } => {
-                    anyhow!(
-                        "Epoch mismatch: server_a={}, server_b={}",
-                        server_a,
-                        server_b
-                    )
+                    PirQueryError::EpochMismatch { server_a, server_b }
                 }
                 AggregationError::PayloadLengthMismatch {
                     index,
                     len_a,
                     len_b,
-                } => {
-                    anyhow!(
-                        "Payload length mismatch at index {}: a={}, b={}",
-                        index,
-                        len_a,
-                        len_b
-                    )
-                }
+                } => PirQueryError::Permanent(format!(
+                    "Payload length mismatch at index {}: a={}, b={}",
+                    index, len_a, len_b
+                )),
             })?;
 
-        Ok(aggregated.payloads)
+        let response_epoch = aggregated.epoch_id;
+
+        // Validate that server response epoch matches metadata epoch
+        if response_epoch != metadata.epoch_id {
+            return Err(PirQueryError::StaleMetadata {
+                expected: metadata.epoch_id,
+                got: response_epoch,
+            });
+        }
+
+        Ok((response_epoch, aggregated.payloads))
     }
 
     /// Execute a PIR query with caching and retry logic.
     /// Checks cache first, falls back to network query with retries.
-    /// On epoch mismatch, refreshes metadata and retries.
+    /// On epoch mismatch or stale metadata, refreshes metadata and retries.
     async fn execute_pir_query_with_retry(
         &self,
         key: &[u8],
@@ -287,7 +366,6 @@ impl PirClient {
             let current_metadata = if attempt == 0 {
                 metadata.clone()
             } else {
-                // Refresh metadata on retry (handles epoch rotation)
                 debug!(attempt, "Retrying PIR query, refreshing metadata");
                 match self.update_metadata().await {
                     Ok(m) => m,
@@ -299,20 +377,14 @@ impl PirClient {
             };
 
             match self.execute_pir_query(key, &current_metadata).await {
-                Ok(payloads) => {
-                    // Store in cache
+                Ok((response_epoch, payloads)) => {
+                    // Cache under the response epoch (validated to match metadata)
                     let mut cache = self.cache.lock().await;
-                    cache.put(current_metadata.epoch_id, key.to_vec(), payloads.clone());
+                    cache.put(response_epoch, key.to_vec(), payloads.clone());
                     return Ok(payloads);
                 }
                 Err(e) => {
-                    let err_str = e.to_string();
-                    let is_epoch_mismatch = err_str.contains("Epoch mismatch");
-                    let is_transient_err = err_str.contains("transient")
-                        || err_str.contains("connection")
-                        || err_str.contains("timeout");
-
-                    if attempt < MAX_RETRIES && (is_epoch_mismatch || is_transient_err) {
+                    if attempt < MAX_RETRIES && e.is_retryable() {
                         let delay = RETRY_BASE_DELAY * 2u32.pow(attempt);
                         warn!(
                             attempt,
@@ -324,7 +396,7 @@ impl PirClient {
                         continue;
                     }
 
-                    return Err(e);
+                    return Err(anyhow!("PIR query failed: {}", e));
                 }
             }
         }
@@ -419,7 +491,6 @@ mod tests {
         let address = [0x33u8; 20];
         let slot = [0x44u8; 32];
 
-        // The key used for query generation must be 8 bytes (Cuckoo key)
         let query_key = storage_query_key(address, slot);
         assert_eq!(
             query_key.len(),
@@ -427,16 +498,19 @@ mod tests {
             "storage query must use 8-byte Cuckoo key"
         );
 
-        // Verify it matches the expected Cuckoo key derivation
         let expected = storage_cuckoo_key(address, slot);
         assert_eq!(query_key, expected);
+    }
+
+    fn make_payloads() -> [Vec<u8>; QUERIES_PER_REQUEST] {
+        std::array::from_fn(|i| vec![i as u8 + 1])
     }
 
     #[test]
     fn cache_invalidates_on_epoch_change() {
         let mut cache = PirCache::new(100);
         let key = vec![0x11; 20];
-        let payloads: [Vec<u8>; QUERIES_PER_REQUEST] = [vec![1], vec![2], vec![3]];
+        let payloads = make_payloads();
 
         cache.put(1, key.clone(), payloads.clone());
         assert!(cache.get(1, &key).is_some());
@@ -444,14 +518,22 @@ mod tests {
         // Same epoch, different key
         assert!(cache.get(1, &[0x22; 20]).is_none());
 
-        // Different epoch invalidates
+        // Different epoch: get returns None
         assert!(cache.get(2, &key).is_none());
+
+        // put with new epoch clears old entries
+        cache.put(2, vec![0xAA], make_payloads());
+        assert!(cache.get(2, &[0xAA]).is_some());
+        assert!(
+            cache.get(2, &key).is_none(),
+            "old key should be cleared after epoch rotation"
+        );
     }
 
     #[test]
     fn cache_evicts_when_full() {
         let mut cache = PirCache::new(2);
-        let payloads: [Vec<u8>; QUERIES_PER_REQUEST] = [vec![1], vec![2], vec![3]];
+        let payloads = make_payloads();
 
         cache.put(1, vec![0x01], payloads.clone());
         cache.put(1, vec![0x02], payloads.clone());
@@ -461,5 +543,21 @@ mod tests {
         cache.put(1, vec![0x03], payloads.clone());
         assert_eq!(cache.entries.len(), 1);
         assert!(cache.get(1, &[0x03]).is_some());
+    }
+
+    #[test]
+    fn pir_query_error_retryable() {
+        assert!(PirQueryError::Transient("timeout".into()).is_retryable());
+        assert!(PirQueryError::EpochMismatch {
+            server_a: 1,
+            server_b: 2
+        }
+        .is_retryable());
+        assert!(PirQueryError::StaleMetadata {
+            expected: 1,
+            got: 2
+        }
+        .is_retryable());
+        assert!(!PirQueryError::Permanent("bad data".into()).is_retryable());
     }
 }

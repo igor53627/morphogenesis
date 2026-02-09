@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 const CODE_RESOLVER_TIMEOUT: Duration = Duration::from_secs(10);
 const CODE_RESOLVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -19,7 +19,13 @@ impl CodeResolver {
             .timeout(CODE_RESOLVER_TIMEOUT)
             .connect_timeout(CODE_RESOLVER_CONNECT_TIMEOUT)
             .build()
-            .unwrap_or_else(|_| Client::new());
+            .unwrap_or_else(|e| {
+                warn!(
+                    "Failed to build CodeResolver HTTP client ({}), using defaults",
+                    e
+                );
+                Client::new()
+            });
 
         Self {
             dict_url,
