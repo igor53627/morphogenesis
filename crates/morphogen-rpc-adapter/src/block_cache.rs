@@ -146,6 +146,9 @@ impl BlockCache {
     /// Check whether all blocks in [from, to] are present in the cache.
     /// O(1) check against the cached window bounds rather than iterating.
     pub fn has_block_range(&self, from: u64, to: u64) -> bool {
+        if from > to {
+            return false;
+        }
         let oldest = match self.cached_blocks.front() {
             Some(b) => b.number,
             None => return false,
@@ -248,9 +251,13 @@ impl BlockCache {
         match &filter.kind {
             FilterKind::Log(log_filter) => {
                 let to_inclusive = self.latest_block.min(log_filter.to_block);
+                // Only advance cursor forward (never backwards)
+                if to_inclusive <= from_exclusive {
+                    return Some(vec![]);
+                }
                 filter.last_polled_block = to_inclusive;
                 let scan_filter = LogFilter {
-                    from_block: from_exclusive + 1,
+                    from_block: from_exclusive.saturating_add(1),
                     to_block: to_inclusive,
                     addresses: log_filter.addresses.clone(),
                     topics: log_filter.topics.iter().map(|t| match t {
@@ -398,7 +405,7 @@ pub fn parse_log_filter_object(filter_obj: &Value, latest: u64) -> Result<LogFil
                     None => return Err(format!("invalid address in array: expected string, got {}", v)),
                 }
             }
-            if addrs.is_empty() { None } else { Some(addrs) }
+            Some(addrs) // empty list = match nothing
         }
         Some(other) => return Err(format!("invalid address field: expected string or array, got {}", other)),
     };
@@ -1314,5 +1321,115 @@ mod tests {
         assert_ne!(id1, id2);
         assert_ne!(id2, id3);
         assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn has_block_range_reversed() {
+        let mut cache = BlockCache::new();
+        cache.insert_block(100, [0x01; 32], vec![], vec![]);
+        cache.insert_block(101, [0x02; 32], vec![], vec![]);
+        assert!(!cache.has_block_range(101, 100));
+    }
+
+    #[test]
+    fn topic_any_requires_position_exists() {
+        // Filter [null] should NOT match a log with empty topics
+        let log_no_topics = serde_json::json!({"address": "0xabc", "topics": [], "data": "0x"});
+        let filter = LogFilter {
+            from_block: 0, to_block: 0,
+            addresses: None,
+            topics: vec![TopicFilter::Any],
+        };
+        assert!(!log_matches_filter(&log_no_topics, &filter));
+
+        // Filter [null, null] should NOT match a log with only 1 topic
+        let log_one_topic = make_log("0xabc", &["0xdead"]);
+        let filter2 = LogFilter {
+            from_block: 0, to_block: 0,
+            addresses: None,
+            topics: vec![TopicFilter::Any, TopicFilter::Any],
+        };
+        assert!(!log_matches_filter(&log_one_topic, &filter2));
+
+        // Filter [null] SHOULD match a log with 1 topic
+        assert!(log_matches_filter(&log_one_topic, &filter));
+    }
+
+    #[test]
+    fn filter_changes_respects_to_block() {
+        let mut cache = BlockCache::new();
+        cache.insert_block(100, [0x01; 32], vec![], vec![]);
+        cache.insert_block(101, [0x02; 32], vec![], vec![]);
+
+        // Create a log filter with to_block=100 when latest is already 101
+        let filter = LogFilter {
+            from_block: 99, to_block: 100,
+            addresses: None, topics: vec![],
+        };
+        let id = cache.create_log_filter(filter);
+
+        // get_filter_changes should return empty (cursor was set to 101, to_block is 100)
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert!(changes.is_empty());
+
+        // Adding more blocks shouldn't change anything — to_block already passed
+        cache.insert_block(102, [0x03; 32], vec![], vec![]);
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn filter_logs_respects_to_block() {
+        let mut cache = BlockCache::new();
+        let log1 = make_log("0xaaa", &[]);
+        let log2 = make_log("0xaaa", &[]);
+        let r1 = make_receipt_with_logs("0xaa00000000000000000000000000000000000000000000000000000000000000", vec![log1]);
+        let r2 = make_receipt_with_logs("0xbb00000000000000000000000000000000000000000000000000000000000000", vec![log2]);
+        cache.insert_block(100, [0x01; 32], vec![], vec![([0xAA; 32], r1)]);
+        cache.insert_block(101, [0x02; 32], vec![], vec![([0xBB; 32], r2)]);
+
+        let filter = LogFilter {
+            from_block: 100, to_block: 100,
+            addresses: None, topics: vec![],
+        };
+        let id = cache.create_log_filter(filter);
+
+        // get_filter_logs should only return logs up to to_block=100
+        let result = cache.get_filter_logs(&id).unwrap().unwrap();
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn parse_filter_rejects_invalid_address_type() {
+        let obj = serde_json::json!({"address": 42});
+        assert!(parse_log_filter_object(&obj, 100).is_err());
+    }
+
+    #[test]
+    fn parse_filter_rejects_invalid_topic_type() {
+        let obj = serde_json::json!({"topics": [42]});
+        assert!(parse_log_filter_object(&obj, 100).is_err());
+    }
+
+    #[test]
+    fn parse_filter_rejects_empty_topic_alternatives() {
+        let obj = serde_json::json!({"topics": [[]]});
+        assert!(parse_log_filter_object(&obj, 100).is_err());
+    }
+
+    #[test]
+    fn empty_address_array_matches_nothing() {
+        let obj = serde_json::json!({"address": []});
+        let filter = parse_log_filter_object(&obj, 100).unwrap();
+        let log = make_log("0xabc", &[]);
+        assert!(!log_matches_filter(&log, &filter));
+    }
+
+    #[test]
+    fn parse_filter_rejects_safe_finalized() {
+        let obj = serde_json::json!({"fromBlock": "safe"});
+        assert!(parse_log_filter_object(&obj, 100).is_err());
+        let obj = serde_json::json!({"toBlock": "finalized"});
+        assert!(parse_log_filter_object(&obj, 100).is_err());
     }
 }
