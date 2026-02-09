@@ -280,8 +280,8 @@ async fn poll_new_blocks(
         {
             Some(h) => h,
             None => {
-                warn!(block_num, "Block missing valid hash, skipping cache");
-                continue;
+                warn!(block_num, "Block missing valid hash, stopping poll");
+                break;
             }
         };
 
@@ -494,8 +494,9 @@ mod tests {
     fn parse_tx_hash_invalid() {
         assert!(parse_tx_hash("0xshort").is_none());
         assert!(parse_tx_hash("not_hex").is_none());
-        // Correct length but invalid hex characters
-        assert!(parse_tx_hash("0xgggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg").is_none());
+        // Correct length (64 chars) but invalid hex characters
+        let bad_hex = format!("0x{}", "g".repeat(64));
+        assert!(parse_tx_hash(&bad_hex).is_none());
     }
 
     #[test]
