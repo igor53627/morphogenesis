@@ -280,8 +280,7 @@ async fn poll_new_blocks(
         {
             Some(h) => h,
             None => {
-                warn!(block_num, "Block missing valid hash, stopping poll");
-                break;
+                return Err(format!("block {} missing valid hash", block_num));
             }
         };
 
@@ -496,6 +495,7 @@ mod tests {
         assert!(parse_tx_hash("not_hex").is_none());
         // Correct length (64 chars) but invalid hex characters
         let bad_hex = format!("0x{}", "g".repeat(64));
+        assert_eq!(bad_hex.strip_prefix("0x").unwrap().len(), 64);
         assert!(parse_tx_hash(&bad_hex).is_none());
     }
 
