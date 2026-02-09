@@ -361,7 +361,15 @@ async fn main() -> Result<()> {
 
     // Register eth_call (Private via local EVM execution)
     module.register_async_method("eth_call", |params, state, _| async move {
-        let (call_params, _block): (Value, Value) = params.parse()?;
+        // Block tag is optional; clients may send 1 or 2 params
+        let raw: Vec<Value> = params.parse()?;
+        let call_params = raw
+            .first()
+            .ok_or_else(|| ErrorObjectOwned::owned(-32602, "missing call object", None::<()>))?;
+        let block = raw
+            .get(1)
+            .cloned()
+            .unwrap_or(Value::String("latest".into()));
 
         info!("Private eth_call via local EVM");
 
@@ -370,7 +378,8 @@ async fn main() -> Result<()> {
             Arc::clone(&state.code_resolver),
             state.http_client.clone(),
             state.args.upstream.clone(),
-            &call_params,
+            call_params,
+            &block,
         )
         .await
         {
@@ -381,7 +390,7 @@ async fn main() -> Result<()> {
                 error!("Private eth_call failed: {}", e);
                 if state.args.fallback_to_upstream {
                     warn!("Falling back to upstream for eth_call (privacy degraded)");
-                    let params = serde_json::json!([call_params, _block]);
+                    let params = serde_json::json!([call_params, block]);
                     return proxy_to_upstream(
                         &state.args.upstream,
                         &state.http_client,

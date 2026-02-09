@@ -65,6 +65,12 @@ impl Database for PirDatabase {
             .block_on(self.pir_client.query_account(addr_bytes))
             .map_err(|e| PirDbError(format!("PIR account query: {}", e)))?;
 
+        // Non-existent account: return None so EXTCODEHASH returns 0x0
+        let has_code = account.code_id.is_some_and(|id| id > 0) || account.code_hash.is_some();
+        if account.nonce == 0 && account.balance == 0 && !has_code {
+            return Ok(None);
+        }
+
         // Resolve code_hash from code_id via dictionary
         let code_hash = if let Some(code_id) = account.code_id {
             if code_id > 0 {
@@ -152,10 +158,28 @@ impl Database for PirDatabase {
                 .await
                 .map_err(|e| PirDbError(format!("Block hash fetch: {}", e)))?;
 
+            if !resp.status().is_success() {
+                return Err(PirDbError(format!(
+                    "Block hash upstream returned {}",
+                    resp.status()
+                )));
+            }
+
             let json: serde_json::Value = resp
                 .json()
                 .await
                 .map_err(|e| PirDbError(format!("Block hash parse: {}", e)))?;
+
+            if let Some(err) = json.get("error") {
+                let msg = err
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown");
+                return Err(PirDbError(format!(
+                    "Block hash RPC error for block {}: {}",
+                    number, msg
+                )));
+            }
 
             let hash_str = json
                 .get("result")

@@ -13,6 +13,64 @@ use std::sync::Arc;
 use tokio::runtime::Handle;
 use tracing::info;
 
+/// Block environment fetched from upstream for accurate EVM execution.
+struct BlockInfo {
+    number: u64,
+    timestamp: u64,
+    gas_limit: u64,
+}
+
+/// Fetch the latest block header fields from upstream for the EVM block env.
+async fn fetch_block_info(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    block_tag: &Value,
+) -> Result<BlockInfo, String> {
+    let tag = block_tag.as_str().unwrap_or("latest").to_string();
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_getBlockByNumber",
+        "params": [tag, false]
+    });
+
+    let resp = client
+        .post(upstream_url)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Block info fetch: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Block info HTTP {}", resp.status()));
+    }
+
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Block info parse: {}", e))?;
+
+    let result = json.get("result").ok_or("No block result from upstream")?;
+
+    let parse_hex_u64 = |field: &str| -> u64 {
+        result
+            .get(field)
+            .and_then(|v| v.as_str())
+            .and_then(|s| {
+                let hex = s.strip_prefix("0x").unwrap_or(s);
+                u64::from_str_radix(hex, 16).ok()
+            })
+            .unwrap_or(0)
+    };
+
+    Ok(BlockInfo {
+        number: parse_hex_u64("number"),
+        timestamp: parse_hex_u64("timestamp"),
+        gas_limit: parse_hex_u64("gasLimit"),
+    })
+}
+
 /// Execute an eth_call privately using revm with PIR-backed state.
 /// All account, storage, and code lookups go through PIR so the
 /// server never learns which addresses/slots are being accessed.
@@ -22,18 +80,30 @@ pub async fn execute_eth_call(
     upstream_client: reqwest::Client,
     upstream_url: String,
     call_params: &Value,
+    block_tag: &Value,
 ) -> Result<Bytes, String> {
     // Parse call parameters before moving into blocking task
-    let from = parse_address(call_params.get("from")).unwrap_or_default();
-    let to = parse_address(call_params.get("to"));
-    let data = parse_bytes(call_params.get("data").or(call_params.get("input")));
-    let value = parse_u256(call_params.get("value"));
-    let gas = parse_u64(call_params.get("gas")).unwrap_or(30_000_000);
+    let from = parse_address_strict(call_params.get("from"))
+        .map_err(|e| format!("invalid 'from': {}", e))?
+        .unwrap_or_default();
+    let to =
+        parse_address_strict(call_params.get("to")).map_err(|e| format!("invalid 'to': {}", e))?;
+    let data = parse_bytes_strict(call_params.get("data").or(call_params.get("input")))
+        .map_err(|e| format!("invalid 'data': {}", e))?;
+    let value = parse_u256_strict(call_params.get("value"))
+        .map_err(|e| format!("invalid 'value': {}", e))?;
+    let gas = parse_u64_strict(call_params.get("gas"))
+        .map_err(|e| format!("invalid 'gas': {}", e))?
+        .unwrap_or(30_000_000);
+
+    // Fetch block env from upstream so NUMBER/TIMESTAMP/BASEFEE are accurate
+    let block_info = fetch_block_info(&upstream_client, &upstream_url, block_tag).await?;
 
     info!(
         %from,
         to = ?to,
         data_len = data.len(),
+        block = block_info.number,
         "Executing private eth_call via revm"
     );
 
@@ -63,6 +133,9 @@ pub async fn execute_eth_call(
         let mut evm = Context::mainnet()
             .with_db(pir_db)
             .modify_block_chained(|b| {
+                b.number = U256::from(block_info.number);
+                b.timestamp = U256::from(block_info.timestamp);
+                b.gas_limit = block_info.gas_limit;
                 b.basefee = 0; // eth_call doesn't charge fees
             })
             .build_mainnet();
@@ -86,36 +159,64 @@ pub async fn execute_eth_call(
     .map_err(|e| format!("spawn_blocking: {}", e))?
 }
 
-fn parse_address(val: Option<&Value>) -> Option<Address> {
-    let s = val?.as_str()?;
-    let hex = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(hex).ok()?;
-    if bytes.len() != 20 {
-        return None;
+/// Parse an address field. Returns Ok(None) if absent, Err if present but invalid.
+fn parse_address_strict(val: Option<&Value>) -> Result<Option<Address>, String> {
+    let Some(v) = val else { return Ok(None) };
+    if v.is_null() {
+        return Ok(None);
     }
-    Some(Address::from_slice(&bytes))
+    let s = v.as_str().ok_or("expected hex string")?;
+    let hex = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(hex).map_err(|e| e.to_string())?;
+    if bytes.len() != 20 {
+        return Err(format!("expected 20 bytes, got {}", bytes.len()));
+    }
+    Ok(Some(Address::from_slice(&bytes)))
 }
 
-fn parse_bytes(val: Option<&Value>) -> Bytes {
-    let Some(s) = val.and_then(|v| v.as_str()) else {
-        return Bytes::new();
+/// Parse a bytes field. Returns Ok(empty) if absent, Err if present but invalid hex.
+fn parse_bytes_strict(val: Option<&Value>) -> Result<Bytes, String> {
+    let Some(v) = val else {
+        return Ok(Bytes::new());
     };
+    if v.is_null() {
+        return Ok(Bytes::new());
+    }
+    let s = v.as_str().ok_or("expected hex string")?;
     let hex = s.strip_prefix("0x").unwrap_or(s);
-    hex::decode(hex).map(Bytes::from).unwrap_or_default()
+    if hex.is_empty() {
+        return Ok(Bytes::new());
+    }
+    hex::decode(hex).map(Bytes::from).map_err(|e| e.to_string())
 }
 
-fn parse_u256(val: Option<&Value>) -> U256 {
-    let Some(s) = val.and_then(|v| v.as_str()) else {
-        return U256::ZERO;
+/// Parse a U256 field. Returns Ok(ZERO) if absent, Err if present but invalid.
+fn parse_u256_strict(val: Option<&Value>) -> Result<U256, String> {
+    let Some(v) = val else {
+        return Ok(U256::ZERO);
     };
+    if v.is_null() {
+        return Ok(U256::ZERO);
+    }
+    let s = v.as_str().ok_or("expected hex string")?;
     let hex = s.strip_prefix("0x").unwrap_or(s);
-    U256::from_str_radix(hex, 16).unwrap_or(U256::ZERO)
+    if hex.is_empty() {
+        return Ok(U256::ZERO);
+    }
+    U256::from_str_radix(hex, 16).map_err(|e| e.to_string())
 }
 
-fn parse_u64(val: Option<&Value>) -> Option<u64> {
-    let s = val?.as_str()?;
+/// Parse a u64 field. Returns Ok(None) if absent, Err if present but invalid.
+fn parse_u64_strict(val: Option<&Value>) -> Result<Option<u64>, String> {
+    let Some(v) = val else { return Ok(None) };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let s = v.as_str().ok_or("expected hex string")?;
     let hex = s.strip_prefix("0x").unwrap_or(s);
-    u64::from_str_radix(hex, 16).ok()
+    u64::from_str_radix(hex, 16)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -126,60 +227,81 @@ mod tests {
     #[test]
     fn parse_address_with_0x_prefix() {
         let val = json!("0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
-        let addr = parse_address(Some(&val)).unwrap();
-        assert_eq!(
-            format!("{:?}", addr).to_lowercase(),
-            "0xd8da6bf26964af9d7eed9e03e53415d37aa96045"
-        );
+        let addr = parse_address_strict(Some(&val)).unwrap().unwrap();
+        let expected: [u8; 20] = hex::decode("d8dA6BF26964aF9D7eEd9e03E53415D37aA96045")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(addr.into_array(), expected);
     }
 
     #[test]
     fn parse_address_without_prefix() {
         let val = json!("d8dA6BF26964aF9D7eEd9e03E53415D37aA96045");
-        assert!(parse_address(Some(&val)).is_some());
+        assert!(parse_address_strict(Some(&val)).unwrap().is_some());
     }
 
     #[test]
-    fn parse_address_none_on_invalid() {
-        assert!(parse_address(None).is_none());
-        assert!(parse_address(Some(&json!("0xinvalid"))).is_none());
-        assert!(parse_address(Some(&json!("0xaabb"))).is_none()); // too short
-        assert!(parse_address(Some(&json!(42))).is_none()); // not a string
+    fn parse_address_none_on_absent() {
+        assert_eq!(parse_address_strict(None).unwrap(), None);
+        assert_eq!(parse_address_strict(Some(&json!(null))).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_address_err_on_invalid() {
+        assert!(parse_address_strict(Some(&json!("0xinvalid"))).is_err());
+        assert!(parse_address_strict(Some(&json!("0xaabb"))).is_err()); // too short
+        assert!(parse_address_strict(Some(&json!(42))).is_err()); // not a string
     }
 
     #[test]
     fn parse_bytes_with_data() {
         let val = json!("0x60806040");
-        let bytes = parse_bytes(Some(&val));
+        let bytes = parse_bytes_strict(Some(&val)).unwrap();
         assert_eq!(bytes.as_ref(), &[0x60, 0x80, 0x60, 0x40]);
     }
 
     #[test]
     fn parse_bytes_empty_on_none() {
-        assert!(parse_bytes(None).is_empty());
-        assert!(parse_bytes(Some(&json!(null))).is_empty());
+        assert!(parse_bytes_strict(None).unwrap().is_empty());
+        assert!(parse_bytes_strict(Some(&json!(null))).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_bytes_err_on_invalid_hex() {
+        assert!(parse_bytes_strict(Some(&json!("0xZZZZ"))).is_err());
     }
 
     #[test]
     fn parse_u256_hex_value() {
         let val = json!("0xde0b6b3a7640000"); // 1 ETH in wei
-        let result = parse_u256(Some(&val));
+        let result = parse_u256_strict(Some(&val)).unwrap();
         assert_eq!(result, U256::from(1_000_000_000_000_000_000u64));
     }
 
     #[test]
     fn parse_u256_zero_on_none() {
-        assert_eq!(parse_u256(None), U256::ZERO);
+        assert_eq!(parse_u256_strict(None).unwrap(), U256::ZERO);
+    }
+
+    #[test]
+    fn parse_u256_err_on_invalid() {
+        assert!(parse_u256_strict(Some(&json!("not_hex"))).is_err());
     }
 
     #[test]
     fn parse_u64_gas_value() {
         let val = json!("0x1c9c380"); // 30_000_000
-        assert_eq!(parse_u64(Some(&val)), Some(30_000_000));
+        assert_eq!(parse_u64_strict(Some(&val)).unwrap(), Some(30_000_000));
     }
 
     #[test]
     fn parse_u64_none_on_missing() {
-        assert_eq!(parse_u64(None), None);
+        assert_eq!(parse_u64_strict(None).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_u64_err_on_invalid() {
+        assert!(parse_u64_strict(Some(&json!("xyz"))).is_err());
     }
 }
