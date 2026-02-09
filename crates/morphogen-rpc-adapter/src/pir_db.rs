@@ -182,17 +182,23 @@ impl Database for PirDatabase {
             }
 
             // BLOCKHASH for unavailable blocks returns 0x0 per EVM spec
-            let result = json.get("result");
-            if result.is_none() || result.unwrap().is_null() {
-                return Ok(B256::ZERO);
-            }
-            let result = result.unwrap();
-            let hash_str = result
-                .get("hash")
-                .and_then(|h| h.as_str())
-                .ok_or_else(|| {
-                    PirDbError(format!("Block {} result missing 'hash' field", number))
-                })?;
+            let result = match json.get("result") {
+                None => return Ok(B256::ZERO),
+                Some(v) if v.is_null() => return Ok(B256::ZERO),
+                Some(v) => v,
+            };
+            // hash can be null for pending blocks; treat as unavailable
+            let hash_val = match result.get("hash") {
+                None => return Ok(B256::ZERO),
+                Some(v) if v.is_null() => return Ok(B256::ZERO),
+                Some(v) => v,
+            };
+            let hash_str = hash_val.as_str().ok_or_else(|| {
+                PirDbError(format!(
+                    "Block {} 'hash' field is not a string",
+                    number
+                ))
+            })?;
 
             let hash_hex = hash_str.strip_prefix("0x").unwrap_or(hash_str);
             let mut hash = [0u8; 32];

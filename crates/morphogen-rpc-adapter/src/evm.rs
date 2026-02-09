@@ -30,31 +30,46 @@ struct BlockInfo {
     basefee: u64,
 }
 
-/// Validate block tag: must be a string (named tag or hex quantity) or null.
+/// Known named block tags per Ethereum JSON-RPC specification.
+const NAMED_BLOCK_TAGS: &[&str] = &["latest", "earliest", "pending", "safe", "finalized"];
+
+/// Validate block tag: must be a named tag, hex quantity ("0x..."), or null.
 /// Rejects EIP-1898 object forms since PIR state is epoch-based.
 fn validate_block_tag(block_tag: &Value) -> Result<String, String> {
     if block_tag.is_null() {
         return Ok("latest".to_string());
     }
-    if let Some(s) = block_tag.as_str() {
+    let s = block_tag
+        .as_str()
+        .ok_or("unsupported block parameter (object form not supported)")?;
+    if NAMED_BLOCK_TAGS.contains(&s) {
         return Ok(s.to_string());
     }
-    Err("unsupported block parameter (object form not supported)".to_string())
+    // Must be a hex quantity: "0x" followed by one or more hex digits
+    let hex = s
+        .strip_prefix("0x")
+        .ok_or_else(|| format!("invalid block tag '{}': expected named tag or hex quantity", s))?;
+    if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "invalid block tag '{}': expected named tag or hex quantity",
+            s
+        ));
+    }
+    Ok(s.to_string())
 }
 
 /// Fetch block header fields from upstream for the EVM block env.
+/// `block_tag` must be a pre-validated tag string (from `validate_block_tag`).
 async fn fetch_block_info(
     client: &reqwest::Client,
     upstream_url: &str,
-    block_tag: &Value,
+    block_tag: &str,
 ) -> Result<BlockInfo, String> {
-    let tag = validate_block_tag(block_tag)?;
-
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
         "method": "eth_getBlockByNumber",
-        "params": [tag, false]
+        "params": [block_tag, false]
     });
 
     let resp = client
@@ -142,11 +157,11 @@ pub async fn execute_eth_call(
         .unwrap_or(30_000_000);
 
     // Validate block tag early so input errors get the right error code
-    validate_block_tag(block_tag)
+    let validated_tag = validate_block_tag(block_tag)
         .map_err(EthCallError::InvalidParams)?;
 
     // Fetch block env from upstream so NUMBER/TIMESTAMP/BASEFEE are accurate
-    let block_info = fetch_block_info(&upstream_client, &upstream_url, block_tag)
+    let block_info = fetch_block_info(&upstream_client, &upstream_url, &validated_tag)
         .await
         .map_err(EthCallError::Internal)?;
 
@@ -261,6 +276,7 @@ fn parse_u256_strict(val: Option<&Value>) -> Result<U256, String> {
 }
 
 /// Parse a u64 field. Returns Ok(None) if absent, Err if present but invalid.
+/// Follows Ethereum JSON-RPC hex quantity rules: "0x0" is valid, "0x" alone is not.
 fn parse_u64_strict(val: Option<&Value>) -> Result<Option<u64>, String> {
     let Some(v) = val else { return Ok(None) };
     if v.is_null() {
@@ -269,7 +285,7 @@ fn parse_u64_strict(val: Option<&Value>) -> Result<Option<u64>, String> {
     let s = v.as_str().ok_or("expected hex string")?;
     let hex = s.strip_prefix("0x").unwrap_or(s);
     if hex.is_empty() {
-        return Ok(Some(0));
+        return Err("invalid hex quantity: no digits after prefix".to_string());
     }
     u64::from_str_radix(hex, 16)
         .map(Some)
@@ -363,14 +379,26 @@ mod tests {
     }
 
     #[test]
-    fn parse_u64_bare_0x_is_zero() {
-        assert_eq!(parse_u64_strict(Some(&json!("0x"))).unwrap(), Some(0));
+    fn parse_u64_bare_0x_is_error() {
+        assert!(parse_u64_strict(Some(&json!("0x"))).is_err());
     }
 
     #[test]
-    fn validate_block_tag_string() {
-        assert_eq!(validate_block_tag(&json!("latest")).unwrap(), "latest");
+    fn parse_u64_0x0_is_zero() {
+        assert_eq!(parse_u64_strict(Some(&json!("0x0"))).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn validate_block_tag_named_tags() {
+        for tag in &["latest", "earliest", "pending", "safe", "finalized"] {
+            assert_eq!(validate_block_tag(&json!(tag)).unwrap(), *tag);
+        }
+    }
+
+    #[test]
+    fn validate_block_tag_hex_quantity() {
         assert_eq!(validate_block_tag(&json!("0x1")).unwrap(), "0x1");
+        assert_eq!(validate_block_tag(&json!("0xff")).unwrap(), "0xff");
     }
 
     #[test]
@@ -380,7 +408,13 @@ mod tests {
 
     #[test]
     fn validate_block_tag_rejects_object() {
-        let obj = json!({"blockNumber": "0x1"});
-        assert!(validate_block_tag(&obj).is_err());
+        assert!(validate_block_tag(&json!({"blockNumber": "0x1"})).is_err());
+    }
+
+    #[test]
+    fn validate_block_tag_rejects_invalid_string() {
+        assert!(validate_block_tag(&json!("foo")).is_err());
+        assert!(validate_block_tag(&json!("0x")).is_err()); // no digits
+        assert!(validate_block_tag(&json!("0xZZ")).is_err()); // not hex
     }
 }
