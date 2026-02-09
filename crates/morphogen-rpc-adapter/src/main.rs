@@ -363,9 +363,14 @@ async fn main() -> Result<()> {
     module.register_async_method("eth_call", |params, state, _| async move {
         // Block tag is optional; clients may send 1 or 2 params
         let raw: Vec<Value> = params.parse()?;
-        let call_params = raw
-            .first()
-            .ok_or_else(|| ErrorObjectOwned::owned(-32602, "missing call object", None::<()>))?;
+        if raw.is_empty() || raw.len() > 2 {
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                format!("expected 1-2 params, got {}", raw.len()),
+                None::<()>,
+            ));
+        }
+        let call_params = &raw[0];
         let block = raw
             .get(1)
             .cloned()

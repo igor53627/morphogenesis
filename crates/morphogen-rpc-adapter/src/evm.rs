@@ -18,15 +18,28 @@ struct BlockInfo {
     number: u64,
     timestamp: u64,
     gas_limit: u64,
+    basefee: u64,
 }
 
-/// Fetch the latest block header fields from upstream for the EVM block env.
+/// Validate block tag: must be a hex string ("latest", "0x..") or null.
+/// Rejects EIP-1898 object forms since PIR state is epoch-based.
+fn validate_block_tag(block_tag: &Value) -> Result<String, String> {
+    if block_tag.is_null() {
+        return Ok("latest".to_string());
+    }
+    if let Some(s) = block_tag.as_str() {
+        return Ok(s.to_string());
+    }
+    Err("unsupported block parameter (object form not supported)".to_string())
+}
+
+/// Fetch block header fields from upstream for the EVM block env.
 async fn fetch_block_info(
     client: &reqwest::Client,
     upstream_url: &str,
     block_tag: &Value,
 ) -> Result<BlockInfo, String> {
-    let tag = block_tag.as_str().unwrap_or("latest").to_string();
+    let tag = validate_block_tag(block_tag)?;
 
     let request = serde_json::json!({
         "jsonrpc": "2.0",
@@ -51,23 +64,33 @@ async fn fetch_block_info(
         .await
         .map_err(|e| format!("Block info parse: {}", e))?;
 
-    let result = json.get("result").ok_or("No block result from upstream")?;
+    if let Some(err) = json.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown");
+        return Err(format!("Block info RPC error: {}", msg));
+    }
 
-    let parse_hex_u64 = |field: &str| -> u64 {
-        result
+    let result = json
+        .get("result")
+        .filter(|v| !v.is_null())
+        .ok_or("No block result from upstream")?;
+
+    let parse_hex_u64 = |field: &str| -> Result<u64, String> {
+        let s = result
             .get(field)
             .and_then(|v| v.as_str())
-            .and_then(|s| {
-                let hex = s.strip_prefix("0x").unwrap_or(s);
-                u64::from_str_radix(hex, 16).ok()
-            })
-            .unwrap_or(0)
+            .ok_or_else(|| format!("missing block field '{}'", field))?;
+        let hex = s.strip_prefix("0x").unwrap_or(s);
+        u64::from_str_radix(hex, 16).map_err(|e| format!("invalid block field '{}': {}", field, e))
     };
 
     Ok(BlockInfo {
-        number: parse_hex_u64("number"),
-        timestamp: parse_hex_u64("timestamp"),
-        gas_limit: parse_hex_u64("gasLimit"),
+        number: parse_hex_u64("number")?,
+        timestamp: parse_hex_u64("timestamp")?,
+        gas_limit: parse_hex_u64("gasLimit")?,
+        basefee: parse_hex_u64("baseFeePerGas").unwrap_or(0), // pre-London blocks lack basefee
     })
 }
 
@@ -136,7 +159,7 @@ pub async fn execute_eth_call(
                 b.number = U256::from(block_info.number);
                 b.timestamp = U256::from(block_info.timestamp);
                 b.gas_limit = block_info.gas_limit;
-                b.basefee = 0; // eth_call doesn't charge fees
+                b.basefee = block_info.basefee;
             })
             .build_mainnet();
 
@@ -214,6 +237,9 @@ fn parse_u64_strict(val: Option<&Value>) -> Result<Option<u64>, String> {
     }
     let s = v.as_str().ok_or("expected hex string")?;
     let hex = s.strip_prefix("0x").unwrap_or(s);
+    if hex.is_empty() {
+        return Ok(Some(0));
+    }
     u64::from_str_radix(hex, 16)
         .map(Some)
         .map_err(|e| e.to_string())
