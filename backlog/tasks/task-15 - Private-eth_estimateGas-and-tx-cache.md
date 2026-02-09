@@ -1,7 +1,7 @@
 ---
 id: TASK-15
 title: Private eth_estimateGas and local transaction cache
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-09 06:45'
 labels: []

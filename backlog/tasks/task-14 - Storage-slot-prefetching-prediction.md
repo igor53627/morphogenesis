@@ -1,7 +1,7 @@
 ---
 id: TASK-14
 title: Storage slot prefetching/prediction
-status: To Do
+status: Icebox
 assignee: []
 created_date: '2026-02-03 14:38'
 labels:

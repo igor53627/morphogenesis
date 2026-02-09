@@ -16,6 +16,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
 hex = "0.4"
+rand = "0.8"
 async-trait = "0.1"
 revm = "34"
 alloy-primitives = "1.5"

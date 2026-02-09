@@ -56,6 +56,11 @@ struct Args {
     /// Fall back to upstream RPC when PIR servers are unavailable
     #[arg(long, default_value_t = false)]
     fallback_to_upstream: bool,
+
+    /// Transaction relay URL for eth_sendRawTransaction.
+    /// Defaults to Flashbots Protect so txs bypass the public mempool.
+    #[arg(long, default_value = "https://rpc.flashbots.net/?hint=hash&originId=morphogenesis")]
+    tx_relay: String,
 }
 
 struct AdapterState {
@@ -70,7 +75,8 @@ const PASSTHROUGH_METHODS: &[&str] = &[
     "eth_blockNumber",
     "eth_chainId",
     "eth_gasPrice",
-    "eth_sendRawTransaction",
+    // NOTE: eth_sendRawTransaction is relayed to a privacy-preserving endpoint
+    // (Flashbots Protect by default) — see RELAY_METHODS below.
     "net_version",
     "web3_clientVersion",
     // Wallet Essentials (History & Status)
@@ -81,23 +87,27 @@ const PASSTHROUGH_METHODS: &[&str] = &[
     "eth_getBlockByHash",
     "eth_feeHistory",
     "eth_maxPriorityFeePerGas",
-    // Warning: eth_getLogs leaks privacy to upstream
-    "eth_getLogs",
-    // Storage & State (eth_getStorageAt now private via PIR)
-    "eth_getProof",
+    // NOTE: eth_getLogs is now served from local block cache (private) for recent blocks
     // Account queries (read-only, safe to passthrough)
     "eth_accounts",
-    // NOTE: eth_sign and eth_signTransaction are intentionally NOT included
-    // These should be handled client-side by wallets to avoid remote signing risks
-    // Filter APIs (for event monitoring)
-    // TODO: Implement sticky routing for filter IDs if using load-balanced upstreams
-    // Current implementation assumes single fixed upstream provider
-    "eth_newFilter",
-    "eth_newBlockFilter",
-    "eth_newPendingTransactionFilter",
-    "eth_uninstallFilter",
-    "eth_getFilterChanges",
-    "eth_getFilterLogs",
+    // NOTE: Filter APIs are now served locally from the block cache.
+    // NOTE: Dropped methods (eth_getProof, eth_sign, eth_signTransaction) return
+    // explicit errors — see DROPPED_METHODS below.
+];
+
+/// Methods explicitly rejected with a clear error message.
+/// These are not proxied to upstream because they either leak private state
+/// (defeating PIR) or pose security risks (remote signing).
+const DROPPED_METHODS: &[(&str, &str)] = &[
+    ("eth_getProof", "eth_getProof is disabled: it leaks account/storage interest to the RPC provider, defeating private state queries"),
+    ("eth_sign", "eth_sign is disabled: signing should be done client-side by the wallet"),
+    ("eth_signTransaction", "eth_signTransaction is disabled: signing should be done client-side by the wallet"),
+];
+
+/// Methods relayed to a privacy-preserving endpoint instead of the regular upstream.
+/// eth_sendRawTransaction goes to Flashbots Protect to avoid public mempool exposure.
+const RELAY_METHODS: &[&str] = &[
+    "eth_sendRawTransaction",
 ];
 
 #[tokio::main]
@@ -570,6 +580,140 @@ async fn main() -> Result<()> {
         .await
     })?;
 
+    // Register eth_getLogs (Private via block cache for recent blocks, upstream fallback)
+    module.register_async_method("eth_getLogs", |params, state, _| async move {
+        let raw: Vec<Value> = params.parse()?;
+        if raw.len() != 1 {
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                format!("expected 1 param (filter object), got {}", raw.len()),
+                None::<()>,
+            ));
+        }
+        let filter_obj = &raw[0];
+
+        // If blockHash is present, proxy to upstream (out of scope)
+        if filter_obj.get("blockHash").is_some() {
+            info!("eth_getLogs with blockHash, proxying to upstream");
+            return proxy_to_upstream(
+                &state.args.upstream,
+                &state.http_client,
+                "eth_getLogs",
+                Value::Array(raw),
+            )
+            .await;
+        }
+
+        let latest = state.block_cache.read().await.latest_block();
+
+        let filter = block_cache::parse_log_filter_object(filter_obj, latest)
+            .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
+
+        // Check cache coverage
+        let cache = state.block_cache.read().await;
+        if cache.has_block_range(filter.from_block, filter.to_block) {
+            let logs = cache.get_logs(&filter);
+            info!(
+                from = filter.from_block,
+                to = filter.to_block,
+                matched = logs.len(),
+                "Serving eth_getLogs from cache (private)"
+            );
+            Ok::<Value, ErrorObjectOwned>(Value::Array(logs))
+        } else {
+            drop(cache);
+            warn!(
+                from = filter.from_block,
+                to = filter.to_block,
+                "eth_getLogs range not fully cached, proxying to upstream (privacy degraded)"
+            );
+            proxy_to_upstream(
+                &state.args.upstream,
+                &state.http_client,
+                "eth_getLogs",
+                Value::Array(raw),
+            )
+            .await
+        }
+    })?;
+
+    // Register eth_newFilter (Private — filter stored locally)
+    module.register_async_method("eth_newFilter", |params, state, _| async move {
+        let raw: Vec<Value> = params.parse()?;
+        if raw.len() != 1 {
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                format!("expected 1 param (filter object), got {}", raw.len()),
+                None::<()>,
+            ));
+        }
+        let filter_obj = &raw[0];
+
+        let latest = state.block_cache.read().await.latest_block();
+
+        let filter = block_cache::parse_log_filter_object(filter_obj, latest)
+            .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
+
+        let id = state.block_cache.write().await.create_log_filter(filter);
+        info!("Created private log filter {}", id);
+        Ok::<Value, ErrorObjectOwned>(Value::String(id))
+    })?;
+
+    // Register eth_newBlockFilter (Private — filter stored locally)
+    module.register_async_method("eth_newBlockFilter", |_params, state, _| async move {
+        let id = state.block_cache.write().await.create_block_filter();
+        info!("Created private block filter {}", id);
+        Ok::<Value, ErrorObjectOwned>(Value::String(id))
+    })?;
+
+    // Register eth_newPendingTransactionFilter (Private — filter stored locally)
+    module.register_async_method("eth_newPendingTransactionFilter", |_params, state, _| async move {
+        let id = state.block_cache.write().await.create_pending_tx_filter();
+        info!("Created private pending tx filter {}", id);
+        Ok::<Value, ErrorObjectOwned>(Value::String(id))
+    })?;
+
+    // Register eth_uninstallFilter (Private)
+    module.register_async_method("eth_uninstallFilter", |params, state, _| async move {
+        let (filter_id,): (String,) = params.parse()?;
+        let result = state.block_cache.write().await.uninstall_filter(&filter_id);
+        info!("Uninstalled filter {}: {}", filter_id, result);
+        Ok::<Value, ErrorObjectOwned>(Value::Bool(result))
+    })?;
+
+    // Register eth_getFilterChanges (Private — served from cache)
+    module.register_async_method("eth_getFilterChanges", |params, state, _| async move {
+        let (filter_id,): (String,) = params.parse()?;
+        let mut cache = state.block_cache.write().await;
+        match cache.get_filter_changes(&filter_id) {
+            Some(changes) => {
+                info!(filter = %filter_id, count = changes.len(), "Serving eth_getFilterChanges from cache (private)");
+                Ok::<Value, ErrorObjectOwned>(Value::Array(changes))
+            }
+            None => {
+                Err(ErrorObjectOwned::owned(-32000, "filter not found", None::<()>))
+            }
+        }
+    })?;
+
+    // Register eth_getFilterLogs (Private — served from cache)
+    module.register_async_method("eth_getFilterLogs", |params, state, _| async move {
+        let (filter_id,): (String,) = params.parse()?;
+        let mut cache = state.block_cache.write().await;
+        match cache.get_filter_logs(&filter_id) {
+            Some(Some(logs)) => {
+                info!(filter = %filter_id, count = logs.len(), "Serving eth_getFilterLogs from cache (private)");
+                Ok::<Value, ErrorObjectOwned>(Value::Array(logs))
+            }
+            Some(None) => {
+                Err(ErrorObjectOwned::owned(-32000, "filter is not a log filter", None::<()>))
+            }
+            None => {
+                Err(ErrorObjectOwned::owned(-32000, "filter not found", None::<()>))
+            }
+        }
+    })?;
+
     // Register passthrough methods
     for method in PASSTHROUGH_METHODS {
         let method_name = method.to_string();
@@ -587,8 +731,32 @@ async fn main() -> Result<()> {
         })?;
     }
 
+    // Register relay methods — sent to privacy relay (Flashbots by default)
+    for method in RELAY_METHODS {
+        let method_name = method.to_string();
+        module.register_async_method(method, move |params, state, _| {
+            let m = method_name.clone();
+            async move {
+                info!("Relaying {} to privacy relay", m);
+                proxy_to_upstream(&state.args.tx_relay, &state.http_client, &m, params.parse()?).await
+            }
+        })?;
+    }
+
+    // Register dropped methods — return explicit errors
+    for &(method, reason) in DROPPED_METHODS {
+        let reason = reason.to_string();
+        module.register_async_method(method, move |_params, _state, _| {
+            let r = reason.clone();
+            async move {
+                Err::<Value, ErrorObjectOwned>(ErrorObjectOwned::owned(-32601, r, None::<()>))
+            }
+        })?;
+    }
+
     info!("Morphogenesis RPC Adapter listening on {}", addr);
     info!("Upstream RPC: {}", args.upstream);
+    info!("Tx relay: {}", args.tx_relay);
     if args.fallback_to_upstream {
         warn!("Fallback to upstream enabled - privacy will be degraded when PIR is unavailable");
     }
@@ -655,28 +823,61 @@ async fn proxy_to_upstream(
 
 #[cfg(test)]
 mod tests {
-    use super::PASSTHROUGH_METHODS;
+    use super::{DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS};
 
     #[test]
-    fn test_passthrough_methods_include_filter_apis() {
-        // Test against actual production allowlist (prevents regression)
-
+    fn test_passthrough_methods_exclude_private() {
         // Verify private methods are NOT in passthrough
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_getStorageAt"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_call"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_estimateGas"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_getTransactionByHash"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_getTransactionReceipt"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_getLogs"));
 
-        // Verify eth_getProof is still passthrough
-        assert!(PASSTHROUGH_METHODS.contains(&"eth_getProof"));
+        // Verify filter APIs are NOT in passthrough (now served locally)
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_newFilter"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_newBlockFilter"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_newPendingTransactionFilter"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_uninstallFilter"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_getFilterChanges"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_getFilterLogs"));
 
-        // Verify filter APIs are included
-        assert!(PASSTHROUGH_METHODS.contains(&"eth_newFilter"));
-        assert!(PASSTHROUGH_METHODS.contains(&"eth_getFilterChanges"));
-
-        // Verify signing methods are NOT included (security)
+        // Verify dropped methods are NOT in passthrough
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_getProof"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_sign"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_signTransaction"));
+
+        // Verify relay methods are NOT in passthrough
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_sendRawTransaction"));
+    }
+
+    #[test]
+    fn test_relay_methods() {
+        assert!(RELAY_METHODS.contains(&"eth_sendRawTransaction"));
+
+        // No overlap with passthrough or dropped
+        let dropped_names: Vec<&str> = DROPPED_METHODS.iter().map(|(name, _)| *name).collect();
+        for method in RELAY_METHODS {
+            assert!(!PASSTHROUGH_METHODS.contains(method), "{} in both relay and passthrough", method);
+            assert!(!dropped_names.contains(method), "{} in both relay and dropped", method);
+        }
+    }
+
+    #[test]
+    fn test_dropped_methods() {
+        let dropped_names: Vec<&str> = DROPPED_METHODS.iter().map(|(name, _)| *name).collect();
+
+        // Privacy: leaks account/storage interest
+        assert!(dropped_names.contains(&"eth_getProof"));
+
+        // Security: remote signing
+        assert!(dropped_names.contains(&"eth_sign"));
+        assert!(dropped_names.contains(&"eth_signTransaction"));
+
+        // No overlap with passthrough
+        for name in &dropped_names {
+            assert!(!PASSTHROUGH_METHODS.contains(name), "{} is in both dropped and passthrough", name);
+        }
     }
 }
