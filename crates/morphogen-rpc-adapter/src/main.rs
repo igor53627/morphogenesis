@@ -391,7 +391,10 @@ async fn main() -> Result<()> {
             Ok(output) => {
                 Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{}", hex::encode(&output))))
             }
-            Err(e) => {
+            Err(evm::EthCallError::InvalidParams(msg)) => {
+                Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
+            }
+            Err(evm::EthCallError::Internal(e)) => {
                 error!("Private eth_call failed: {}", e);
                 if state.args.fallback_to_upstream {
                     warn!("Falling back to upstream for eth_call (privacy degraded)");

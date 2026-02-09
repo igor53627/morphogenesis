@@ -182,14 +182,17 @@ impl Database for PirDatabase {
             }
 
             // BLOCKHASH for unavailable blocks returns 0x0 per EVM spec
-            let Some(hash_str) = json
-                .get("result")
-                .filter(|v| !v.is_null())
-                .and_then(|r| r.get("hash"))
-                .and_then(|h| h.as_str())
-            else {
+            let result = json.get("result");
+            if result.is_none() || result.unwrap().is_null() {
                 return Ok(B256::ZERO);
-            };
+            }
+            let result = result.unwrap();
+            let hash_str = result
+                .get("hash")
+                .and_then(|h| h.as_str())
+                .ok_or_else(|| {
+                    PirDbError(format!("Block {} result missing 'hash' field", number))
+                })?;
 
             let hash_hex = hash_str.strip_prefix("0x").unwrap_or(hash_str);
             let mut hash = [0u8; 32];
