@@ -188,8 +188,14 @@ impl Database for PirDatabase {
                 Some(v) => v,
             };
             // hash can be null for pending blocks; treat as unavailable
+            // missing hash field is an upstream schema error
             let hash_val = match result.get("hash") {
-                None => return Ok(B256::ZERO),
+                None => {
+                    return Err(PirDbError(format!(
+                        "Block {} result missing 'hash' field",
+                        number
+                    )))
+                }
                 Some(v) if v.is_null() => return Ok(B256::ZERO),
                 Some(v) => v,
             };

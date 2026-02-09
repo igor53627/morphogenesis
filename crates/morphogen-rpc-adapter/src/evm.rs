@@ -39,9 +39,13 @@ fn validate_block_tag(block_tag: &Value) -> Result<String, String> {
     if block_tag.is_null() {
         return Ok("latest".to_string());
     }
-    let s = block_tag
-        .as_str()
-        .ok_or("unsupported block parameter (object form not supported)")?;
+    let s = block_tag.as_str().ok_or_else(|| {
+        if block_tag.is_object() {
+            "EIP-1898 object form not supported".to_string()
+        } else {
+            "block parameter must be a string or null".to_string()
+        }
+    })?;
     if NAMED_BLOCK_TAGS.contains(&s) {
         return Ok(s.to_string());
     }
@@ -276,14 +280,16 @@ fn parse_u256_strict(val: Option<&Value>) -> Result<U256, String> {
 }
 
 /// Parse a u64 field. Returns Ok(None) if absent, Err if present but invalid.
-/// Follows Ethereum JSON-RPC hex quantity rules: "0x0" is valid, "0x" alone is not.
+/// Follows Ethereum JSON-RPC hex quantity rules: requires "0x" prefix, "0x0" for zero.
 fn parse_u64_strict(val: Option<&Value>) -> Result<Option<u64>, String> {
     let Some(v) = val else { return Ok(None) };
     if v.is_null() {
         return Ok(None);
     }
     let s = v.as_str().ok_or("expected hex string")?;
-    let hex = s.strip_prefix("0x").unwrap_or(s);
+    let hex = s
+        .strip_prefix("0x")
+        .ok_or_else(|| format!("expected 0x-prefixed hex quantity, got '{}'", s))?;
     if hex.is_empty() {
         return Err("invalid hex quantity: no digits after prefix".to_string());
     }
@@ -416,5 +422,17 @@ mod tests {
         assert!(validate_block_tag(&json!("foo")).is_err());
         assert!(validate_block_tag(&json!("0x")).is_err()); // no digits
         assert!(validate_block_tag(&json!("0xZZ")).is_err()); // not hex
+    }
+
+    #[test]
+    fn validate_block_tag_rejects_non_string_types() {
+        assert!(validate_block_tag(&json!(1)).is_err());
+        assert!(validate_block_tag(&json!(true)).is_err());
+        assert!(validate_block_tag(&json!([1, 2])).is_err());
+    }
+
+    #[test]
+    fn parse_u64_rejects_no_prefix() {
+        assert!(parse_u64_strict(Some(&json!("10"))).is_err());
     }
 }
