@@ -13,6 +13,7 @@ const POLL_INTERVAL_SECS: u64 = 2;
 /// Per-block tracking for reliable eviction of both txs and receipts.
 struct CachedBlock {
     number: u64,
+    block_hash: [u8; 32],
     tx_hashes: Vec<[u8; 32]>,
     receipt_hashes: Vec<[u8; 32]>,
 }
@@ -37,7 +38,7 @@ impl BlockCache {
         }
     }
 
-    pub fn insert_block(&mut self, block_number: u64, txs: Vec<([u8; 32], Value)>, receipts: Vec<([u8; 32], Value)>) {
+    pub fn insert_block(&mut self, block_number: u64, block_hash: [u8; 32], txs: Vec<([u8; 32], Value)>, receipts: Vec<([u8; 32], Value)>) {
         let mut tx_hashes = Vec::with_capacity(txs.len());
         for (hash, tx) in txs {
             tx_hashes.push(hash);
@@ -50,6 +51,7 @@ impl BlockCache {
         }
         self.cached_blocks.push_back(CachedBlock {
             number: block_number,
+            block_hash,
             tx_hashes,
             receipt_hashes,
         });
@@ -103,6 +105,11 @@ impl BlockCache {
 
     pub fn cached_tx_count(&self) -> usize {
         self.transactions.len()
+    }
+
+    /// Returns (block_number, block_hash) of the latest cached block, if any.
+    pub fn latest_block_hash(&self) -> Option<(u64, [u8; 32])> {
+        self.cached_blocks.back().map(|b| (b.number, b.block_hash))
     }
 }
 
@@ -170,8 +177,8 @@ pub fn start_block_poller(
 }
 
 /// Poll upstream for new blocks and insert into cache.
-/// Detects reorgs by checking if upstream's block at our cached_latest
-/// has a different hash than expected, and invalidates stale entries.
+/// Detects reorgs by comparing the block hash at our cached latest
+/// against what upstream reports, and invalidates stale entries.
 /// Returns the number of new blocks fetched.
 async fn poll_new_blocks(
     cache: &Arc<RwLock<BlockCache>>,
@@ -186,22 +193,50 @@ async fn poll_new_blocks(
     let current_block = parse_hex_block_number(block_num_str)
         .ok_or_else(|| format!("invalid block number: {}", block_num_str))?;
 
-    let cached_latest = cache.read().await.latest_block();
+    let cached_info = cache.read().await.latest_block_hash();
 
-    // Reorg detection: if chain head went backwards, invalidate stale blocks
-    if current_block < cached_latest && cached_latest > 0 {
-        warn!(
-            cached = cached_latest,
-            chain_head = current_block,
-            "Chain reorg detected (head moved backwards), invalidating cache"
-        );
-        cache.write().await.invalidate_from(current_block + 1);
-        return Ok(0);
+    // Reorg detection: compare block hash at our cached latest against upstream
+    if let Some((cached_num, cached_hash)) = cached_info {
+        if current_block < cached_num {
+            // Head moved backwards — clear everything above current
+            warn!(
+                cached = cached_num,
+                chain_head = current_block,
+                "Chain reorg detected (head moved backwards), invalidating cache"
+            );
+            cache.write().await.invalidate_from(current_block);
+            return Ok(0);
+        }
+
+        // Even if head didn't move backwards, check hash at cached_latest
+        // to detect same-height reorgs
+        let check_hex = format!("0x{:x}", cached_num);
+        let check_block = rpc_call(
+            client, upstream_url, "eth_getBlockByNumber",
+            serde_json::json!([check_hex, false]),
+        ).await?;
+        if !check_block.is_null() {
+            if let Some(upstream_hash) = check_block.get("hash")
+                .and_then(|h| h.as_str())
+                .and_then(|s| parse_tx_hash(s))
+            {
+                if upstream_hash != cached_hash {
+                    warn!(
+                        block = cached_num,
+                        "Chain reorg detected (block hash mismatch), invalidating cache"
+                    );
+                    cache.write().await.invalidate_from(cached_num);
+                    return Ok(0);
+                }
+            }
+        }
+
+        if current_block <= cached_num {
+            return Ok(0);
+        }
     }
 
-    if current_block <= cached_latest {
-        return Ok(0);
-    }
+    let cached_latest = cached_info.map_or(0, |(n, _)| n);
 
     // On first run (cached_latest == 0), just fetch the latest block
     let start_block = if cached_latest == 0 {
@@ -230,6 +265,11 @@ async fn poll_new_blocks(
             break;
         }
 
+        let block_hash = block.get("hash")
+            .and_then(|h| h.as_str())
+            .and_then(|s| parse_tx_hash(s))
+            .unwrap_or([0u8; 32]);
+
         let txs_array = block.get("transactions")
             .and_then(|v| v.as_array())
             .cloned()
@@ -250,7 +290,7 @@ async fn poll_new_blocks(
         // Try eth_getBlockReceipts first (efficient), fall back to individual calls
         let receipts = fetch_receipts(client, upstream_url, &block_hex, &tx_hashes_for_receipts).await?;
 
-        cache.write().await.insert_block(block_num, txs, receipts);
+        cache.write().await.insert_block(block_num, block_hash, txs, receipts);
         new_blocks += 1;
     }
 
@@ -353,14 +393,16 @@ mod tests {
     fn block_cache_insert_and_get() {
         let mut cache = BlockCache::new();
         let hash = [0xAA; 32];
+        let blk_hash = [0x11; 32];
         let tx = serde_json::json!({"hash": "0xaa", "value": "0x1"});
         let receipt = serde_json::json!({"transactionHash": "0xaa", "status": "0x1"});
 
-        cache.insert_block(100, vec![(hash, tx.clone())], vec![(hash, receipt.clone())]);
+        cache.insert_block(100, blk_hash, vec![(hash, tx.clone())], vec![(hash, receipt.clone())]);
 
         assert_eq!(cache.latest_block(), 100);
         assert_eq!(cache.get_transaction(&hash), Some(&tx));
         assert_eq!(cache.get_receipt(&hash), Some(&receipt));
+        assert_eq!(cache.latest_block_hash(), Some((100, blk_hash)));
     }
 
     #[test]
@@ -372,9 +414,11 @@ mod tests {
             let mut hash = [0u8; 32];
             hash[0] = i as u8;
             hash[1] = (i >> 8) as u8;
+            let mut blk_hash = [0u8; 32];
+            blk_hash[0] = i as u8;
             let tx = serde_json::json!({"block": i});
             let receipt = serde_json::json!({"status": "0x1"});
-            cache.insert_block(i, vec![(hash, tx)], vec![(hash, receipt)]);
+            cache.insert_block(i, blk_hash, vec![(hash, tx)], vec![(hash, receipt)]);
         }
 
         // Oldest block's tx and receipt should be evicted
@@ -398,9 +442,9 @@ mod tests {
         let hash_b = [0xBB; 32];
         let hash_c = [0xCC; 32];
 
-        cache.insert_block(100, vec![(hash_a, serde_json::json!({}))], vec![(hash_a, serde_json::json!({}))]);
-        cache.insert_block(101, vec![(hash_b, serde_json::json!({}))], vec![(hash_b, serde_json::json!({}))]);
-        cache.insert_block(102, vec![(hash_c, serde_json::json!({}))], vec![(hash_c, serde_json::json!({}))]);
+        cache.insert_block(100, [0x01; 32], vec![(hash_a, serde_json::json!({}))], vec![(hash_a, serde_json::json!({}))]);
+        cache.insert_block(101, [0x02; 32], vec![(hash_b, serde_json::json!({}))], vec![(hash_b, serde_json::json!({}))]);
+        cache.insert_block(102, [0x03; 32], vec![(hash_c, serde_json::json!({}))], vec![(hash_c, serde_json::json!({}))]);
 
         assert_eq!(cache.latest_block(), 102);
 

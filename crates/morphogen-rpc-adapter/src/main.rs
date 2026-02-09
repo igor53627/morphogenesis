@@ -441,8 +441,6 @@ async fn main() -> Result<()> {
     // Register eth_estimateGas (Private via local EVM execution)
     module.register_async_method("eth_estimateGas", |params, state, _| async move {
         // Accept 1-3 params: (call_obj, [block_tag], [state_overrides])
-        // State overrides (3rd param) are not supported locally but we accept
-        // and ignore them to avoid breaking clients that send them.
         let raw: Vec<Value> = params.parse()?;
         if raw.is_empty() || raw.len() > 3 {
             return Err(ErrorObjectOwned::owned(
@@ -451,6 +449,28 @@ async fn main() -> Result<()> {
                 None::<()>,
             ));
         }
+
+        // If state overrides (3rd param) are present, we can't handle them locally.
+        // Proxy to upstream if fallback is enabled, otherwise reject explicitly.
+        let has_overrides = raw.len() == 3 && !raw[2].is_null() && raw[2] != serde_json::json!({});
+        if has_overrides {
+            if state.args.fallback_to_upstream {
+                warn!("eth_estimateGas with state overrides, proxying to upstream (privacy degraded)");
+                return proxy_to_upstream(
+                    &state.args.upstream,
+                    &state.http_client,
+                    "eth_estimateGas",
+                    Value::Array(raw),
+                )
+                .await;
+            }
+            return Err(ErrorObjectOwned::owned(
+                -32602,
+                "state overrides not supported for local eth_estimateGas",
+                None::<()>,
+            ));
+        }
+
         let call_params = &raw[0];
         let block = raw
             .get(1)
@@ -479,12 +499,11 @@ async fn main() -> Result<()> {
                 error!("Private eth_estimateGas failed: {}", e);
                 if state.args.fallback_to_upstream {
                     warn!("Falling back to upstream for eth_estimateGas (privacy degraded)");
-                    let params = serde_json::json!([call_params, block]);
                     return proxy_to_upstream(
                         &state.args.upstream,
                         &state.http_client,
                         "eth_estimateGas",
-                        params,
+                        Value::Array(raw),
                     )
                     .await;
                 }
@@ -501,7 +520,7 @@ async fn main() -> Result<()> {
     module.register_async_method("eth_getTransactionByHash", |params, state, _| async move {
         let (hash_str,): (String,) = params.parse()?;
         let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
-            ErrorObjectOwned::owned(-32602, "Invalid tx hash: expected 0x-prefixed 32-byte hex", None::<()>)
+            ErrorObjectOwned::owned(-32602, "Invalid tx hash: expected 32-byte hex string", None::<()>)
         })?;
 
         // Check local cache first (private)
@@ -528,7 +547,7 @@ async fn main() -> Result<()> {
     module.register_async_method("eth_getTransactionReceipt", |params, state, _| async move {
         let (hash_str,): (String,) = params.parse()?;
         let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
-            ErrorObjectOwned::owned(-32602, "Invalid tx hash: expected 0x-prefixed 32-byte hex", None::<()>)
+            ErrorObjectOwned::owned(-32602, "Invalid tx hash: expected 32-byte hex string", None::<()>)
         })?;
 
         // Check local cache first (private)
