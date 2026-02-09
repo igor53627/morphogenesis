@@ -144,13 +144,17 @@ impl BlockCache {
     }
 
     /// Check whether all blocks in [from, to] are present in the cache.
+    /// O(1) check against the cached window bounds rather than iterating.
     pub fn has_block_range(&self, from: u64, to: u64) -> bool {
-        for block_num in from..=to {
-            if !self.logs.contains_key(&block_num) {
-                return false;
-            }
-        }
-        true
+        let oldest = match self.cached_blocks.front() {
+            Some(b) => b.number,
+            None => return false,
+        };
+        let latest = match self.cached_blocks.back() {
+            Some(b) => b.number,
+            None => return false,
+        };
+        from >= oldest && to <= latest
     }
 
     /// Return all logs in [filter.from_block, filter.to_block] matching the filter.
@@ -185,10 +189,16 @@ impl BlockCache {
         });
     }
 
-    /// Generate an unguessable random hex filter ID.
+    /// Generate an unguessable random hex filter ID (u64 quantity for client compat).
     fn generate_filter_id(&self) -> String {
-        let id: u128 = rand::thread_rng().gen();
-        format!("0x{:x}", id)
+        let mut rng = rand::thread_rng();
+        loop {
+            let id: u64 = rng.gen();
+            let hex_id = format!("0x{:x}", id);
+            if !self.filters.contains_key(&hex_id) {
+                return hex_id;
+            }
+        }
     }
 
     /// Create a log filter and return its hex ID.
@@ -234,11 +244,11 @@ impl BlockCache {
         let filter = self.filters.get_mut(id)?;
         filter.last_accessed = Instant::now();
         let from_exclusive = filter.last_polled_block;
-        let to_inclusive = self.latest_block;
-        filter.last_polled_block = to_inclusive;
 
         match &filter.kind {
             FilterKind::Log(log_filter) => {
+                let to_inclusive = self.latest_block.min(log_filter.to_block);
+                filter.last_polled_block = to_inclusive;
                 let scan_filter = LogFilter {
                     from_block: from_exclusive + 1,
                     to_block: to_inclusive,
@@ -252,9 +262,12 @@ impl BlockCache {
                 Some(self.get_logs(&scan_filter))
             }
             FilterKind::Block => {
+                let to_inclusive = self.latest_block;
+                filter.last_polled_block = to_inclusive;
                 Some(self.get_block_hashes_in_range(from_exclusive, to_inclusive))
             }
             FilterKind::PendingTransaction => {
+                filter.last_polled_block = self.latest_block;
                 Some(vec![])
             }
         }
@@ -273,7 +286,7 @@ impl BlockCache {
             FilterKind::Log(log_filter) => {
                 let scan_filter = LogFilter {
                     from_block: log_filter.from_block,
-                    to_block: self.latest_block,
+                    to_block: self.latest_block.min(log_filter.to_block),
                     addresses: log_filter.addresses.clone(),
                     topics: log_filter.topics.iter().map(|t| match t {
                         TopicFilter::Any => TopicFilter::Any,
@@ -350,7 +363,9 @@ pub fn parse_log_filter_object(filter_obj: &Value, latest: u64) -> Result<LogFil
     let from_block = match filter_obj.get("fromBlock").and_then(|v| v.as_str()) {
         Some("latest") | Some("pending") | None => latest,
         Some("earliest") => 0,
-        Some("safe") | Some("finalized") => latest.saturating_sub(64),
+        Some("safe") | Some("finalized") => {
+            return Err("\"safe\" and \"finalized\" block tags are not supported; use an explicit block number".to_string());
+        }
         Some(hex) => parse_hex_block_number(hex)
             .ok_or_else(|| format!("invalid fromBlock: {}", hex))?,
     };
@@ -358,7 +373,9 @@ pub fn parse_log_filter_object(filter_obj: &Value, latest: u64) -> Result<LogFil
     let to_block = match filter_obj.get("toBlock").and_then(|v| v.as_str()) {
         Some("latest") | Some("pending") | None => latest,
         Some("earliest") => 0,
-        Some("safe") | Some("finalized") => latest.saturating_sub(64),
+        Some("safe") | Some("finalized") => {
+            return Err("\"safe\" and \"finalized\" block tags are not supported; use an explicit block number".to_string());
+        }
         Some(hex) => parse_hex_block_number(hex)
             .ok_or_else(|| format!("invalid toBlock: {}", hex))?,
     };
@@ -374,37 +391,45 @@ pub fn parse_log_filter_object(filter_obj: &Value, latest: u64) -> Result<LogFil
         None | Some(Value::Null) => None,
         Some(Value::String(s)) => Some(vec![s.to_lowercase()]),
         Some(Value::Array(arr)) => {
-            let addrs: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                .collect();
+            let mut addrs = Vec::with_capacity(arr.len());
+            for v in arr {
+                match v.as_str() {
+                    Some(s) => addrs.push(s.to_lowercase()),
+                    None => return Err(format!("invalid address in array: expected string, got {}", v)),
+                }
+            }
             if addrs.is_empty() { None } else { Some(addrs) }
         }
-        _ => None,
+        Some(other) => return Err(format!("invalid address field: expected string or array, got {}", other)),
     };
 
-    let topics = match filter_obj.get("topics").and_then(|v| v.as_array()) {
-        Some(arr) => {
-            arr.iter()
-                .map(|item| match item {
-                    Value::Null => TopicFilter::Any,
-                    Value::String(s) => TopicFilter::Exact(s.to_lowercase()),
+    let topics = match filter_obj.get("topics") {
+        None | Some(Value::Null) => vec![],
+        Some(Value::Array(arr)) => {
+            let mut result = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item {
+                    Value::Null => result.push(TopicFilter::Any),
+                    Value::String(s) => result.push(TopicFilter::Exact(s.to_lowercase())),
                     Value::Array(alts) => {
-                        let options: Vec<String> = alts
-                            .iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_lowercase()))
-                            .collect();
-                        if options.is_empty() {
-                            TopicFilter::Any
-                        } else {
-                            TopicFilter::OneOf(options)
+                        let mut options = Vec::with_capacity(alts.len());
+                        for v in alts {
+                            match v.as_str() {
+                                Some(s) => options.push(s.to_lowercase()),
+                                None => return Err(format!("invalid topic in alternatives array: expected string, got {}", v)),
+                            }
                         }
+                        if options.is_empty() {
+                            return Err("empty topic alternatives array is not valid".to_string());
+                        }
+                        result.push(TopicFilter::OneOf(options));
                     }
-                    _ => TopicFilter::Any,
-                })
-                .collect()
+                    other => return Err(format!("invalid topic filter: expected null, string, or array, got {}", other)),
+                }
+            }
+            result
         }
-        None => vec![],
+        Some(other) => return Err(format!("invalid topics field: expected array, got {}", other)),
     };
 
     Ok(LogFilter {
@@ -435,7 +460,12 @@ pub fn log_matches_filter(log: &Value, filter: &LogFilter) -> bool {
         .and_then(|t| t.as_array());
     for (i, topic_filter) in filter.topics.iter().enumerate() {
         match topic_filter {
-            TopicFilter::Any => continue,
+            TopicFilter::Any => {
+                // Wildcard still implies the position exists per EIP-1474
+                if log_topics.map_or(true, |t| t.get(i).is_none()) {
+                    return false;
+                }
+            }
             TopicFilter::Exact(expected) => {
                 let actual = log_topics
                     .and_then(|t| t.get(i))

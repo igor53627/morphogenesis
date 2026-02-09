@@ -85,7 +85,7 @@ crates/
 
 ## Documentation
 
-- [Kanban](docs/KANBAN.md) - Project status and tasks (historic)
+- [Kanban](docs/archive/KANBAN.md) - Project status and tasks (historic)
 - [Backlog](backlog/) - Active task management (use `backlog` CLI)
 - [Protocol & Architecture](docs/morphogenesis_protocol.md) - v5.0
 - [Performance](docs/PERFORMANCE.md) - Optimization findings

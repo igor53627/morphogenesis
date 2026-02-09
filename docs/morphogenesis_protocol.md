@@ -2,7 +2,7 @@
 
 **Status:** Production Ready
 **Date:** Feb 2026
-**Target:** Single-Server GPU PIR (NVIDIA H100/H200/B200)
+**Target:** 2-Party GPU PIR (NVIDIA H100/H200/B200, one GPU server per party)
 
 ## 1. Overview
 
@@ -12,7 +12,7 @@ Morphogenesis is a **Private Information Retrieval (PIR)** protocol for Ethereum
 *   **Privacy:** Information-Theoretic (IT-PIR) via 2-server DPF.
 *   **Scale:** 2.15 Billion rows (full Mainnet accounts + storage).
 *   **Latency:** 32.1 ms query time on H100 (subtree kernel), 27.4 ms on B200.
-*   **Simplicity:** Runs on a single commodity GPU server.
+*   **Simplicity:** Each party runs on a single commodity GPU server.
 
 ### Workspace
 
@@ -235,7 +235,7 @@ The `DeltaBuffer` accumulates live state updates between epoch rotations.
 
 ### 7.3 Leakage Assessment
 
-*   **Retry Oracle:** Eliminated. Epoch-based consistency means clients never retry on failures.
+*   **Retry Oracle:** Eliminated. Consistency retries are handled server-side; clients may retry on transport errors, but retries do not depend on the query target.
 *   **Metadata:** The server learns only that the client is "live" (tracking the chain tip).
 *   **RPC Adapter:** Method routing minimizes upstream leakage. Private methods never touch the upstream RPC. Transactions relay through Flashbots Protect.
 
