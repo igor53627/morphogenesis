@@ -116,13 +116,6 @@ fn analyze_mask_distribution(k0: &morphogen_dpf::page::PageDpfKey, num_pages: us
 
     let mut dpf_output = vec![ByteGroup::zero(); num_pages];
 
-    match k0.domain_bits() {
-        1..=8 => {
-            // Can't easily access params, use full_eval
-        }
-        _ => {}
-    }
-
     k0.full_eval(&mut dpf_output).unwrap();
 
     let mut zero_masks = 0usize;

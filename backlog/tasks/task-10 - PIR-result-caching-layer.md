@@ -1,7 +1,7 @@
 ---
 id: TASK-10
 title: PIR result caching layer
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-03 14:38'
 labels:

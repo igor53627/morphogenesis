@@ -1,7 +1,7 @@
 ---
 id: TASK-9
 title: Wallet compatibility verification
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-03 14:38'
 labels:

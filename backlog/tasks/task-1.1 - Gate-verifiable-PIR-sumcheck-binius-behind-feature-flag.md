@@ -1,7 +1,7 @@
 ---
 id: TASK-1.1
 title: Gate verifiable PIR (sumcheck/binius) behind feature flag
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-02-04 08:08'
 labels: []

@@ -1,7 +1,7 @@
 ---
 id: TASK-2
 title: Add client library support for storage queries
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-03 14:29'
 labels: []

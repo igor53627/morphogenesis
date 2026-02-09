@@ -1,7 +1,7 @@
 ---
 id: TASK-7
 title: Error handling hardening
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-03 14:38'
 labels:
