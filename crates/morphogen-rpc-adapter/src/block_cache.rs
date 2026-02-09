@@ -108,13 +108,13 @@ impl BlockCache {
     }
 
     /// Returns (block_number, block_hash) of the latest cached block, if any.
-    pub fn latest_block_hash(&self) -> Option<(u64, [u8; 32])> {
+    pub(crate) fn latest_block_hash(&self) -> Option<(u64, [u8; 32])> {
         self.cached_blocks.back().map(|b| (b.number, b.block_hash))
     }
 }
 
-/// Parse a 0x-prefixed hex string into a 32-byte hash.
-/// Rejects input that isn't exactly 64 hex chars (+ optional 0x prefix)
+/// Parse an optionally 0x-prefixed hex string into a 32-byte hash.
+/// Rejects input that isn't exactly 64 hex chars (with optional 0x prefix)
 /// before decoding, preventing DoS via oversized input.
 pub fn parse_tx_hash(s: &str) -> Option<[u8; 32]> {
     let hex = s.strip_prefix("0x").unwrap_or(s);
@@ -216,11 +216,11 @@ async fn poll_new_blocks(
             serde_json::json!([check_hex, false]),
         ).await?;
         if !check_block.is_null() {
-            if let Some(upstream_hash) = check_block.get("hash")
+            match check_block.get("hash")
                 .and_then(|h| h.as_str())
                 .and_then(|s| parse_tx_hash(s))
             {
-                if upstream_hash != cached_hash {
+                Some(upstream_hash) if upstream_hash != cached_hash => {
                     warn!(
                         block = cached_num,
                         "Chain reorg detected (block hash mismatch), invalidating cache"
@@ -228,6 +228,15 @@ async fn poll_new_blocks(
                     cache.write().await.invalidate_from(cached_num);
                     return Ok(0);
                 }
+                None => {
+                    warn!(
+                        block = cached_num,
+                        "Upstream block missing hash, conservatively invalidating cache"
+                    );
+                    cache.write().await.invalidate_from(cached_num);
+                    return Ok(0);
+                }
+                _ => {} // hash matches, no reorg
             }
         }
 
@@ -265,10 +274,16 @@ async fn poll_new_blocks(
             break;
         }
 
-        let block_hash = block.get("hash")
+        let block_hash = match block.get("hash")
             .and_then(|h| h.as_str())
             .and_then(|s| parse_tx_hash(s))
-            .unwrap_or([0u8; 32]);
+        {
+            Some(h) => h,
+            None => {
+                warn!(block_num, "Block missing valid hash, skipping cache");
+                continue;
+            }
+        };
 
         let txs_array = block.get("transactions")
             .and_then(|v| v.as_array())
@@ -479,6 +494,8 @@ mod tests {
     fn parse_tx_hash_invalid() {
         assert!(parse_tx_hash("0xshort").is_none());
         assert!(parse_tx_hash("not_hex").is_none());
+        // Correct length but invalid hex characters
+        assert!(parse_tx_hash("0xgggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg").is_none());
     }
 
     #[test]
