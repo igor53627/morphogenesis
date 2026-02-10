@@ -17,7 +17,6 @@ This file confirms that morphogenesis requires:
 ## Git Hook
 
 `.git/hooks/post-commit` runs:
-- zoekt-git-index (search indexing)
 - roborev enqueue (automatic review)
 - backlog task edit (auto-link commits to tasks)
 
