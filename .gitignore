@@ -2,6 +2,12 @@ target/
 fixtures/*.bin
 **/.DS_Store
 .env*
-docs/paper/*.log
 modal_*.py
-target/
+
+# LaTeX build artifacts
+docs/paper/*.aux
+docs/paper/*.bbl
+docs/paper/*.blg
+docs/paper/*.log
+docs/paper/*.out
+docs/paper/*.toc
