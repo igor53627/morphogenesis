@@ -1,6 +1,6 @@
 # Morphogenesis PIR
 
-2-party DPF-based Private Information Retrieval for Ethereum state.
+2-server DPF-based Private Information Retrieval for Ethereum state.
 
 ## Current Status
 
@@ -12,11 +12,13 @@
 
 ## Performance
 
-| Hardware | VRAM | Throughput | Latency | Concurrent Clients (< 600 ms) |
-|----------|------|------------|---------|-------------------------------|
-| NVIDIA B200 | 192 GB | 2,510 GB/s | 27.4 ms | ~21 |
-| NVIDIA H200 | 141 GB | 2,235 GB/s | 30.8 ms | ~19 |
-| NVIDIA H100 | 80 GB | 2,143 GB/s | 32.1 ms | ~18 |
+| Hardware | VRAM | Throughput | Latency | Concurrent Clients (< 600 ms) | Source |
+|----------|------|------------|---------|-------------------------------|--------|
+| NVIDIA B200 | 192 GB | 2,510 GB/s | 27.4 ms | ~21 | Projected |
+| NVIDIA H200 | 141 GB | 2,235 GB/s | 30.8 ms | ~19 | Projected |
+| NVIDIA H100 | 80 GB | 2,143 GB/s | 32.1 ms | ~18 | Measured |
+
+Assumes full mainnet matrix in GPU VRAM, one in-flight query per client, and excludes network RTT/application overhead. See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for benchmark methodology.
 
 ## Quick Start
 
@@ -27,12 +29,19 @@ cargo build --release --features avx512,parallel
 # Run benchmark (75GB matrix, 3 iterations)
 ./target/release/bench_scan --rows 78643200 --iterations 3 --warmup-iterations 1 --scan-only --parallel
 
+# Keep provider key out of inline commands/snippets
+export UPSTREAM_RPC_URL="https://eth-mainnet.g.alchemy.com/v2/<KEY>"
+
 # Run RPC adapter (connects to PIR servers + upstream RPC)
 cargo run -p morphogen-rpc-adapter -- \
   --server1 http://pir1:8080 \
   --server2 http://pir2:8080 \
-  --upstream https://eth-mainnet.g.alchemy.com/v2/KEY
+  --upstream "$UPSTREAM_RPC_URL"
 ```
+
+## Development Workflow
+
+Required tooling/hooks are documented in [.mandatory-tooling](.mandatory-tooling). Task tracking lives in [backlog/](backlog/) and reviews are managed with `roborev`.
 
 ## Architecture
 
@@ -54,12 +63,12 @@ The adapter runs on `:8545` as a drop-in replacement for standard Ethereum RPC p
 
 | Category | Methods | Mechanism |
 |----------|---------|-----------|
-| Private (PIR) | `getBalance`, `getTransactionCount`, `getCode`, `getStorageAt` | DPF query to PIR servers |
+| Private (PIR) | `eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt` | DPF query to PIR servers |
 | Private (EVM) | `eth_call`, `eth_estimateGas` | Local revm with PIR-backed state |
-| Private (Cache) | `eth_getLogs`, `getTransactionByHash`, `getTransactionReceipt` | Block cache (64 blocks) |
-| Private (Filters) | `newFilter`, `newBlockFilter`, `getFilterChanges`, `getFilterLogs` | Local filter state |
+| Private (Cache) | `eth_getLogs`, `eth_getTransactionByHash`, `eth_getTransactionReceipt` | Block cache (64 blocks) |
+| Private (Filters) | `eth_newFilter`, `eth_newBlockFilter`, `eth_getFilterChanges`, `eth_getFilterLogs` | Local filter state |
 | Relay | `eth_sendRawTransaction` | Flashbots Protect |
-| Passthrough | `blockNumber`, `chainId`, `gasPrice`, `getBlockByNumber`, etc. | Forwarded to upstream |
+| Passthrough | `eth_blockNumber`, `eth_chainId`, `eth_gasPrice`, `eth_getBlockByNumber`, etc. | Forwarded to upstream |
 
 ## Features
 
