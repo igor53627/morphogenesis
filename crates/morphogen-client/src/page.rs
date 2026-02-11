@@ -224,8 +224,8 @@ mod tests {
 
             for idx in 0..metadata.num_pages {
                 let mut xor = [0u8; 16];
-                for j in 0..16 {
-                    xor[j] = output_a[idx].0[j] ^ output_b[idx].0[j];
+                for (j, byte) in xor.iter_mut().enumerate() {
+                    *byte = output_a[idx].0[j] ^ output_b[idx].0[j];
                 }
 
                 if idx == target_page {
@@ -313,13 +313,13 @@ mod tests {
     #[test]
     fn extract_rows_from_aggregated_pages() {
         let mut pages: [Vec<u8>; 3] = Default::default();
-        for i in 0..3 {
+        for (i, page_slot) in pages.iter_mut().enumerate() {
             let mut page = vec![0u8; PAGE_SIZE_BYTES];
             for row in 0..ROWS_PER_PAGE {
                 let start = row * ROW_SIZE_BYTES;
                 page[start..start + ROW_SIZE_BYTES].fill((row + i * 16) as u8);
             }
-            pages[i] = page;
+            *page_slot = page;
         }
 
         let result = PageAggregatedResult {

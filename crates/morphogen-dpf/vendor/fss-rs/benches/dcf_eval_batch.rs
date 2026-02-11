@@ -37,7 +37,7 @@ fn from_domain_range_size<const IN_BLEN: usize, const OUT_BLEN: usize, const CIP
 
     let k = dcf.gen(&f, [&s0s[0], &s0s[1]]);
 
-    let mut xs = vec![[0; IN_BLEN]; POINT_NUM];
+    let mut xs = [[0; IN_BLEN]; POINT_NUM];
     xs.iter_mut().for_each(|x| thread_rng().fill_bytes(x));
     let xs_iter: Vec<_> = xs.iter().collect();
     let mut ys = vec![ByteGroup::zero(); POINT_NUM];

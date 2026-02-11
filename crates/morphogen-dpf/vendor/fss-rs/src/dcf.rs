@@ -356,23 +356,25 @@ mod tests {
             assert_eq!(xs.len(), 1 << filter_bitn);
             let xs_lt_num = alpha_i;
             let xs_gt_num = (u16::MAX >> (16 - filter_bitn)) - alpha_i;
-            let ys_expected: Vec<_> = iter::repeat(if bound_is_gt {
-                GroupImpl::zero()
-            } else {
-                beta.into()
-            })
-            .take(xs_lt_num as usize)
+            let ys_expected: Vec<_> = iter::repeat_n(
+                if bound_is_gt {
+                    GroupImpl::zero()
+                } else {
+                    beta.into()
+                },
+                xs_lt_num as usize,
+            )
             .chain([GroupImpl::zero()])
-            .chain(
-                iter::repeat({
+            .chain(iter::repeat_n(
+                {
                     if bound_is_gt {
                         beta.into()
                     } else {
                         GroupImpl::zero()
                     }
-                })
-                .take(xs_gt_num as usize),
-            )
+                },
+                xs_gt_num as usize,
+            ))
             .collect();
 
             let mut ys0 = vec![GroupImpl::zero(); xs.len()];
