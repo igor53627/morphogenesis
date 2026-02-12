@@ -899,10 +899,7 @@ mod fss_page_tests {
         k1.full_eval(&mut output1).unwrap();
 
         for i in 0..256 {
-            let mut xor = [0u8; 16];
-            for j in 0..16 {
-                xor[j] = output0[i].0[j] ^ output1[i].0[j];
-            }
+            let xor = std::array::from_fn(|j| output0[i].0[j] ^ output1[i].0[j]);
             if i == target_page {
                 assert_eq!(xor, [0xFF; 16], "XOR at target page {} should be 0xFF", i);
             } else {
@@ -929,10 +926,7 @@ mod fss_page_tests {
         k1.full_eval(&mut output1).unwrap();
 
         for i in [0, 1, 100, target_page, 1000] {
-            let mut xor = [0u8; 16];
-            for j in 0..16 {
-                xor[j] = output0[i].0[j] ^ output1[i].0[j];
-            }
+            let xor = std::array::from_fn(|j| output0[i].0[j] ^ output1[i].0[j]);
             if i == target_page {
                 assert_eq!(xor, [0xFF; 16], "XOR at target page {} should be 0xFF", i);
             } else {
@@ -959,10 +953,7 @@ mod fss_page_tests {
         k1.full_eval(&mut output1).unwrap();
 
         for i in [0, 1, 100, target_page, 1000, 65535] {
-            let mut xor = [0u8; 16];
-            for j in 0..16 {
-                xor[j] = output0[i].0[j] ^ output1[i].0[j];
-            }
+            let xor = std::array::from_fn(|j| output0[i].0[j] ^ output1[i].0[j]);
             if i == target_page {
                 assert_eq!(xor, [0xFF; 16], "XOR at target page {} should be 0xFF", i);
             } else {
@@ -989,10 +980,7 @@ mod fss_page_tests {
         k1.full_eval(&mut output1).unwrap();
 
         for i in [0, 1, 100, target_page, 1_000_000] {
-            let mut xor = [0u8; 16];
-            for j in 0..16 {
-                xor[j] = output0[i].0[j] ^ output1[i].0[j];
-            }
+            let xor = std::array::from_fn(|j| output0[i].0[j] ^ output1[i].0[j]);
             if i == target_page {
                 assert_eq!(xor, [0xFF; 16], "XOR at target page {} should be 0xFF", i);
             } else {
@@ -1019,10 +1007,7 @@ mod fss_page_tests {
         k1.full_eval(&mut output1).unwrap();
 
         for i in [0, 1, 100, target_page, 30_000_000] {
-            let mut xor = [0u8; 16];
-            for j in 0..16 {
-                xor[j] = output0[i].0[j] ^ output1[i].0[j];
-            }
+            let xor = std::array::from_fn(|j| output0[i].0[j] ^ output1[i].0[j]);
             if i == target_page {
                 assert_eq!(xor, [0xFF; 16], "XOR at target page {} should be 0xFF", i);
             } else {
@@ -1067,10 +1052,8 @@ mod fss_page_tests {
                 k0.full_eval(&mut output0).unwrap();
                 k1.full_eval(&mut output1).unwrap();
 
-                let mut xor_target = [0u8; 16];
-                for j in 0..16 {
-                    xor_target[j] = output0[target].0[j] ^ output1[target].0[j];
-                }
+                let xor_target =
+                    std::array::from_fn(|j| output0[target].0[j] ^ output1[target].0[j]);
                 assert_eq!(
                     xor_target, [0xFF; 16],
                     "domain_bits={}, target={}: XOR should be 0xFF",
@@ -1078,10 +1061,8 @@ mod fss_page_tests {
                 );
 
                 let check_idx = if target == 0 { 1 } else { 0 };
-                let mut xor_other = [0u8; 16];
-                for j in 0..16 {
-                    xor_other[j] = output0[check_idx].0[j] ^ output1[check_idx].0[j];
-                }
+                let xor_other =
+                    std::array::from_fn(|j| output0[check_idx].0[j] ^ output1[check_idx].0[j]);
                 assert_eq!(
                     xor_other, [0x00; 16],
                     "domain_bits={}, non-target={}: XOR should be 0x00",
@@ -1156,8 +1137,8 @@ mod fss_page_tests {
         let num_pages = params.max_pages();
         let mut matrix = vec![[0u8; PAGE_SIZE_BYTES]; num_pages];
         for (p, page) in matrix.iter_mut().enumerate() {
-            for i in 0..PAGE_SIZE_BYTES {
-                page[i] = ((p * PAGE_SIZE_BYTES + i) % 256) as u8;
+            for (i, byte) in page.iter_mut().enumerate() {
+                *byte = ((p * PAGE_SIZE_BYTES + i) % 256) as u8;
             }
         }
 

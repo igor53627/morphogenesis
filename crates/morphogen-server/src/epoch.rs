@@ -1275,7 +1275,7 @@ mod tests {
         let manager = EpochManager::new(global, 4).unwrap();
 
         let handle = manager.acquire();
-        let snapshot: &EpochSnapshot = &*handle;
+        let snapshot: &EpochSnapshot = &handle;
         assert_eq!(snapshot.epoch_id, 99);
     }
 

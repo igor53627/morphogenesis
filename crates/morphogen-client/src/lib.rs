@@ -550,9 +550,7 @@ mod tests {
         row[15] = 100;
         row[23] = 5;
         // CodeHash = all 0xAA
-        for i in 24..56 {
-            row[i] = 0xAA;
-        }
+        row[24..56].fill(0xAA);
 
         let data = AccountData::from_bytes(&row).unwrap();
         assert_eq!(data.balance, 100);
@@ -570,7 +568,7 @@ mod tests {
         let _m = server
             .mock("GET", "/dict.bin")
             .match_header("Range", "bytes=32-63")
-            .with_body(&hash)
+            .with_body(hash)
             .create_async()
             .await;
 
@@ -676,13 +674,13 @@ mod tests {
     #[test]
     fn storage_data_parses_full_value() {
         let mut payload = vec![0xFFu8; 48];
-        for i in 0..32 {
-            payload[i] = i as u8;
+        for (i, byte) in payload[..32].iter_mut().enumerate() {
+            *byte = i as u8;
         }
 
         let data = StorageData::from_bytes(&payload).unwrap();
-        for i in 0..32 {
-            assert_eq!(data.value[i], i as u8);
+        for (i, &byte) in data.value.iter().enumerate() {
+            assert_eq!(byte, i as u8);
         }
     }
 
@@ -708,8 +706,8 @@ mod tests {
         // Value
         payload[31] = 0xFF;
         // Tag at bytes [32..40]
-        for i in 0..8 {
-            payload[32 + i] = (0xAA + i) as u8;
+        for (i, byte) in payload[32..40].iter_mut().enumerate() {
+            *byte = (0xAA + i) as u8;
         }
 
         let data = StorageData::from_bytes(&payload).unwrap();
@@ -717,8 +715,8 @@ mod tests {
         assert!(data.tag.is_some());
 
         let tag = data.tag.unwrap();
-        for i in 0..8 {
-            assert_eq!(tag[i], (0xAA + i) as u8);
+        for (i, &byte) in tag.iter().enumerate() {
+            assert_eq!(byte, (0xAA + i) as u8);
         }
     }
 

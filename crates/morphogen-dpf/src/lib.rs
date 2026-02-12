@@ -426,11 +426,9 @@ mod tests {
         let target = 5;
         let key = AesDpfKey::new_single(&mut rng, target);
 
-        let result = key.eval_bit(target);
-        assert!(
-            result || !result,
-            "Single key eval should return some value"
-        );
+        // Verify eval_bit returns without panicking; the value is
+        // inherently either true or false, so we just exercise the call.
+        let _result = key.eval_bit(target);
     }
 }
 
@@ -563,10 +561,7 @@ mod fss_tests {
 
         // Check XOR at all positions
         for i in 0..256 {
-            let mut xor = [0u8; 16];
-            for j in 0..16 {
-                xor[j] = ys0[i].0[j] ^ ys1[i].0[j];
-            }
+            let xor = std::array::from_fn(|j| ys0[i].0[j] ^ ys1[i].0[j]);
             if i == target as usize {
                 assert_eq!(xor, [0xFF; 16], "XOR at target {} should be all 0xFF", i);
             } else {
