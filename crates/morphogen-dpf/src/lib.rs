@@ -561,10 +561,7 @@ mod fss_tests {
 
         // Check XOR at all positions
         for i in 0..256 {
-            let mut xor = [0u8; 16];
-            for (j, byte) in xor.iter_mut().enumerate() {
-                *byte = ys0[i].0[j] ^ ys1[i].0[j];
-            }
+            let xor = std::array::from_fn(|j| ys0[i].0[j] ^ ys1[i].0[j]);
             if i == target as usize {
                 assert_eq!(xor, [0xFF; 16], "XOR at target {} should be all 0xFF", i);
             } else {

@@ -223,10 +223,7 @@ mod tests {
             key_b.full_eval(&mut output_b).unwrap();
 
             for idx in 0..metadata.num_pages {
-                let mut xor = [0u8; 16];
-                for (j, byte) in xor.iter_mut().enumerate() {
-                    *byte = output_a[idx].0[j] ^ output_b[idx].0[j];
-                }
+                let xor = std::array::from_fn(|j| output_a[idx].0[j] ^ output_b[idx].0[j]);
 
                 if idx == target_page {
                     assert_eq!(
