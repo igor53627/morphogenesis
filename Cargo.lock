@@ -3230,6 +3230,7 @@ dependencies = [
  "revm",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.22",

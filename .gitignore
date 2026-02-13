@@ -15,3 +15,5 @@ docs/paper/*.out
 docs/paper/*.run.xml
 docs/paper/*.synctex.gz
 docs/paper/*.toc
+# Nightshift plan artifacts (keep out of version control)
+.nightshift-plan

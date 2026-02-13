@@ -12,6 +12,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use morphogen_client::network::PirClient;
 use serde_json::Value;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -44,6 +45,10 @@ struct Args {
     /// CAS Base URL for bytecode fetching
     #[arg(long, default_value = "http://localhost:8080/cas")]
     cas_url: String,
+
+    /// Required allowlist root for local file:// dictionary/CAS URLs
+    #[arg(long)]
+    file_url_root: Option<PathBuf>,
 
     /// Metadata refresh interval in seconds
     #[arg(long, default_value_t = 12)]
@@ -123,10 +128,14 @@ async fn main() -> Result<()> {
         args.pir_server_a.clone(),
         args.pir_server_b.clone(),
     ));
-    let code_resolver = Arc::new(CodeResolver::new(
-        args.dict_url.clone(),
-        args.cas_url.clone(),
-    ));
+    let code_resolver = Arc::new(match args.file_url_root.clone() {
+        Some(root) => CodeResolver::new_with_file_url_root(
+            args.dict_url.clone(),
+            args.cas_url.clone(),
+            Some(root),
+        ),
+        None => CodeResolver::new(args.dict_url.clone(), args.cas_url.clone()),
+    });
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(args.upstream_timeout))

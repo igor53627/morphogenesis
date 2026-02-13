@@ -1,0 +1,53 @@
+name: Nightly Live Smoke
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  wallet-compat:
+    name: Wallet Compat Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Run wallet compatibility smoke
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/nightly-smoke
+          bash scripts/test_wallet_compat.sh | tee /tmp/nightly-smoke/wallet_compat.log
+      - name: Upload wallet smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-wallet-compat-logs
+          path: /tmp/nightly-smoke/wallet_compat.log
+
+  filter-e2e:
+    name: Filter E2E Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: foundry-rs/foundry-toolchain@v1
+      - uses: Swatinem/rust-cache@v2
+      - name: Run filter/logs smoke
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/nightly-smoke
+          bash scripts/test_filter_e2e.sh | tee /tmp/nightly-smoke/filter_e2e.log
+      - name: Upload filter smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-filter-e2e-logs
+          path: /tmp/nightly-smoke/filter_e2e.log

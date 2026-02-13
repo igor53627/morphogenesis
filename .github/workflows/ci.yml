@@ -60,3 +60,22 @@ jobs:
       - run: cargo build -p morphogen-rpc-adapter
       - run: cargo test -p morphogen-rpc-adapter
       - run: cargo test -p morphogen-client
+
+  e2e-deterministic:
+    name: Deterministic E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          set -euo pipefail
+          mkdir -p /tmp/nightly-smoke/deterministic-e2e
+          LOG_DIR=/tmp/nightly-smoke/deterministic-e2e KEEP_LOGS_ON_SUCCESS=1 bash scripts/test_rpc_e2e.sh
+      - name: Upload deterministic e2e logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deterministic-e2e-logs
+          path: /tmp/nightly-smoke/deterministic-e2e
+          if-no-files-found: ignore

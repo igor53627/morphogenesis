@@ -34,14 +34,22 @@ export UPSTREAM_RPC_URL="https://eth-mainnet.g.alchemy.com/v2/<KEY>"
 
 # Run RPC adapter (connects to PIR servers + upstream RPC)
 cargo run -p morphogen-rpc-adapter -- \
-  --server1 http://pir1:8080 \
-  --server2 http://pir2:8080 \
+  --pir-server-a http://pir1:8080 \
+  --pir-server-b http://pir2:8080 \
   --upstream "$UPSTREAM_RPC_URL"
 ```
 
 ## Development Workflow
 
 Required tooling/hooks are documented in [.mandatory-tooling](.mandatory-tooling). Task tracking lives in [backlog/](backlog/) and reviews are managed with `roborev`.
+
+## Deterministic E2E
+
+Run the full local deterministic RPC adapter E2E suite (subset fixtures, no live-mainnet dependency):
+
+```bash
+bash scripts/test_rpc_e2e.sh
+```
 
 ## Architecture
 
