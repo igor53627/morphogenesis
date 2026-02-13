@@ -3,10 +3,9 @@
 //! Recommendation: Use Optimized v1 - it provides 3-8% speedup without
 //! the serialization penalty of v2/v3.
 
-use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+use morphogen_gpu_dpf::dpf::ChaChaParams;
 use morphogen_gpu_dpf::kernel::PAGE_SIZE_BYTES;
 use std::env;
-use std::time::Instant;
 
 #[cfg(feature = "cuda")]
 use morphogen_gpu_dpf::kernel::GpuScanner;

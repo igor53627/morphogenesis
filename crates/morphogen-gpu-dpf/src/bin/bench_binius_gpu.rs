@@ -3,8 +3,6 @@ use clap::Parser;
 use cudarc::driver::{CudaDevice, DriverError, LaunchAsync, LaunchConfig};
 #[cfg(feature = "cuda")]
 use cudarc::nvrtc::Ptx;
-use std::sync::Arc;
-use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]

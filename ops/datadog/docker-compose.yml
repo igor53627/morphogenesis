@@ -1,0 +1,26 @@
+services:
+  datadog-agent:
+    image: datadog/agent:7
+    container_name: morphogenesis-datadog-agent
+    hostname: ${DD_HOSTNAME:-morphogenesis-e2e}
+    restart: unless-stopped
+    environment:
+      DD_API_KEY: ${DD_API_KEY:?set DD_API_KEY in env}
+      DD_SITE: ${DD_SITE:-datadoghq.com}
+      DD_ENV: ${DD_ENV:-e2e}
+      DD_HOSTNAME: ${DD_HOSTNAME:-morphogenesis-e2e}
+      DD_APM_ENABLED: "true"
+      DD_APM_NON_LOCAL_TRAFFIC: "true"
+      DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_GRPC_ENDPOINT: "0.0.0.0:4317"
+      DD_OTLP_CONFIG_RECEIVER_PROTOCOLS_HTTP_ENDPOINT: "0.0.0.0:4318"
+      DD_LOGS_ENABLED: "false"
+      DD_PROCESS_AGENT_ENABLED: "false"
+    ports:
+      - "8126:8126"
+      - "4317:4317"
+      - "4318:4318"
+    healthcheck:
+      test: ["CMD-SHELL", "agent health >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12

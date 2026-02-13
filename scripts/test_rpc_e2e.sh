@@ -1,10 +1,20 @@
 #!/bin/bash
-set -e
+set -euo pipefail
+
+ENABLE_DATADOG="${ENABLE_DATADOG:-0}"
+OTEL_ENDPOINT="${OTEL_ENDPOINT:-http://127.0.0.1:4317}"
+OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-morphogen-rpc-adapter}"
+OTEL_CLIENT_SERVICE_NAME="${OTEL_CLIENT_SERVICE_NAME:-morphogen-e2e-client}"
+OTEL_ENV="${OTEL_ENV:-e2e}"
+OTEL_VERSION="${OTEL_VERSION:-local}"
 
 # 1. Build components
 echo "Building components..."
 cargo build -p morphogen-server --bin test_server --features network
 cargo build -p morphogen-rpc-adapter
+if [[ "${ENABLE_DATADOG}" == "1" ]]; then
+    cargo build -p morphogen-rpc-adapter --bin morphogen-rpc-dd-client
+fi
 
 # 2. Setup Mock CAS (Dictionary + Bytecode)
 echo "Setting up Mock CAS..."
@@ -70,12 +80,34 @@ SERVER_B_PID=$!
 
 # 4. Start RPC Adapter
 echo "Starting RPC Adapter..."
-./target/debug/morphogen-rpc-adapter \
-    --port 8545 \
-    --pir-server-a http://127.0.0.1:3000 \
-    --pir-server-b http://127.0.0.1:3001 \
-    --dict-url http://localhost:8088/mainnet_compact.dict \
-    --cas-url http://localhost:8088/cas &
+ADAPTER_OTEL_ARGS=()
+if [[ "${ENABLE_DATADOG}" == "1" ]]; then
+    echo "OpenTelemetry export enabled (endpoint: ${OTEL_ENDPOINT})"
+    ADAPTER_OTEL_ARGS=(
+        --otel-traces
+        --otel-endpoint "${OTEL_ENDPOINT}"
+        --otel-service-name "${OTEL_SERVICE_NAME}"
+        --otel-env "${OTEL_ENV}"
+        --otel-version "${OTEL_VERSION}"
+    )
+fi
+
+if [[ "${ENABLE_DATADOG}" == "1" ]]; then
+    ./target/debug/morphogen-rpc-adapter \
+        --port 8545 \
+        --pir-server-a http://127.0.0.1:3000 \
+        --pir-server-b http://127.0.0.1:3001 \
+        --dict-url http://localhost:8088/mainnet_compact.dict \
+        --cas-url http://localhost:8088/cas \
+        "${ADAPTER_OTEL_ARGS[@]}" &
+else
+    ./target/debug/morphogen-rpc-adapter \
+        --port 8545 \
+        --pir-server-a http://127.0.0.1:3000 \
+        --pir-server-b http://127.0.0.1:3001 \
+        --dict-url http://localhost:8088/mainnet_compact.dict \
+        --cas-url http://localhost:8088/cas &
+fi
 ADAPTER_PID=$!
 
 # Cleanup function
@@ -88,9 +120,21 @@ trap cleanup EXIT
 
 sleep 5
 
-# 5. Test with cast
+# 5. Test queries
 TEST_ADDR="0x000000000000000000000000000000000000031c"
 echo "Querying $TEST_ADDR via RPC..."
+
+if [[ "${ENABLE_DATADOG}" == "1" ]]; then
+    ./target/debug/morphogen-rpc-dd-client \
+        --rpc-url http://127.0.0.1:8545 \
+        --address "$TEST_ADDR" \
+        --otel-traces \
+        --otel-endpoint "${OTEL_ENDPOINT}" \
+        --otel-service-name "${OTEL_CLIENT_SERVICE_NAME}" \
+        --otel-env "${OTEL_ENV}" \
+        --otel-version "${OTEL_VERSION}"
+    exit 0
+fi
 
 # eth_getBalance
 BALANCE=$(cast balance $TEST_ADDR --rpc-url http://127.0.0.1:8545)
