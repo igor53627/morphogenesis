@@ -121,9 +121,7 @@ pub fn rpc_server_span(method: &'static str, extensions: &Extensions) -> tracing
 
 fn extract_remote_parent_context(extensions: &Extensions) -> Option<opentelemetry::Context> {
     let headers = extensions.get::<TraceContextHeaders>()?;
-    if headers.traceparent.is_none() {
-        return None;
-    }
+    headers.traceparent.as_ref()?;
 
     let extracted = opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&TraceHeadersExtractor { headers })
