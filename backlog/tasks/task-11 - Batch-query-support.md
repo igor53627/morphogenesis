@@ -1,9 +1,10 @@
 ---
 id: TASK-11
 title: Batch query support
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-03 14:38'
+updated_date: '2026-02-18 06:40'
 labels:
   - rpc
   - optimization

@@ -1,7 +1,7 @@
 ---
 id: TASK-13
-title: Access list optimization for eth_call
-status: To Do
+title: Implement eth_createAccessList method (privacy-preserving)
+status: Icebox
 assignee: []
 created_date: '2026-02-03 14:38'
 labels:
@@ -15,5 +15,10 @@ priority: low
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-Research/Future: Use eth_createAccessList to prefetch storage slots. Batch PIR queries before execution starts to minimize execution pauses.
+Implement `eth_createAccessList` in the RPC adapter as an optional optimization path for callers that want precomputed access lists.
+
+Constraints:
+- Keep wallet compatibility unaffected when this method is absent.
+- Avoid privacy regressions (do not leak call intent to upstream by default).
+- Integrate with existing local EVM / PIR-backed execution where feasible.
 <!-- SECTION:DESCRIPTION:END -->

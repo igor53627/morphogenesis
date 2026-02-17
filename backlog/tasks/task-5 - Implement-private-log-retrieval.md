@@ -1,9 +1,10 @@
 ---
 id: TASK-5
 title: Implement private log retrieval
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-03 14:30'
+updated_date: '2026-02-18 06:40'
 labels: []
 dependencies: []
 priority: medium

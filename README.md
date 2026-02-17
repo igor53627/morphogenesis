@@ -42,6 +42,7 @@ cargo run -p morphogen-rpc-adapter -- \
 ## Development Workflow
 
 Required tooling/hooks are documented in [.mandatory-tooling](.mandatory-tooling). Task tracking lives in [backlog/](backlog/) and reviews are managed with `roborev`.
+Every code or docs change must update the related backlog task status/notes before merge.
 
 ## Deterministic E2E
 
