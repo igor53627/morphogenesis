@@ -18,12 +18,6 @@ UPSTREAM_URL="http://127.0.0.1:${UPSTREAM_PORT}"
 FIXTURE_DIR="${ROOT_DIR}/fixtures/e2e"
 DICT_URL="file://${FIXTURE_DIR}/mainnet_compact.dict"
 CAS_URL="file://${FIXTURE_DIR}/cas"
-ENABLE_OTEL="${ENABLE_OTEL:-0}"
-OTEL_ENDPOINT="${OTEL_ENDPOINT:-http://127.0.0.1:4317}"
-OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-morphogen-rpc-adapter}"
-OTEL_CLIENT_SERVICE_NAME="${OTEL_CLIENT_SERVICE_NAME:-morphogen-e2e-client}"
-OTEL_ENV="${OTEL_ENV:-e2e}"
-OTEL_VERSION="${OTEL_VERSION:-local}"
 
 LOG_DIR_CREATED_BY_SCRIPT=0
 if [ -n "${LOG_DIR:-}" ]; then
@@ -200,9 +194,6 @@ assert_eq() {
 echo "Building components..."
 cargo build -p morphogen-server --bin test_server --features network >/dev/null
 cargo build -p morphogen-rpc-adapter --bin morphogen-rpc-adapter --bin mock_upstream >/dev/null
-if [ "${ENABLE_OTEL}" = "1" ]; then
-    cargo build -p morphogen-rpc-adapter --bin morphogen-e2e-client >/dev/null
-fi
 
 ensure_port_free "${PORT_A}" "PIR server A" "PORT_A"
 ensure_port_free "${PORT_B}" "PIR server B" "PORT_B"
@@ -251,16 +242,6 @@ fi
 green "Mock upstream is ready."
 
 echo "Starting RPC adapter..."
-ADAPTER_OTEL_ARGS=()
-if [ "${ENABLE_OTEL}" = "1" ]; then
-    ADAPTER_OTEL_ARGS=(
-        --otel-traces
-        --otel-endpoint "${OTEL_ENDPOINT}"
-        --otel-service-name "${OTEL_SERVICE_NAME}"
-        --otel-env "${OTEL_ENV}"
-        --otel-version "${OTEL_VERSION}"
-    )
-fi
 "${ROOT_DIR}/target/debug/morphogen-rpc-adapter" \
     --port "${ADAPTER_PORT}" \
     --upstream "${UPSTREAM_URL}" \
@@ -269,7 +250,6 @@ fi
     --dict-url "${DICT_URL}" \
     --cas-url "${CAS_URL}" \
     --file-url-root "${FIXTURE_DIR}" \
-    "${ADAPTER_OTEL_ARGS[@]}" \
     >"${LOG_DIR}/adapter.log" 2>&1 &
 ADAPTER_PID=$!
 
@@ -316,19 +296,6 @@ echo "Running deterministic E2E assertions..."
 TEST_ADDR="0x000000000000000000000000000000000000031c"
 ZERO_SLOT="0x0"
 TRANSFER_TOPIC="0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
-
-if [ "${ENABLE_OTEL}" = "1" ]; then
-    "${ROOT_DIR}/target/debug/morphogen-e2e-client" \
-        --rpc-url "${RPC_URL}" \
-        --address "${TEST_ADDR}" \
-        --otel-traces \
-        --otel-endpoint "${OTEL_ENDPOINT}" \
-        --otel-service-name "${OTEL_CLIENT_SERVICE_NAME}" \
-        --otel-env "${OTEL_ENV}" \
-        --otel-version "${OTEL_VERSION}"
-    green "ALL DETERMINISTIC E2E ASSERTIONS PASSED."
-    exit 0
-fi
 
 RESP="$(rpc_call "eth_getBalance" "[\"${TEST_ADDR}\",\"latest\"]")"
 ERR="$(error_of "${RESP}")"
