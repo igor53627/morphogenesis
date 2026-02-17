@@ -2,6 +2,7 @@ mod block_cache;
 mod code_resolver;
 mod evm;
 mod pir_db;
+mod telemetry;
 
 use anyhow::Result;
 use block_cache::BlockCache;
@@ -17,7 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tower::ServiceBuilder;
+use tracing::{error, info, warn, Instrument};
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Morphogenesis RPC Adapter")]
@@ -69,6 +71,26 @@ struct Args {
         default_value = "https://rpc.flashbots.net/?hint=hash&originId=morphogenesis"
     )]
     tx_relay: String,
+
+    /// Enable OpenTelemetry trace export (Datadog Agent OTLP gRPC compatible)
+    #[arg(long, default_value_t = false)]
+    otel_traces: bool,
+
+    /// OTLP collector endpoint (Datadog Agent default: http://127.0.0.1:4317)
+    #[arg(long, default_value = "http://127.0.0.1:4317")]
+    otel_endpoint: String,
+
+    /// Service name reported to APM
+    #[arg(long, default_value = "morphogen-rpc-adapter")]
+    otel_service_name: String,
+
+    /// Deployment environment tag for traces
+    #[arg(long, default_value = "e2e")]
+    otel_env: String,
+
+    /// Service version tag for traces
+    #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
+    otel_version: String,
 }
 
 struct AdapterState {
@@ -118,11 +140,21 @@ const RELAY_METHODS: &[&str] = &["eth_sendRawTransaction"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
     let args = Args::parse();
+    let otel = telemetry::OtelSettings {
+        enabled: args.otel_traces,
+        endpoint: args.otel_endpoint.clone(),
+        service_name: args.otel_service_name.clone(),
+        environment: args.otel_env.clone(),
+        service_version: args.otel_version.clone(),
+    };
+    let _telemetry_guard = telemetry::init_tracing(otel)?;
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
-    let server = Server::builder().build(addr).await?;
+    let server = Server::builder()
+        .set_http_middleware(ServiceBuilder::new().layer(telemetry::TraceContextLayer))
+        .build(addr)
+        .await?;
 
     let pir_client = Arc::new(PirClient::new(
         args.pir_server_a.clone(),
@@ -193,332 +225,315 @@ async fn main() -> Result<()> {
     let mut module = RpcModule::from_arc(state.clone());
 
     // Register eth_getBalance (Private)
-    module.register_async_method("eth_getBalance", |params, state, _| async move {
-        let (address_str, block): (String, Value) = params.parse()?;
-        let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
-        let mut address = [0u8; 20];
-        hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
-        })?;
+    module.register_async_method("eth_getBalance", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getBalance", &extensions);
+        async move {
+            let (address_str, block): (String, Value) = params.parse()?;
+            let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
+            let mut address = [0u8; 20];
+            hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
+                ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
+            })?;
 
-        info!("Private eth_getBalance for 0x{}", address_hex);
+            info!("Private eth_getBalance for 0x{}", address_hex);
 
-        match state.pir_client.query_account(address).await {
-            Ok(account) => {
-                Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", account.balance)))
-            }
-            Err(e) => {
-                error!("PIR query failed for eth_getBalance: {}", e);
-                if state.args.fallback_to_upstream {
-                    warn!("Falling back to upstream for eth_getBalance (privacy degraded)");
-                    let params = serde_json::json!([address_str, block]);
-                    return proxy_to_upstream(
-                        &state.args.upstream,
-                        &state.http_client,
-                        "eth_getBalance",
-                        params,
-                    )
-                    .await;
+            match state.pir_client.query_account(address).await {
+                Ok(account) => {
+                    Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", account.balance)))
                 }
-                Err(ErrorObjectOwned::owned(
-                    -32000,
-                    "PIR servers unavailable".to_string(),
-                    None::<()>,
-                ))
+                Err(e) => {
+                    error!("PIR query failed for eth_getBalance: {}", e);
+                    if state.args.fallback_to_upstream {
+                        warn!("Falling back to upstream for eth_getBalance (privacy degraded)");
+                        let params = serde_json::json!([address_str, block]);
+                        return proxy_to_upstream(
+                            &state.args.upstream,
+                            &state.http_client,
+                            "eth_getBalance",
+                            params,
+                        )
+                        .await;
+                    }
+                    Err(ErrorObjectOwned::owned(
+                        -32000,
+                        "PIR servers unavailable".to_string(),
+                        None::<()>,
+                    ))
+                }
             }
         }
+        .instrument(request_span)
     })?;
 
     // Register eth_getTransactionCount (Private)
-    module.register_async_method("eth_getTransactionCount", |params, state, _| async move {
-        let (address_str, block): (String, Value) = params.parse()?;
-        let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
-        let mut address = [0u8; 20];
-        hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
-        })?;
+    module.register_async_method("eth_getTransactionCount", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getTransactionCount", &extensions);
+        async move {
+            let (address_str, block): (String, Value) = params.parse()?;
+            let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
+            let mut address = [0u8; 20];
+            hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
+                ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
+            })?;
 
-        info!("Private eth_getTransactionCount for 0x{}", address_hex);
+            info!("Private eth_getTransactionCount for 0x{}", address_hex);
 
-        match state.pir_client.query_account(address).await {
-            Ok(account) => {
-                Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", account.nonce)))
-            }
-            Err(e) => {
-                error!("PIR query failed for eth_getTransactionCount: {}", e);
-                if state.args.fallback_to_upstream {
-                    warn!(
+            match state.pir_client.query_account(address).await {
+                Ok(account) => {
+                    Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", account.nonce)))
+                }
+                Err(e) => {
+                    error!("PIR query failed for eth_getTransactionCount: {}", e);
+                    if state.args.fallback_to_upstream {
+                        warn!(
                         "Falling back to upstream for eth_getTransactionCount (privacy degraded)"
                     );
-                    let params = serde_json::json!([address_str, block]);
-                    return proxy_to_upstream(
-                        &state.args.upstream,
-                        &state.http_client,
-                        "eth_getTransactionCount",
-                        params,
-                    )
-                    .await;
+                        let params = serde_json::json!([address_str, block]);
+                        return proxy_to_upstream(
+                            &state.args.upstream,
+                            &state.http_client,
+                            "eth_getTransactionCount",
+                            params,
+                        )
+                        .await;
+                    }
+                    Err(ErrorObjectOwned::owned(
+                        -32000,
+                        "PIR servers unavailable".to_string(),
+                        None::<()>,
+                    ))
                 }
-                Err(ErrorObjectOwned::owned(
-                    -32000,
-                    "PIR servers unavailable".to_string(),
-                    None::<()>,
-                ))
             }
         }
+        .instrument(request_span)
     })?;
 
     // Register eth_getCode (Private via CAS)
-    module.register_async_method("eth_getCode", |params, state, _| async move {
-        let (address_str, block): (String, Value) = params.parse()?;
-        let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
-        let mut address = [0u8; 20];
-        hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
-        })?;
+    module.register_async_method("eth_getCode", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getCode", &extensions);
+        async move {
+            let (address_str, block): (String, Value) = params.parse()?;
+            let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
+            let mut address = [0u8; 20];
+            hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
+                ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
+            })?;
 
-        info!("Private eth_getCode for 0x{}", address_hex);
+            info!("Private eth_getCode for 0x{}", address_hex);
 
-        // 1. PIR Query for Account Data
-        let account = match state.pir_client.query_account(address).await {
-            Ok(a) => a,
-            Err(e) => {
-                error!("PIR query failed for eth_getCode: {}", e);
-                if state.args.fallback_to_upstream {
-                    warn!("Falling back to upstream for eth_getCode (privacy degraded)");
-                    let params = serde_json::json!([address_str, block]);
-                    return proxy_to_upstream(
-                        &state.args.upstream,
-                        &state.http_client,
-                        "eth_getCode",
-                        params,
-                    )
-                    .await;
-                }
-                return Err(ErrorObjectOwned::owned(
-                    -32000,
-                    "PIR servers unavailable".to_string(),
-                    None::<()>,
-                ));
-            }
-        };
-
-        // 2. Resolve CodeID -> CodeHash -> Bytecode
-        let bytecode = if let Some(code_id) = account.code_id {
-            match state.code_resolver.resolve_code_hash(code_id).await {
-                Ok(hash) => match state.code_resolver.fetch_bytecode(hash).await {
-                    Ok(code) => code,
-                    Err(e) => {
-                        error!("CAS fetch failed for code_id {}: {}", code_id, e);
-                        return Err(ErrorObjectOwned::owned(
-                            -32000,
-                            "Failed to fetch bytecode",
-                            None::<()>,
-                        ));
-                    }
-                },
+            // 1. PIR Query for Account Data
+            let account = match state.pir_client.query_account(address).await {
+                Ok(a) => a,
                 Err(e) => {
-                    error!("Code resolution failed for code_id {}: {}", code_id, e);
+                    error!("PIR query failed for eth_getCode: {}", e);
+                    if state.args.fallback_to_upstream {
+                        warn!("Falling back to upstream for eth_getCode (privacy degraded)");
+                        let params = serde_json::json!([address_str, block]);
+                        return proxy_to_upstream(
+                            &state.args.upstream,
+                            &state.http_client,
+                            "eth_getCode",
+                            params,
+                        )
+                        .await;
+                    }
                     return Err(ErrorObjectOwned::owned(
                         -32000,
-                        "Failed to resolve code hash",
+                        "PIR servers unavailable".to_string(),
                         None::<()>,
                     ));
                 }
-            }
-        } else {
-            Vec::new() // EOA or no code
-        };
+            };
 
-        Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{}", hex::encode(bytecode))))
+            // 2. Resolve CodeID -> CodeHash -> Bytecode
+            let bytecode = if let Some(code_id) = account.code_id {
+                match state.code_resolver.resolve_code_hash(code_id).await {
+                    Ok(hash) => match state.code_resolver.fetch_bytecode(hash).await {
+                        Ok(code) => code,
+                        Err(e) => {
+                            error!("CAS fetch failed for code_id {}: {}", code_id, e);
+                            return Err(ErrorObjectOwned::owned(
+                                -32000,
+                                "Failed to fetch bytecode",
+                                None::<()>,
+                            ));
+                        }
+                    },
+                    Err(e) => {
+                        error!("Code resolution failed for code_id {}: {}", code_id, e);
+                        return Err(ErrorObjectOwned::owned(
+                            -32000,
+                            "Failed to resolve code hash",
+                            None::<()>,
+                        ));
+                    }
+                }
+            } else {
+                Vec::new() // EOA or no code
+            };
+
+            Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{}", hex::encode(bytecode))))
+        }
+        .instrument(request_span)
     })?;
 
     // Register eth_getStorageAt (Private via PIR)
-    module.register_async_method("eth_getStorageAt", |params, state, _| async move {
-        let (address_str, slot_str, block): (String, String, Value) = params.parse()?;
-        let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
-        let slot_hex = slot_str.strip_prefix("0x").unwrap_or(&slot_str);
+    module.register_async_method("eth_getStorageAt", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getStorageAt", &extensions);
+        async move {
+            let (address_str, slot_str, block): (String, String, Value) = params.parse()?;
+            let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
+            let slot_hex = slot_str.strip_prefix("0x").unwrap_or(&slot_str);
 
-        let mut address = [0u8; 20];
-        hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
-        })?;
+            let mut address = [0u8; 20];
+            hex::decode_to_slice(address_hex, &mut address).map_err(|e| {
+                ErrorObjectOwned::owned(-32602, format!("Invalid address: {}", e), None::<()>)
+            })?;
 
-        let mut slot = [0u8; 32];
-        // Reject oversized input before decoding (max 64 hex chars = 32 bytes)
-        if slot_hex.len() > 64 {
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                "Slot too long (max 32 bytes)".to_string(),
-                None::<()>,
-            ));
-        }
-        // Pad odd-length hex with leading zero for valid decoding
-        let slot_hex_padded;
-        let slot_hex_final = if slot_hex.len() % 2 != 0 {
-            slot_hex_padded = format!("0{}", slot_hex);
-            &slot_hex_padded
-        } else {
-            slot_hex
-        };
-        let slot_bytes = hex::decode(slot_hex_final).map_err(|e| {
-            ErrorObjectOwned::owned(-32602, format!("Invalid slot: {}", e), None::<()>)
-        })?;
-        // Copy to the end of the array (big-endian padding)
-        let offset = 32 - slot_bytes.len();
-        slot[offset..].copy_from_slice(&slot_bytes);
-
-        info!(
-            "Private eth_getStorageAt for 0x{} slot 0x{}",
-            address_hex,
-            hex::encode(slot)
-        );
-
-        match state.pir_client.query_storage(address, slot).await {
-            Ok(storage) => Ok::<Value, ErrorObjectOwned>(Value::String(format!(
-                "0x{}",
-                hex::encode(storage.value)
-            ))),
-            Err(e) => {
-                error!("PIR storage query failed: {}", e);
-                if state.args.fallback_to_upstream {
-                    warn!("Falling back to upstream for eth_getStorageAt (privacy degraded)");
-                    let params = serde_json::json!([address_str, slot_str, block]);
-                    return proxy_to_upstream(
-                        &state.args.upstream,
-                        &state.http_client,
-                        "eth_getStorageAt",
-                        params,
-                    )
-                    .await;
-                }
-                Err(ErrorObjectOwned::owned(
-                    -32000,
-                    "PIR servers unavailable".to_string(),
+            let mut slot = [0u8; 32];
+            // Reject oversized input before decoding (max 64 hex chars = 32 bytes)
+            if slot_hex.len() > 64 {
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    "Slot too long (max 32 bytes)".to_string(),
                     None::<()>,
-                ))
+                ));
+            }
+            // Pad odd-length hex with leading zero for valid decoding
+            let slot_hex_padded;
+            let slot_hex_final = if slot_hex.len() % 2 != 0 {
+                slot_hex_padded = format!("0{}", slot_hex);
+                &slot_hex_padded
+            } else {
+                slot_hex
+            };
+            let slot_bytes = hex::decode(slot_hex_final).map_err(|e| {
+                ErrorObjectOwned::owned(-32602, format!("Invalid slot: {}", e), None::<()>)
+            })?;
+            // Copy to the end of the array (big-endian padding)
+            let offset = 32 - slot_bytes.len();
+            slot[offset..].copy_from_slice(&slot_bytes);
+
+            info!(
+                "Private eth_getStorageAt for 0x{} slot 0x{}",
+                address_hex,
+                hex::encode(slot)
+            );
+
+            match state.pir_client.query_storage(address, slot).await {
+                Ok(storage) => Ok::<Value, ErrorObjectOwned>(Value::String(format!(
+                    "0x{}",
+                    hex::encode(storage.value)
+                ))),
+                Err(e) => {
+                    error!("PIR storage query failed: {}", e);
+                    if state.args.fallback_to_upstream {
+                        warn!("Falling back to upstream for eth_getStorageAt (privacy degraded)");
+                        let params = serde_json::json!([address_str, slot_str, block]);
+                        return proxy_to_upstream(
+                            &state.args.upstream,
+                            &state.http_client,
+                            "eth_getStorageAt",
+                            params,
+                        )
+                        .await;
+                    }
+                    Err(ErrorObjectOwned::owned(
+                        -32000,
+                        "PIR servers unavailable".to_string(),
+                        None::<()>,
+                    ))
+                }
             }
         }
+        .instrument(request_span)
     })?;
 
     // Register eth_call (Private via local EVM execution)
-    module.register_async_method("eth_call", |params, state, _| async move {
-        // Block tag is optional; clients may send 1 or 2 params
-        let raw: Vec<Value> = params.parse()?;
-        if raw.is_empty() || raw.len() > 2 {
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                format!("expected 1-2 params, got {}", raw.len()),
-                None::<()>,
-            ));
-        }
-        let call_params = &raw[0];
-        let block = raw
-            .get(1)
-            .cloned()
-            .unwrap_or(Value::String("latest".into()));
-
-        info!("Private eth_call via local EVM");
-
-        match evm::execute_eth_call(
-            Arc::clone(&state.pir_client),
-            Arc::clone(&state.code_resolver),
-            state.http_client.clone(),
-            state.args.upstream.clone(),
-            call_params,
-            &block,
-        )
-        .await
-        {
-            Ok(output) => {
-                Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{}", hex::encode(&output))))
-            }
-            Err(evm::EthCallError::InvalidParams(msg)) => {
-                Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
-            }
-            Err(evm::EthCallError::Internal(e)) => {
-                error!("Private eth_call failed: {}", e);
-                if state.args.fallback_to_upstream {
-                    warn!("Falling back to upstream for eth_call (privacy degraded)");
-                    let params = serde_json::json!([call_params, block]);
-                    return proxy_to_upstream(
-                        &state.args.upstream,
-                        &state.http_client,
-                        "eth_call",
-                        params,
-                    )
-                    .await;
-                }
-                Err(ErrorObjectOwned::owned(
-                    -32000,
-                    format!("eth_call failed: {}", e),
+    module.register_async_method("eth_call", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_call", &extensions);
+        async move {
+            // Block tag is optional; clients may send 1 or 2 params
+            let raw: Vec<Value> = params.parse()?;
+            if raw.is_empty() || raw.len() > 2 {
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    format!("expected 1-2 params, got {}", raw.len()),
                     None::<()>,
-                ))
+                ));
+            }
+            let call_params = &raw[0];
+            let block = raw
+                .get(1)
+                .cloned()
+                .unwrap_or(Value::String("latest".into()));
+
+            info!("Private eth_call via local EVM");
+
+            match evm::execute_eth_call(
+                Arc::clone(&state.pir_client),
+                Arc::clone(&state.code_resolver),
+                state.http_client.clone(),
+                state.args.upstream.clone(),
+                call_params,
+                &block,
+            )
+            .await
+            {
+                Ok(output) => Ok::<Value, ErrorObjectOwned>(Value::String(format!(
+                    "0x{}",
+                    hex::encode(&output)
+                ))),
+                Err(evm::EthCallError::InvalidParams(msg)) => {
+                    Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
+                }
+                Err(evm::EthCallError::Internal(e)) => {
+                    error!("Private eth_call failed: {}", e);
+                    if state.args.fallback_to_upstream {
+                        warn!("Falling back to upstream for eth_call (privacy degraded)");
+                        let params = serde_json::json!([call_params, block]);
+                        return proxy_to_upstream(
+                            &state.args.upstream,
+                            &state.http_client,
+                            "eth_call",
+                            params,
+                        )
+                        .await;
+                    }
+                    Err(ErrorObjectOwned::owned(
+                        -32000,
+                        format!("eth_call failed: {}", e),
+                        None::<()>,
+                    ))
+                }
             }
         }
+        .instrument(request_span)
     })?;
 
     // Register eth_estimateGas (Private via local EVM execution)
-    module.register_async_method("eth_estimateGas", |params, state, _| async move {
-        // Accept 1-3 params: (call_obj, [block_tag], [state_overrides])
-        let raw: Vec<Value> = params.parse()?;
-        if raw.is_empty() || raw.len() > 3 {
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                format!("expected 1-3 params, got {}", raw.len()),
-                None::<()>,
-            ));
-        }
+    module.register_async_method("eth_estimateGas", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_estimateGas", &extensions);
+        async move {
+            // Accept 1-3 params: (call_obj, [block_tag], [state_overrides])
+            let raw: Vec<Value> = params.parse()?;
+            if raw.is_empty() || raw.len() > 3 {
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    format!("expected 1-3 params, got {}", raw.len()),
+                    None::<()>,
+                ));
+            }
 
-        // If state overrides (3rd param) are present, we can't handle them locally.
-        // Proxy to upstream if fallback is enabled, otherwise reject explicitly.
-        let has_overrides = raw.len() == 3 && !raw[2].is_null() && raw[2] != serde_json::json!({});
-        if has_overrides {
-            if state.args.fallback_to_upstream {
-                warn!(
+            // If state overrides (3rd param) are present, we can't handle them locally.
+            // Proxy to upstream if fallback is enabled, otherwise reject explicitly.
+            let has_overrides =
+                raw.len() == 3 && !raw[2].is_null() && raw[2] != serde_json::json!({});
+            if has_overrides {
+                if state.args.fallback_to_upstream {
+                    warn!(
                     "eth_estimateGas with state overrides, proxying to upstream (privacy degraded)"
                 );
-                return proxy_to_upstream(
-                    &state.args.upstream,
-                    &state.http_client,
-                    "eth_estimateGas",
-                    Value::Array(raw),
-                )
-                .await;
-            }
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                "state overrides not supported for local eth_estimateGas",
-                None::<()>,
-            ));
-        }
-
-        let call_params = &raw[0];
-        let block = raw
-            .get(1)
-            .cloned()
-            .unwrap_or(Value::String("latest".into()));
-
-        info!("Private eth_estimateGas via local EVM");
-
-        match evm::execute_eth_estimate_gas(
-            Arc::clone(&state.pir_client),
-            Arc::clone(&state.code_resolver),
-            state.http_client.clone(),
-            state.args.upstream.clone(),
-            call_params,
-            &block,
-        )
-        .await
-        {
-            Ok(gas) => Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", gas))),
-            Err(evm::EthCallError::InvalidParams(msg)) => {
-                Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
-            }
-            Err(evm::EthCallError::Internal(e)) => {
-                error!("Private eth_estimateGas failed: {}", e);
-                if state.args.fallback_to_upstream {
-                    warn!("Falling back to upstream for eth_estimateGas (privacy degraded)");
                     return proxy_to_upstream(
                         &state.args.upstream,
                         &state.http_client,
@@ -527,214 +542,288 @@ async fn main() -> Result<()> {
                     )
                     .await;
                 }
-                Err(ErrorObjectOwned::owned(
-                    -32000,
-                    format!("eth_estimateGas failed: {}", e),
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    "state overrides not supported for local eth_estimateGas",
                     None::<()>,
-                ))
+                ));
+            }
+
+            let call_params = &raw[0];
+            let block = raw
+                .get(1)
+                .cloned()
+                .unwrap_or(Value::String("latest".into()));
+
+            info!("Private eth_estimateGas via local EVM");
+
+            match evm::execute_eth_estimate_gas(
+                Arc::clone(&state.pir_client),
+                Arc::clone(&state.code_resolver),
+                state.http_client.clone(),
+                state.args.upstream.clone(),
+                call_params,
+                &block,
+            )
+            .await
+            {
+                Ok(gas) => Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", gas))),
+                Err(evm::EthCallError::InvalidParams(msg)) => {
+                    Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
+                }
+                Err(evm::EthCallError::Internal(e)) => {
+                    error!("Private eth_estimateGas failed: {}", e);
+                    if state.args.fallback_to_upstream {
+                        warn!("Falling back to upstream for eth_estimateGas (privacy degraded)");
+                        return proxy_to_upstream(
+                            &state.args.upstream,
+                            &state.http_client,
+                            "eth_estimateGas",
+                            Value::Array(raw),
+                        )
+                        .await;
+                    }
+                    Err(ErrorObjectOwned::owned(
+                        -32000,
+                        format!("eth_estimateGas failed: {}", e),
+                        None::<()>,
+                    ))
+                }
             }
         }
+        .instrument(request_span)
     })?;
 
     // Register eth_getTransactionByHash (Private via block cache, upstream fallback)
-    module.register_async_method("eth_getTransactionByHash", |params, state, _| async move {
-        let (hash_str,): (String,) = params.parse()?;
-        let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
-            ErrorObjectOwned::owned(
-                -32602,
-                "Invalid tx hash: expected 32-byte hex string",
-                None::<()>,
-            )
-        })?;
+    module.register_async_method("eth_getTransactionByHash", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getTransactionByHash", &extensions);
+        async move {
+            let (hash_str,): (String,) = params.parse()?;
+            let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32602,
+                    "Invalid tx hash: expected 32-byte hex string",
+                    None::<()>,
+                )
+            })?;
 
-        // Check local cache first (private)
-        {
-            let cache = state.block_cache.read().await;
-            if let Some(tx) = cache.get_transaction(&hash) {
-                info!("Serving eth_getTransactionByHash from cache (private)");
-                return Ok::<Value, ErrorObjectOwned>(tx.clone());
+            // Check local cache first (private)
+            {
+                let cache = state.block_cache.read().await;
+                if let Some(tx) = cache.get_transaction(&hash) {
+                    info!("Serving eth_getTransactionByHash from cache (private)");
+                    return Ok::<Value, ErrorObjectOwned>(tx.clone());
+                }
             }
-        }
 
-        // Cache miss: respect fallback setting
-        if !state.args.fallback_to_upstream {
-            return Err(ErrorObjectOwned::owned(
-                -32000,
-                "transaction not found in local cache",
-                None::<()>,
-            ));
-        }
-        info!("Proxying eth_getTransactionByHash to upstream (not in cache)");
-        proxy_to_upstream(
-            &state.args.upstream,
-            &state.http_client,
-            "eth_getTransactionByHash",
-            serde_json::json!([hash_str]),
-        )
-        .await
-    })?;
-
-    // Register eth_getTransactionReceipt (Private via block cache, upstream fallback)
-    module.register_async_method("eth_getTransactionReceipt", |params, state, _| async move {
-        let (hash_str,): (String,) = params.parse()?;
-        let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
-            ErrorObjectOwned::owned(
-                -32602,
-                "Invalid tx hash: expected 32-byte hex string",
-                None::<()>,
-            )
-        })?;
-
-        // Check local cache first (private)
-        {
-            let cache = state.block_cache.read().await;
-            if let Some(receipt) = cache.get_receipt(&hash) {
-                info!("Serving eth_getTransactionReceipt from cache (private)");
-                return Ok::<Value, ErrorObjectOwned>(receipt.clone());
-            }
-        }
-
-        // Cache miss: respect fallback setting
-        if !state.args.fallback_to_upstream {
-            return Err(ErrorObjectOwned::owned(
-                -32000,
-                "receipt not found in local cache",
-                None::<()>,
-            ));
-        }
-        info!("Proxying eth_getTransactionReceipt to upstream (not in cache)");
-        proxy_to_upstream(
-            &state.args.upstream,
-            &state.http_client,
-            "eth_getTransactionReceipt",
-            serde_json::json!([hash_str]),
-        )
-        .await
-    })?;
-
-    // Register eth_getLogs (Private via block cache for recent blocks, upstream fallback)
-    module.register_async_method("eth_getLogs", |params, state, _| async move {
-        let raw: Vec<Value> = params.parse()?;
-        if raw.len() != 1 {
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                format!("expected 1 param (filter object), got {}", raw.len()),
-                None::<()>,
-            ));
-        }
-        let filter_obj = &raw[0];
-
-        // If blockHash is present, proxy to upstream (out of scope for cache)
-        if filter_obj.get("blockHash").is_some() {
+            // Cache miss: respect fallback setting
             if !state.args.fallback_to_upstream {
                 return Err(ErrorObjectOwned::owned(
                     -32000,
-                    "eth_getLogs by blockHash not supported without upstream fallback",
+                    "transaction not found in local cache",
                     None::<()>,
                 ));
             }
-            info!("eth_getLogs with blockHash, proxying to upstream");
-            return proxy_to_upstream(
-                &state.args.upstream,
-                &state.http_client,
-                "eth_getLogs",
-                Value::Array(raw),
-            )
-            .await;
-        }
-
-        let latest = state.block_cache.read().await.latest_block();
-
-        let filter = block_cache::parse_log_filter_object(filter_obj, latest)
-            .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
-
-        // Check cache coverage
-        let cache = state.block_cache.read().await;
-        if cache.has_block_range(filter.from_block, filter.to_block) {
-            let logs = cache.get_logs(&filter);
-            info!(
-                from = filter.from_block,
-                to = filter.to_block,
-                matched = logs.len(),
-                "Serving eth_getLogs from cache (private)"
-            );
-            Ok::<Value, ErrorObjectOwned>(Value::Array(logs))
-        } else {
-            drop(cache);
-            if !state.args.fallback_to_upstream {
-                return Err(ErrorObjectOwned::owned(
-                    -32000,
-                    "requested log range not fully cached",
-                    None::<()>,
-                ));
-            }
-            warn!(
-                from = filter.from_block,
-                to = filter.to_block,
-                "eth_getLogs range not fully cached, proxying to upstream (privacy degraded)"
-            );
+            info!("Proxying eth_getTransactionByHash to upstream (not in cache)");
             proxy_to_upstream(
                 &state.args.upstream,
                 &state.http_client,
-                "eth_getLogs",
-                Value::Array(raw),
+                "eth_getTransactionByHash",
+                serde_json::json!([hash_str]),
             )
             .await
         }
+        .instrument(request_span)
+    })?;
+
+    // Register eth_getTransactionReceipt (Private via block cache, upstream fallback)
+    module.register_async_method("eth_getTransactionReceipt", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getTransactionReceipt", &extensions);
+        async move {
+            let (hash_str,): (String,) = params.parse()?;
+            let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
+                ErrorObjectOwned::owned(
+                    -32602,
+                    "Invalid tx hash: expected 32-byte hex string",
+                    None::<()>,
+                )
+            })?;
+
+            // Check local cache first (private)
+            {
+                let cache = state.block_cache.read().await;
+                if let Some(receipt) = cache.get_receipt(&hash) {
+                    info!("Serving eth_getTransactionReceipt from cache (private)");
+                    return Ok::<Value, ErrorObjectOwned>(receipt.clone());
+                }
+            }
+
+            // Cache miss: respect fallback setting
+            if !state.args.fallback_to_upstream {
+                return Err(ErrorObjectOwned::owned(
+                    -32000,
+                    "receipt not found in local cache",
+                    None::<()>,
+                ));
+            }
+            info!("Proxying eth_getTransactionReceipt to upstream (not in cache)");
+            proxy_to_upstream(
+                &state.args.upstream,
+                &state.http_client,
+                "eth_getTransactionReceipt",
+                serde_json::json!([hash_str]),
+            )
+            .await
+        }
+        .instrument(request_span)
+    })?;
+
+    // Register eth_getLogs (Private via block cache for recent blocks, upstream fallback)
+    module.register_async_method("eth_getLogs", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getLogs", &extensions);
+        async move {
+            let raw: Vec<Value> = params.parse()?;
+            if raw.len() != 1 {
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    format!("expected 1 param (filter object), got {}", raw.len()),
+                    None::<()>,
+                ));
+            }
+            let filter_obj = &raw[0];
+
+            // If blockHash is present, proxy to upstream (out of scope for cache)
+            if filter_obj.get("blockHash").is_some() {
+                if !state.args.fallback_to_upstream {
+                    return Err(ErrorObjectOwned::owned(
+                        -32000,
+                        "eth_getLogs by blockHash not supported without upstream fallback",
+                        None::<()>,
+                    ));
+                }
+                info!("eth_getLogs with blockHash, proxying to upstream");
+                return proxy_to_upstream(
+                    &state.args.upstream,
+                    &state.http_client,
+                    "eth_getLogs",
+                    Value::Array(raw),
+                )
+                .await;
+            }
+
+            let latest = state.block_cache.read().await.latest_block();
+
+            let filter = block_cache::parse_log_filter_object(filter_obj, latest)
+                .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
+
+            // Check cache coverage
+            let cache = state.block_cache.read().await;
+            if cache.has_block_range(filter.from_block, filter.to_block) {
+                let logs = cache.get_logs(&filter);
+                info!(
+                    from = filter.from_block,
+                    to = filter.to_block,
+                    matched = logs.len(),
+                    "Serving eth_getLogs from cache (private)"
+                );
+                Ok::<Value, ErrorObjectOwned>(Value::Array(logs))
+            } else {
+                drop(cache);
+                if !state.args.fallback_to_upstream {
+                    return Err(ErrorObjectOwned::owned(
+                        -32000,
+                        "requested log range not fully cached",
+                        None::<()>,
+                    ));
+                }
+                warn!(
+                    from = filter.from_block,
+                    to = filter.to_block,
+                    "eth_getLogs range not fully cached, proxying to upstream (privacy degraded)"
+                );
+                proxy_to_upstream(
+                    &state.args.upstream,
+                    &state.http_client,
+                    "eth_getLogs",
+                    Value::Array(raw),
+                )
+                .await
+            }
+        }
+        .instrument(request_span)
     })?;
 
     // Register eth_newFilter (Private — filter stored locally)
-    module.register_async_method("eth_newFilter", |params, state, _| async move {
-        let raw: Vec<Value> = params.parse()?;
-        if raw.len() != 1 {
-            return Err(ErrorObjectOwned::owned(
-                -32602,
-                format!("expected 1 param (filter object), got {}", raw.len()),
-                None::<()>,
-            ));
+    module.register_async_method("eth_newFilter", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_newFilter", &extensions);
+        async move {
+            let raw: Vec<Value> = params.parse()?;
+            if raw.len() != 1 {
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    format!("expected 1 param (filter object), got {}", raw.len()),
+                    None::<()>,
+                ));
+            }
+            let filter_obj = &raw[0];
+
+            let latest = state.block_cache.read().await.latest_block();
+
+            let filter = block_cache::parse_log_filter_object(filter_obj, latest)
+                .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
+
+            let id = state.block_cache.write().await.create_log_filter(filter);
+            info!("Created private log filter {}", id);
+            Ok::<Value, ErrorObjectOwned>(Value::String(id))
         }
-        let filter_obj = &raw[0];
-
-        let latest = state.block_cache.read().await.latest_block();
-
-        let filter = block_cache::parse_log_filter_object(filter_obj, latest)
-            .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
-
-        let id = state.block_cache.write().await.create_log_filter(filter);
-        info!("Created private log filter {}", id);
-        Ok::<Value, ErrorObjectOwned>(Value::String(id))
+        .instrument(request_span)
     })?;
 
     // Register eth_newBlockFilter (Private — filter stored locally)
-    module.register_async_method("eth_newBlockFilter", |_params, state, _| async move {
-        let id = state.block_cache.write().await.create_block_filter();
-        info!("Created private block filter {}", id);
-        Ok::<Value, ErrorObjectOwned>(Value::String(id))
+    module.register_async_method("eth_newBlockFilter", |_params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_newBlockFilter", &extensions);
+        async move {
+            let id = state.block_cache.write().await.create_block_filter();
+            info!("Created private block filter {}", id);
+            Ok::<Value, ErrorObjectOwned>(Value::String(id))
+        }
+        .instrument(request_span)
     })?;
 
     // Register eth_newPendingTransactionFilter (Private — filter stored locally)
     module.register_async_method(
         "eth_newPendingTransactionFilter",
-        |_params, state, _| async move {
-            let id = state.block_cache.write().await.create_pending_tx_filter();
-            info!("Created private pending tx filter {}", id);
-            Ok::<Value, ErrorObjectOwned>(Value::String(id))
+        |_params, state, extensions| {
+            let request_span =
+                telemetry::rpc_server_span("eth_newPendingTransactionFilter", &extensions);
+            async move {
+                let id = state.block_cache.write().await.create_pending_tx_filter();
+                info!("Created private pending tx filter {}", id);
+                Ok::<Value, ErrorObjectOwned>(Value::String(id))
+            }
+            .instrument(request_span)
         },
     )?;
 
     // Register eth_uninstallFilter (Private)
-    module.register_async_method("eth_uninstallFilter", |params, state, _| async move {
-        let (filter_id,): (String,) = params.parse()?;
-        let result = state.block_cache.write().await.uninstall_filter(&filter_id);
-        info!("Uninstalled filter {}: {}", filter_id, result);
-        Ok::<Value, ErrorObjectOwned>(Value::Bool(result))
+    module.register_async_method("eth_uninstallFilter", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_uninstallFilter", &extensions);
+        async move {
+            let (filter_id,): (String,) = params.parse()?;
+            let result = state.block_cache.write().await.uninstall_filter(&filter_id);
+            info!("Uninstalled filter {}: {}", filter_id, result);
+            Ok::<Value, ErrorObjectOwned>(Value::Bool(result))
+        }
+        .instrument(request_span)
     })?;
 
     // Register eth_getFilterChanges (Private — served from cache)
-    module.register_async_method("eth_getFilterChanges", |params, state, _| async move {
-        let (filter_id,): (String,) = params.parse()?;
-        let mut cache = state.block_cache.write().await;
-        match cache.get_filter_changes(&filter_id) {
+    module.register_async_method("eth_getFilterChanges", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getFilterChanges", &extensions);
+        async move {
+            let (filter_id,): (String,) = params.parse()?;
+            let mut cache = state.block_cache.write().await;
+            match cache.get_filter_changes(&filter_id) {
             Some(changes) => {
                 info!(filter = %filter_id, count = changes.len(), "Serving eth_getFilterChanges from cache (private)");
                 Ok::<Value, ErrorObjectOwned>(Value::Array(changes))
@@ -743,13 +832,17 @@ async fn main() -> Result<()> {
                 Err(ErrorObjectOwned::owned(-32000, "filter not found", None::<()>))
             }
         }
+        }
+        .instrument(request_span)
     })?;
 
     // Register eth_getFilterLogs (Private — served from cache)
-    module.register_async_method("eth_getFilterLogs", |params, state, _| async move {
-        let (filter_id,): (String,) = params.parse()?;
-        let mut cache = state.block_cache.write().await;
-        match cache.get_filter_logs(&filter_id) {
+    module.register_async_method("eth_getFilterLogs", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getFilterLogs", &extensions);
+        async move {
+            let (filter_id,): (String,) = params.parse()?;
+            let mut cache = state.block_cache.write().await;
+            match cache.get_filter_logs(&filter_id) {
             Some(Some(logs)) => {
                 info!(filter = %filter_id, count = logs.len(), "Serving eth_getFilterLogs from cache (private)");
                 Ok::<Value, ErrorObjectOwned>(Value::Array(logs))
@@ -761,57 +854,66 @@ async fn main() -> Result<()> {
                 Err(ErrorObjectOwned::owned(-32000, "filter not found", None::<()>))
             }
         }
+        }
+        .instrument(request_span)
     })?;
 
     // Register passthrough methods
     for method in PASSTHROUGH_METHODS {
-        let method_name = method.to_string();
-        module.register_async_method(method, move |params, state, _| {
-            let m = method_name.clone();
+        let method_name = *method;
+        module.register_async_method(method, move |params, state, extensions| {
+            let request_span = telemetry::rpc_server_span(method_name, &extensions);
             async move {
                 proxy_to_upstream(
                     &state.args.upstream,
                     &state.http_client,
-                    &m,
+                    method_name,
                     params.parse()?,
                 )
                 .await
             }
+            .instrument(request_span)
         })?;
     }
 
     // Register relay methods — sent to privacy relay (Flashbots by default)
     for method in RELAY_METHODS {
-        let method_name = method.to_string();
-        module.register_async_method(method, move |params, state, _| {
-            let m = method_name.clone();
+        let method_name = *method;
+        module.register_async_method(method, move |params, state, extensions| {
+            let request_span = telemetry::rpc_server_span(method_name, &extensions);
             async move {
-                info!("Relaying {} to privacy relay", m);
+                info!("Relaying {} to privacy relay", method_name);
                 proxy_to_upstream(
                     &state.args.tx_relay,
                     &state.http_client,
-                    &m,
+                    method_name,
                     params.parse()?,
                 )
                 .await
             }
+            .instrument(request_span)
         })?;
     }
 
     // Register dropped methods — return explicit errors
     for &(method, reason) in DROPPED_METHODS {
         let reason = reason.to_string();
-        module.register_async_method(method, move |_params, _state, _| {
+        let method_name = method;
+        module.register_async_method(method, move |_params, _state, extensions| {
             let r = reason.clone();
+            let request_span = telemetry::rpc_server_span(method_name, &extensions);
             async move {
                 Err::<Value, ErrorObjectOwned>(ErrorObjectOwned::owned(-32601, r, None::<()>))
             }
+            .instrument(request_span)
         })?;
     }
 
+    let sanitized_upstream = telemetry::sanitize_url_for_telemetry(&args.upstream);
+    let sanitized_relay = telemetry::sanitize_url_for_telemetry(&args.tx_relay);
     info!("Morphogenesis RPC Adapter listening on {}", addr);
-    info!("Upstream RPC: {}", args.upstream);
-    info!("Tx relay: {}", args.tx_relay);
+    info!("Upstream RPC: {}", sanitized_upstream);
+    info!("Tx relay: {}", sanitized_relay);
     if args.fallback_to_upstream {
         warn!("Fallback to upstream enabled - privacy will be degraded when PIR is unavailable");
     }
@@ -828,57 +930,100 @@ async fn proxy_to_upstream(
     method: &str,
     params: Value,
 ) -> Result<Value, ErrorObjectOwned> {
-    info!("Proxying {} to upstream", method);
+    let sanitized_url = telemetry::sanitize_url_for_telemetry(url);
+    let span = tracing::info_span!(
+        "rpc.upstream",
+        otel.kind = "client",
+        otel.name = method,
+        rpc.system = "ethereum-jsonrpc",
+        rpc.method = %method,
+        upstream.url = %sanitized_url
+    );
+    async move {
+        info!("Proxying {} to upstream", method);
 
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params
-    });
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        });
 
-    let response = client.post(url).json(&request).send().await.map_err(|e| {
-        if e.is_timeout() {
-            ErrorObjectOwned::owned(
-                -32000,
-                format!("Upstream timeout for {}", method),
-                None::<()>,
-            )
-        } else if e.is_connect() {
-            ErrorObjectOwned::owned(
-                -32000,
-                format!("Upstream connection failed for {}", method),
-                None::<()>,
-            )
-        } else {
-            ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>)
-        }
-    })?;
+        let response = client.post(url).json(&request).send().await.map_err(|e| {
+            if e.is_timeout() {
+                ErrorObjectOwned::owned(
+                    -32000,
+                    format!("Upstream timeout for {}", method),
+                    None::<()>,
+                )
+            } else if e.is_connect() {
+                ErrorObjectOwned::owned(
+                    -32000,
+                    format!("Upstream connection failed for {}", method),
+                    None::<()>,
+                )
+            } else {
+                upstream_request_failed_error(method)
+            }
+        })?;
 
-    let json: Value = response
-        .json()
-        .await
-        .map_err(|e| ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>))?;
+        let json: Value = response
+            .json()
+            .await
+            .map_err(|_| upstream_invalid_json_error(method))?;
 
-    if let Some(error) = json.get("error") {
-        warn!("Upstream error for {}: {:?}", method, error);
-        return Err(ErrorObjectOwned::owned(
-            error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32,
-            error
+        if let Some(error) = json.get("error") {
+            let error_code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32;
+            let error_message = error
                 .get("message")
                 .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error")
-                .to_string(),
-            error.get("data").cloned(),
-        ));
-    }
+                .unwrap_or("Unknown error");
+            warn!(
+                rpc.method = %method,
+                error.code = error_code,
+                error.message = %error_message,
+                "Upstream returned JSON-RPC error"
+            );
+            return Err(ErrorObjectOwned::owned(
+                error_code,
+                error_message.to_string(),
+                error.get("data").cloned(),
+            ));
+        }
 
-    Ok(json.get("result").cloned().unwrap_or(Value::Null))
+        Ok(json.get("result").cloned().unwrap_or(Value::Null))
+    }
+    .instrument(span)
+    .await
+}
+
+fn upstream_request_failed_error(method: &str) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(
+        -32000,
+        format!("Upstream request failed for {}", method),
+        None::<()>,
+    )
+}
+
+fn upstream_invalid_json_error(method: &str) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(
+        -32000,
+        format!("Invalid JSON response for {}", method),
+        None::<()>,
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS};
+    use super::{
+        proxy_to_upstream, upstream_invalid_json_error, DROPPED_METHODS, PASSTHROUGH_METHODS,
+        RELAY_METHODS,
+    };
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio::time::sleep;
 
     #[test]
     fn test_passthrough_methods_exclude_private() {
@@ -946,5 +1091,107 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn sanitize_url_strips_credentials_and_query_params() {
+        // Standard URL - should return scheme + host
+        assert_eq!(
+            super::telemetry::sanitize_url_for_telemetry("https://api.example.com/path?key=secret"),
+            "https://api.example.com"
+        );
+
+        // URL with credentials - should strip userinfo
+        assert_eq!(
+            super::telemetry::sanitize_url_for_telemetry("https://user:pass@api.example.com/path"),
+            "https://api.example.com"
+        );
+
+        // URL with port - preserve host:port for better service differentiation
+        assert_eq!(
+            super::telemetry::sanitize_url_for_telemetry("http://localhost:8545/path"),
+            "http://localhost:8545"
+        );
+
+        // Invalid URL - should return placeholder
+        assert_eq!(
+            super::telemetry::sanitize_url_for_telemetry("not-a-valid-url"),
+            "<invalid-url>"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_to_upstream_request_error_is_redacted() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let err = proxy_to_upstream(
+            "ftp://user:secret@example.com:8545",
+            &client,
+            "eth_getBalance",
+            json!([]),
+        )
+        .await
+        .expect_err("expected request error");
+
+        assert_eq!(err.message(), "Upstream request failed for eth_getBalance");
+    }
+
+    #[tokio::test]
+    async fn proxy_to_upstream_connect_error_is_redacted() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind temporary listener");
+        let addr = listener.local_addr().expect("listener addr");
+        drop(listener);
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let url = format!("http://{}", addr);
+        let err = proxy_to_upstream(&url, &client, "eth_getBalance", json!([]))
+            .await
+            .expect_err("expected connect error");
+
+        assert_eq!(
+            err.message(),
+            "Upstream connection failed for eth_getBalance"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_to_upstream_timeout_error_is_redacted() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind timeout listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            sleep(Duration::from_millis(250)).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(25))
+            .build()
+            .expect("build client");
+        let url = format!("http://{}", addr);
+        let err = proxy_to_upstream(&url, &client, "eth_getBalance", json!([]))
+            .await
+            .expect_err("expected timeout error");
+
+        assert_eq!(err.message(), "Upstream timeout for eth_getBalance");
+    }
+
+    #[test]
+    fn proxy_to_upstream_invalid_json_error_is_redacted() {
+        let err = upstream_invalid_json_error("eth_getBalance");
+        assert_eq!(err.message(), "Invalid JSON response for eth_getBalance");
     }
 }

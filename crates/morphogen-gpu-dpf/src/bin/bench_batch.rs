@@ -2,10 +2,9 @@
 //!
 //! Measures QPS and Latency for different batch sizes.
 
-use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+use morphogen_gpu_dpf::dpf::ChaChaParams;
 use morphogen_gpu_dpf::kernel::PAGE_SIZE_BYTES;
 use std::env;
-use std::time::Instant;
 
 #[cfg(feature = "cuda")]
 use morphogen_gpu_dpf::kernel::GpuScanner;

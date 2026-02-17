@@ -65,3 +65,8 @@ The observability stack is designed for high-performance PIR:
 - **Tracing:** Low-overhead macros; disabled at compile-time if the `tracing` feature is off.
 - **Metrics:** Atomic counters and thread-local histograms to minimize lock contention.
 - **Micro-benchmarking:** For sub-millisecond precision on the GPU path, use the dedicated `profile_gpu_dpf` binary which uses high-resolution CUDA events.
+
+## OpenTelemetry Tracing
+
+For distributed tracing setup with various backends (SigNoz, SkyWalking, Jaeger, etc.),
+see `docs/OPENTELEMETRY.md`.

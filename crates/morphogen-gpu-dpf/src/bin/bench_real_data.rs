@@ -1,11 +1,9 @@
 use clap::Parser;
-use morphogen_gpu_dpf::dpf::ChaChaParams;
 #[cfg(feature = "cuda")]
 use morphogen_gpu_dpf::kernel::GpuScanner;
 #[cfg(feature = "cuda")]
 use morphogen_gpu_dpf::storage::GpuPageMatrix;
 use std::path::PathBuf;
-use std::time::Instant;
 
 #[derive(Parser)]
 struct Args {

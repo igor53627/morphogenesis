@@ -8,9 +8,9 @@
 - Run tests frequently during development
 
 ### Progress Tracking
-- Use `docs/KANBAN.md` to track all work
-- Update KANBAN when starting/completing tasks
-- Mark phases with `[x]` when done
+- Use `backlog` CLI to track all work (`backlog task list`, `backlog task edit`, `backlog task view`)
+- Update the relevant backlog task status/notes when starting or completing work
+- Treat `docs/KANBAN.md` as historical archive only (do not use it for active tracking)
 
 ### Version Control
 - Use `jj` (Jujutsu) instead of `git` for all VCS operations
@@ -39,4 +39,5 @@ cargo clippy --package morphogen-server --features network
 - `crates/morphogen-dpf/` - DPF key generation and evaluation
 - `crates/morphogen-client/` - Client library and fixtures
 - `crates/reth-adapter/` - ETL tool for converting Reth DB to Cuckoo Matrix
-- `docs/KANBAN.md` - Project task tracking
+- `backlog/tasks/` - Active task tracking (managed via `backlog` CLI)
+- `docs/KANBAN.md` - Historical task notes (archival)

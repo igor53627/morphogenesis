@@ -2,12 +2,9 @@
 //!
 //! Simulates splitting the database across 2 GPUs to measure latency reduction.
 
-use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaKey, ChaChaParams};
+use morphogen_gpu_dpf::dpf::ChaChaParams;
 use morphogen_gpu_dpf::kernel::PAGE_SIZE_BYTES;
 use std::env;
-use std::sync::{Arc, Barrier};
-use std::thread;
-use std::time::{Duration, Instant};
 
 #[cfg(feature = "cuda")]
 use morphogen_gpu_dpf::kernel::GpuScanner;
