@@ -66,7 +66,7 @@ The observability stack is designed for high-performance PIR:
 - **Metrics:** Atomic counters and thread-local histograms to minimize lock contention.
 - **Micro-benchmarking:** For sub-millisecond precision on the GPU path, use the dedicated `profile_gpu_dpf` binary which uses high-resolution CUDA events.
 
-## Datadog (E2E baseline)
+## OpenTelemetry Tracing
 
-For short-lived E2E environments, use the Datadog OTLP baseline documented in `docs/DATADOG_E2E.md`.
-The RPC adapter can export traces directly to a local Datadog Agent via OTLP gRPC.
+For distributed tracing setup with various backends (SigNoz, SkyWalking, Jaeger, etc.),
+see `docs/OPENTELEMETRY.md`.

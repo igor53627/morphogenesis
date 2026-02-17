@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-ENABLE_DATADOG="${ENABLE_DATADOG:-0}"
+ENABLE_OTEL="${ENABLE_OTEL:-0}"
 OTEL_ENDPOINT="${OTEL_ENDPOINT:-http://127.0.0.1:4317}"
 OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-morphogen-rpc-adapter}"
 OTEL_CLIENT_SERVICE_NAME="${OTEL_CLIENT_SERVICE_NAME:-morphogen-e2e-client}"
@@ -12,8 +12,8 @@ OTEL_VERSION="${OTEL_VERSION:-local}"
 echo "Building components..."
 cargo build -p morphogen-server --bin test_server --features network
 cargo build -p morphogen-rpc-adapter
-if [[ "${ENABLE_DATADOG}" == "1" ]]; then
-    cargo build -p morphogen-rpc-adapter --bin morphogen-rpc-dd-client
+if [[ "${ENABLE_OTEL}" == "1" ]]; then
+    cargo build -p morphogen-rpc-adapter --bin morphogen-e2e-client
 fi
 
 # 2. Setup Mock CAS (Dictionary + Bytecode)
@@ -81,7 +81,7 @@ SERVER_B_PID=$!
 # 4. Start RPC Adapter
 echo "Starting RPC Adapter..."
 ADAPTER_OTEL_ARGS=()
-if [[ "${ENABLE_DATADOG}" == "1" ]]; then
+if [[ "${ENABLE_OTEL}" == "1" ]]; then
     echo "OpenTelemetry export enabled (endpoint: ${OTEL_ENDPOINT})"
     ADAPTER_OTEL_ARGS=(
         --otel-traces
@@ -92,7 +92,7 @@ if [[ "${ENABLE_DATADOG}" == "1" ]]; then
     )
 fi
 
-if [[ "${ENABLE_DATADOG}" == "1" ]]; then
+if [[ "${ENABLE_OTEL}" == "1" ]]; then
     ./target/debug/morphogen-rpc-adapter \
         --port 8545 \
         --pir-server-a http://127.0.0.1:3000 \
@@ -124,8 +124,8 @@ sleep 5
 TEST_ADDR="0x000000000000000000000000000000000000031c"
 echo "Querying $TEST_ADDR via RPC..."
 
-if [[ "${ENABLE_DATADOG}" == "1" ]]; then
-    ./target/debug/morphogen-rpc-dd-client \
+if [[ "${ENABLE_OTEL}" == "1" ]]; then
+    ./target/debug/morphogen-e2e-client \
         --rpc-url http://127.0.0.1:8545 \
         --address "$TEST_ADDR" \
         --otel-traces \

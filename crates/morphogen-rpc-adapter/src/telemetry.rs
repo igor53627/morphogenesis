@@ -200,9 +200,13 @@ pub fn default_otel_settings() -> OtelSettings {
     }
 }
 
+/// Default EnvFilter for tracing when RUST_LOG is not set.
+/// Includes both the RPC adapter and E2E client targets.
+pub const DEFAULT_ENV_FILTER: &str = "morphogen_rpc_adapter=info,morphogen_e2e_client=info";
+
 pub fn init_tracing(otel: OtelSettings) -> Result<TelemetryGuard> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "morphogen_rpc_adapter=info,morphogen_e2e_client=info".into());
+        .unwrap_or_else(|_| DEFAULT_ENV_FILTER.into());
     let fmt_layer = tracing_subscriber::fmt::layer();
 
     if !otel.enabled {
@@ -336,7 +340,8 @@ mod tests {
     fn default_env_filter_includes_both_binaries() {
         // Verify the default filter string includes both adapter and e2e-client targets
         // This ensures spans from both binaries are emitted by default
-        let default_filter = "morphogen_rpc_adapter=info,morphogen_e2e_client=info";
+        // Use the actual constant from production code to prevent drift
+        let default_filter = super::DEFAULT_ENV_FILTER;
 
         // Parse the filter to ensure it's valid - this will panic if the filter is invalid
         let _filter = tracing_subscriber::EnvFilter::new(default_filter);

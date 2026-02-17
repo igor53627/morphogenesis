@@ -1075,7 +1075,7 @@ mod tests {
             "https://api.example.com"
         );
 
-        // URL with port - should preserve host (including port if present)
+        // URL with port - port is intentionally stripped for telemetry (host only)
         assert_eq!(
             super::sanitize_url_for_telemetry("http://localhost:8545/path"),
             "http://localhost"
