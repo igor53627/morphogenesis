@@ -8,7 +8,7 @@ use opentelemetry::global;
 use opentelemetry::propagation::Injector;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
-use tracing::{info, Instrument};
+use tracing::{info, warn, Instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[derive(Parser, Debug, Clone)]
@@ -122,6 +122,7 @@ async fn rpc_call(
     method: &str,
     params: Value,
 ) -> Result<Value> {
+    let sanitized_rpc_url = telemetry::sanitize_url_for_telemetry(rpc_url);
     let request_span = tracing::info_span!(
         "rpc.client.request",
         otel.kind = "client",
@@ -129,7 +130,7 @@ async fn rpc_call(
         rpc.system = "ethereum-jsonrpc",
         rpc.method = %method,
         peer.service = "morphogen-rpc-adapter",
-        server.address = %rpc_url
+        server.address = %sanitized_rpc_url
     );
 
     async move {
@@ -206,11 +207,24 @@ struct HeaderInjector<'a>(&'a mut HeaderMap);
 
 impl Injector for HeaderInjector<'_> {
     fn set(&mut self, key: &str, value: String) {
-        let Ok(name) = HeaderName::from_bytes(key.as_bytes()) else {
-            return;
+        let name = match HeaderName::from_bytes(key.as_bytes()) {
+            Ok(name) => name,
+            Err(error) => {
+                warn!(%key, %error, "invalid header name for trace context");
+                return;
+            }
         };
-        let Ok(value) = HeaderValue::from_str(&value) else {
-            return;
+        let value = match HeaderValue::from_str(&value) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    %key,
+                    value_len = value.len(),
+                    %error,
+                    "invalid header value for trace context"
+                );
+                return;
+            }
         };
         self.0.insert(name, value);
     }

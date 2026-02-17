@@ -782,15 +782,19 @@ async fn main() -> Result<()> {
     })?;
 
     // Register eth_newPendingTransactionFilter (Private — filter stored locally)
-    module.register_async_method("eth_newPendingTransactionFilter", |_params, state, extensions| {
-        let request_span = telemetry::rpc_server_span("eth_newPendingTransactionFilter", &extensions);
-        async move {
-            let id = state.block_cache.write().await.create_pending_tx_filter();
-            info!("Created private pending tx filter {}", id);
-            Ok::<Value, ErrorObjectOwned>(Value::String(id))
-        }
-        .instrument(request_span)
-    })?;
+    module.register_async_method(
+        "eth_newPendingTransactionFilter",
+        |_params, state, extensions| {
+            let request_span =
+                telemetry::rpc_server_span("eth_newPendingTransactionFilter", &extensions);
+            async move {
+                let id = state.block_cache.write().await.create_pending_tx_filter();
+                info!("Created private pending tx filter {}", id);
+                Ok::<Value, ErrorObjectOwned>(Value::String(id))
+            }
+            .instrument(request_span)
+        },
+    )?;
 
     // Register eth_uninstallFilter (Private)
     module.register_async_method("eth_uninstallFilter", |params, state, extensions| {
@@ -896,9 +900,11 @@ async fn main() -> Result<()> {
         })?;
     }
 
+    let sanitized_upstream = telemetry::sanitize_url_for_telemetry(&args.upstream);
+    let sanitized_relay = telemetry::sanitize_url_for_telemetry(&args.tx_relay);
     info!("Morphogenesis RPC Adapter listening on {}", addr);
-    info!("Upstream RPC: {}", args.upstream);
-    info!("Tx relay: {}", args.tx_relay);
+    info!("Upstream RPC: {}", sanitized_upstream);
+    info!("Tx relay: {}", sanitized_relay);
     if args.fallback_to_upstream {
         warn!("Fallback to upstream enabled - privacy will be degraded when PIR is unavailable");
     }
@@ -909,30 +915,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Sanitize URL for telemetry by keeping only scheme and host (no path, query, or credentials)
-fn sanitize_url_for_telemetry(url: &str) -> String {
-    // If URL parsing fails, return a redacted placeholder instead of the raw URL
-    // to avoid leaking secrets in case the URL contains credentials/tokens
-    match reqwest::Url::parse(url) {
-        Ok(parsed) => {
-            // Only include scheme and host to avoid leaking path/query/credentials
-            format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or("unknown"))
-        }
-        Err(_) => "<invalid-url>".to_string(),
-    }
-}
-
 async fn proxy_to_upstream(
     url: &str,
     client: &reqwest::Client,
     method: &str,
     params: Value,
 ) -> Result<Value, ErrorObjectOwned> {
-    let sanitized_url = sanitize_url_for_telemetry(url);
+    let sanitized_url = telemetry::sanitize_url_for_telemetry(url);
     let span = tracing::info_span!(
         "rpc.upstream",
         otel.kind = "client",
-        otel.name = "upstream_rpc",
+        otel.name = method,
         rpc.system = "ethereum-jsonrpc",
         rpc.method = %method,
         upstream.url = %sanitized_url
@@ -961,24 +954,30 @@ async fn proxy_to_upstream(
                     None::<()>,
                 )
             } else {
-                ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>)
+                upstream_request_failed_error(method)
             }
         })?;
 
         let json: Value = response
             .json()
             .await
-            .map_err(|e| ErrorObjectOwned::owned(-32000, e.to_string(), None::<()>))?;
+            .map_err(|_| upstream_invalid_json_error(method))?;
 
         if let Some(error) = json.get("error") {
-            warn!("Upstream error for {}: {:?}", method, error);
+            let error_code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32;
+            let error_message = error
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("Unknown error");
+            warn!(
+                rpc.method = %method,
+                error.code = error_code,
+                error.message = %error_message,
+                "Upstream returned JSON-RPC error"
+            );
             return Err(ErrorObjectOwned::owned(
-                error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32,
-                error
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error")
-                    .to_string(),
+                error_code,
+                error_message.to_string(),
                 error.get("data").cloned(),
             ));
         }
@@ -989,9 +988,33 @@ async fn proxy_to_upstream(
     .await
 }
 
+fn upstream_request_failed_error(method: &str) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(
+        -32000,
+        format!("Upstream request failed for {}", method),
+        None::<()>,
+    )
+}
+
+fn upstream_invalid_json_error(method: &str) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(
+        -32000,
+        format!("Invalid JSON response for {}", method),
+        None::<()>,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS};
+    use super::{
+        proxy_to_upstream, upstream_invalid_json_error, DROPPED_METHODS, PASSTHROUGH_METHODS,
+        RELAY_METHODS,
+    };
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+    use tokio::time::sleep;
 
     #[test]
     fn test_passthrough_methods_exclude_private() {
@@ -1065,26 +1088,101 @@ mod tests {
     fn sanitize_url_strips_credentials_and_query_params() {
         // Standard URL - should return scheme + host
         assert_eq!(
-            super::sanitize_url_for_telemetry("https://api.example.com/path?key=secret"),
+            super::telemetry::sanitize_url_for_telemetry("https://api.example.com/path?key=secret"),
             "https://api.example.com"
         );
 
         // URL with credentials - should strip userinfo
         assert_eq!(
-            super::sanitize_url_for_telemetry("https://user:pass@api.example.com/path"),
+            super::telemetry::sanitize_url_for_telemetry("https://user:pass@api.example.com/path"),
             "https://api.example.com"
         );
 
-        // URL with port - port is intentionally stripped for telemetry (host only)
+        // URL with port - preserve host:port for better service differentiation
         assert_eq!(
-            super::sanitize_url_for_telemetry("http://localhost:8545/path"),
-            "http://localhost"
+            super::telemetry::sanitize_url_for_telemetry("http://localhost:8545/path"),
+            "http://localhost:8545"
         );
 
         // Invalid URL - should return placeholder
         assert_eq!(
-            super::sanitize_url_for_telemetry("not-a-valid-url"),
+            super::telemetry::sanitize_url_for_telemetry("not-a-valid-url"),
             "<invalid-url>"
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_to_upstream_request_error_is_redacted() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let err = proxy_to_upstream(
+            "ftp://user:secret@example.com:8545",
+            &client,
+            "eth_getBalance",
+            json!([]),
+        )
+        .await
+        .expect_err("expected request error");
+
+        assert_eq!(err.message(), "Upstream request failed for eth_getBalance");
+    }
+
+    #[tokio::test]
+    async fn proxy_to_upstream_connect_error_is_redacted() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind temporary listener");
+        let addr = listener.local_addr().expect("listener addr");
+        drop(listener);
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let url = format!("http://{}", addr);
+        let err = proxy_to_upstream(&url, &client, "eth_getBalance", json!([]))
+            .await
+            .expect_err("expected connect error");
+
+        assert_eq!(
+            err.message(),
+            "Upstream connection failed for eth_getBalance"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_to_upstream_timeout_error_is_redacted() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind timeout listener");
+        let addr = listener.local_addr().expect("listener addr");
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0_u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            sleep(Duration::from_millis(250)).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(25))
+            .build()
+            .expect("build client");
+        let url = format!("http://{}", addr);
+        let err = proxy_to_upstream(&url, &client, "eth_getBalance", json!([]))
+            .await
+            .expect_err("expected timeout error");
+
+        assert_eq!(err.message(), "Upstream timeout for eth_getBalance");
+    }
+
+    #[test]
+    fn proxy_to_upstream_invalid_json_error_is_redacted() {
+        let err = upstream_invalid_json_error("eth_getBalance");
+        assert_eq!(err.message(), "Invalid JSON response for eth_getBalance");
     }
 }

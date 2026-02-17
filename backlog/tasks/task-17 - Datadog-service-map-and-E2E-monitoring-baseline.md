@@ -1,9 +1,10 @@
 ---
 id: TASK-17
 title: Datadog service map and E2E monitoring baseline
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-02-15 00:00'
+updated_date: '2026-02-17 11:11'
 labels:
   - observability
   - datadog
@@ -38,3 +39,13 @@ Establish a production-like Datadog observability baseline for full E2E protocol
 - Bootstrap script creates or updates dashboard and monitors without duplicates.
 - Alert thresholds and tags are documented (`env`, `service`, `version`, `run_id`).
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-02-17: addressing PR #7 reviewer comments on telemetry sanitization, upstream error redaction, and trace context diagnostics.
+
+2026-02-17: applied PR #7 review fixes and verified with cargo test -p morphogen-rpc-adapter (all tests passing).
+
+2026-02-17: ran roborev local review job 735, fixed findings (error log sanitization + header log hygiene + timeout/connect redaction tests), reran roborev job 736 with no issues.
+<!-- SECTION:NOTES:END -->

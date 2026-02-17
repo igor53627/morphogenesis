@@ -169,6 +169,28 @@ fn has_remote_parent(extensions: &Extensions) -> bool {
     extract_remote_parent_context(extensions).is_some()
 }
 
+/// Sanitize URL for telemetry by keeping scheme + host (+ port when present).
+/// Credentials, path, query, and fragment are always removed.
+pub fn sanitize_url_for_telemetry(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => {
+            let host = parsed.host_str().unwrap_or("unknown");
+            let host = if host.contains(':') && !host.starts_with('[') && !host.ends_with(']') {
+                format!("[{host}]")
+            } else {
+                host.to_string()
+            };
+
+            if let Some(port) = parsed.port() {
+                format!("{}://{}:{}", parsed.scheme(), host, port)
+            } else {
+                format!("{}://{}", parsed.scheme(), host)
+            }
+        }
+        Err(_) => "<invalid-url>".to_string(),
+    }
+}
+
 pub fn normalize_otlp_endpoint(raw: &str) -> Result<String> {
     let candidate = if raw.contains("://") {
         raw.to_string()
@@ -258,6 +280,7 @@ pub fn init_tracing(otel: OtelSettings) -> Result<TelemetryGuard> {
 mod tests {
     use super::{
         capture_trace_context, default_otel_settings, has_remote_parent, normalize_otlp_endpoint,
+        sanitize_url_for_telemetry,
     };
     use http::{Extensions, HeaderMap, HeaderValue};
     use opentelemetry::global;
@@ -349,5 +372,21 @@ mod tests {
         // Verify the filter string contains both targets
         assert!(default_filter.contains("morphogen_rpc_adapter=info"));
         assert!(default_filter.contains("morphogen_e2e_client=info"));
+    }
+
+    #[test]
+    fn sanitize_url_preserves_host_and_port_without_credentials() {
+        assert_eq!(
+            sanitize_url_for_telemetry("https://user:pass@api.example.com:8443/path?key=secret"),
+            "https://api.example.com:8443"
+        );
+        assert_eq!(
+            sanitize_url_for_telemetry("http://127.0.0.1:8545/anything"),
+            "http://127.0.0.1:8545"
+        );
+        assert_eq!(
+            sanitize_url_for_telemetry("not-a-valid-url"),
+            "<invalid-url>"
+        );
     }
 }
