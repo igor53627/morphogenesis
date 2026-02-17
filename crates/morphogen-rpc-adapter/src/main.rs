@@ -369,7 +369,8 @@ async fn main() -> Result<()> {
     })?;
 
     // Register eth_getStorageAt (Private via PIR)
-    module.register_async_method("eth_getStorageAt", |params, state, _| {
+    module.register_async_method("eth_getStorageAt", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getStorageAt", &extensions);
         async move {
             let (address_str, slot_str, block): (String, String, Value) = params.parse()?;
             let address_hex = address_str.strip_prefix("0x").unwrap_or(&address_str);
@@ -436,17 +437,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_getStorageAt",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_getStorageAt"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register eth_call (Private via local EVM execution)
-    module.register_async_method("eth_call", |params, state, _| {
+    module.register_async_method("eth_call", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_call", &extensions);
         async move {
             // Block tag is optional; clients may send 1 or 2 params
             let raw: Vec<Value> = params.parse()?;
@@ -503,17 +499,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_call",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_call"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register eth_estimateGas (Private via local EVM execution)
-    module.register_async_method("eth_estimateGas", |params, state, _| {
+    module.register_async_method("eth_estimateGas", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_estimateGas", &extensions);
         async move {
             // Accept 1-3 params: (call_obj, [block_tag], [state_overrides])
             let raw: Vec<Value> = params.parse()?;
@@ -591,17 +582,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_estimateGas",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_estimateGas"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register eth_getTransactionByHash (Private via block cache, upstream fallback)
-    module.register_async_method("eth_getTransactionByHash", |params, state, _| {
+    module.register_async_method("eth_getTransactionByHash", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getTransactionByHash", &extensions);
         async move {
             let (hash_str,): (String,) = params.parse()?;
             let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
@@ -638,17 +624,12 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_getTransactionByHash",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_getTransactionByHash"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register eth_getTransactionReceipt (Private via block cache, upstream fallback)
-    module.register_async_method("eth_getTransactionReceipt", |params, state, _| {
+    module.register_async_method("eth_getTransactionReceipt", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getTransactionReceipt", &extensions);
         async move {
             let (hash_str,): (String,) = params.parse()?;
             let hash = block_cache::parse_tx_hash(&hash_str).ok_or_else(|| {
@@ -685,17 +666,12 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_getTransactionReceipt",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_getTransactionReceipt"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register eth_getLogs (Private via block cache for recent blocks, upstream fallback)
-    module.register_async_method("eth_getLogs", |params, state, _| {
+    module.register_async_method("eth_getLogs", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getLogs", &extensions);
         async move {
             let raw: Vec<Value> = params.parse()?;
             if raw.len() != 1 {
@@ -765,17 +741,12 @@ async fn main() -> Result<()> {
                 .await
             }
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_getLogs",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_getLogs"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register eth_newFilter (Private — filter stored locally)
-    module.register_async_method("eth_newFilter", |params, state, _| {
+    module.register_async_method("eth_newFilter", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_newFilter", &extensions);
         async move {
             let raw: Vec<Value> = params.parse()?;
             if raw.len() != 1 {
@@ -796,66 +767,46 @@ async fn main() -> Result<()> {
             info!("Created private log filter {}", id);
             Ok::<Value, ErrorObjectOwned>(Value::String(id))
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_newFilter",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_newFilter"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register eth_newBlockFilter (Private — filter stored locally)
-    module.register_async_method("eth_newBlockFilter", |_params, state, _| {
+    module.register_async_method("eth_newBlockFilter", |_params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_newBlockFilter", &extensions);
         async move {
             let id = state.block_cache.write().await.create_block_filter();
             info!("Created private block filter {}", id);
             Ok::<Value, ErrorObjectOwned>(Value::String(id))
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_newBlockFilter",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_newBlockFilter"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register eth_newPendingTransactionFilter (Private — filter stored locally)
-    module.register_async_method("eth_newPendingTransactionFilter", |_params, state, _| {
+    module.register_async_method("eth_newPendingTransactionFilter", |_params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_newPendingTransactionFilter", &extensions);
         async move {
             let id = state.block_cache.write().await.create_pending_tx_filter();
             info!("Created private pending tx filter {}", id);
             Ok::<Value, ErrorObjectOwned>(Value::String(id))
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_newPendingTransactionFilter",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_newPendingTransactionFilter"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register eth_uninstallFilter (Private)
-    module.register_async_method("eth_uninstallFilter", |params, state, _| {
+    module.register_async_method("eth_uninstallFilter", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_uninstallFilter", &extensions);
         async move {
             let (filter_id,): (String,) = params.parse()?;
             let result = state.block_cache.write().await.uninstall_filter(&filter_id);
             info!("Uninstalled filter {}: {}", filter_id, result);
             Ok::<Value, ErrorObjectOwned>(Value::Bool(result))
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_uninstallFilter",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_uninstallFilter"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register eth_getFilterChanges (Private — served from cache)
-    module.register_async_method("eth_getFilterChanges", |params, state, _| {
+    module.register_async_method("eth_getFilterChanges", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getFilterChanges", &extensions);
         async move {
             let (filter_id,): (String,) = params.parse()?;
             let mut cache = state.block_cache.write().await;
@@ -869,17 +820,12 @@ async fn main() -> Result<()> {
             }
         }
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_getFilterChanges",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_getFilterChanges"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register eth_getFilterLogs (Private — served from cache)
-    module.register_async_method("eth_getFilterLogs", |params, state, _| {
+    module.register_async_method("eth_getFilterLogs", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_getFilterLogs", &extensions);
         async move {
             let (filter_id,): (String,) = params.parse()?;
             let mut cache = state.block_cache.write().await;
@@ -896,83 +842,57 @@ async fn main() -> Result<()> {
             }
         }
         }
-        .instrument(tracing::info_span!(
-            "rpc.request",
-            otel.kind = "server",
-            otel.name = "eth_getFilterLogs",
-            rpc.system = "ethereum-jsonrpc",
-            rpc.method = "eth_getFilterLogs"
-        ))
+        .instrument(request_span)
     })?;
 
     // Register passthrough methods
     for method in PASSTHROUGH_METHODS {
-        let method_name = method.to_string();
-        module.register_async_method(method, move |params, state, _| {
-            let m = method_name.clone();
-            let span_method = m.clone();
+        let method_name = *method;
+        module.register_async_method(method, move |params, state, extensions| {
+            let request_span = telemetry::rpc_server_span(method_name, &extensions);
             async move {
                 proxy_to_upstream(
                     &state.args.upstream,
                     &state.http_client,
-                    &m,
+                    method_name,
                     params.parse()?,
                 )
                 .await
             }
-            .instrument(tracing::info_span!(
-                "rpc.request",
-                otel.kind = "server",
-                otel.name = "passthrough",
-                rpc.system = "ethereum-jsonrpc",
-                rpc.method = %span_method
-            ))
+            .instrument(request_span)
         })?;
     }
 
     // Register relay methods — sent to privacy relay (Flashbots by default)
     for method in RELAY_METHODS {
-        let method_name = method.to_string();
-        module.register_async_method(method, move |params, state, _| {
-            let m = method_name.clone();
-            let span_method = m.clone();
+        let method_name = *method;
+        module.register_async_method(method, move |params, state, extensions| {
+            let request_span = telemetry::rpc_server_span(method_name, &extensions);
             async move {
-                info!("Relaying {} to privacy relay", m);
+                info!("Relaying {} to privacy relay", method_name);
                 proxy_to_upstream(
                     &state.args.tx_relay,
                     &state.http_client,
-                    &m,
+                    method_name,
                     params.parse()?,
                 )
                 .await
             }
-            .instrument(tracing::info_span!(
-                "rpc.request",
-                otel.kind = "server",
-                otel.name = "relay",
-                rpc.system = "ethereum-jsonrpc",
-                rpc.method = %span_method
-            ))
+            .instrument(request_span)
         })?;
     }
 
     // Register dropped methods — return explicit errors
     for &(method, reason) in DROPPED_METHODS {
         let reason = reason.to_string();
-        let method_name = method.to_string();
-        module.register_async_method(method, move |_params, _state, _| {
+        let method_name = method;
+        module.register_async_method(method, move |_params, _state, extensions| {
             let r = reason.clone();
-            let span_method = method_name.clone();
+            let request_span = telemetry::rpc_server_span(method_name, &extensions);
             async move {
                 Err::<Value, ErrorObjectOwned>(ErrorObjectOwned::owned(-32601, r, None::<()>))
             }
-            .instrument(tracing::info_span!(
-                "rpc.request",
-                otel.kind = "server",
-                otel.name = "dropped",
-                rpc.system = "ethereum-jsonrpc",
-                rpc.method = %span_method
-            ))
+            .instrument(request_span)
         })?;
     }
 
@@ -989,19 +909,33 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Sanitize URL for telemetry by keeping only scheme and host (no path, query, or credentials)
+fn sanitize_url_for_telemetry(url: &str) -> String {
+    // If URL parsing fails, return a redacted placeholder instead of the raw URL
+    // to avoid leaking secrets in case the URL contains credentials/tokens
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => {
+            // Only include scheme and host to avoid leaking path/query/credentials
+            format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or("unknown"))
+        }
+        Err(_) => "<invalid-url>".to_string(),
+    }
+}
+
 async fn proxy_to_upstream(
     url: &str,
     client: &reqwest::Client,
     method: &str,
     params: Value,
 ) -> Result<Value, ErrorObjectOwned> {
+    let sanitized_url = sanitize_url_for_telemetry(url);
     let span = tracing::info_span!(
         "rpc.upstream",
         otel.kind = "client",
         otel.name = "upstream_rpc",
         rpc.system = "ethereum-jsonrpc",
         rpc.method = %method,
-        upstream.url = %url
+        upstream.url = %sanitized_url
     );
     async move {
         info!("Proxying {} to upstream", method);
@@ -1125,5 +1059,32 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn sanitize_url_strips_credentials_and_query_params() {
+        // Standard URL - should return scheme + host
+        assert_eq!(
+            super::sanitize_url_for_telemetry("https://api.example.com/path?key=secret"),
+            "https://api.example.com"
+        );
+
+        // URL with credentials - should strip userinfo
+        assert_eq!(
+            super::sanitize_url_for_telemetry("https://user:pass@api.example.com/path"),
+            "https://api.example.com"
+        );
+
+        // URL with port - should preserve host (including port if present)
+        assert_eq!(
+            super::sanitize_url_for_telemetry("http://localhost:8545/path"),
+            "http://localhost"
+        );
+
+        // Invalid URL - should return placeholder
+        assert_eq!(
+            super::sanitize_url_for_telemetry("not-a-valid-url"),
+            "<invalid-url>"
+        );
     }
 }

@@ -15,7 +15,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 #[command(
     author,
     version,
-    about = "Datadog/OTLP-instrumented E2E client for Morphogenesis RPC Adapter"
+    about = "OpenTelemetry-instrumented E2E client for Morphogenesis RPC Adapter"
 )]
 struct Args {
     /// RPC URL of the local adapter
@@ -30,7 +30,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     otel_traces: bool,
 
-    /// OTLP collector endpoint (Datadog Agent default: http://127.0.0.1:4317)
+    /// OTLP collector endpoint (default: http://127.0.0.1:4317)
     #[arg(long, default_value = "http://127.0.0.1:4317")]
     otel_endpoint: String,
 

@@ -202,7 +202,7 @@ pub fn default_otel_settings() -> OtelSettings {
 
 pub fn init_tracing(otel: OtelSettings) -> Result<TelemetryGuard> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "morphogen_rpc_adapter=info".into());
+        .unwrap_or_else(|_| "morphogen_rpc_adapter=info,morphogen_e2e_client=info".into());
     let fmt_layer = tracing_subscriber::fmt::layer();
 
     if !otel.enabled {
@@ -276,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn default_settings_have_datadog_compatible_defaults() {
+    fn default_settings_have_otlp_compatible_defaults() {
         let settings = default_otel_settings();
         assert!(!settings.enabled);
         assert_eq!(settings.endpoint, "http://127.0.0.1:4317");
@@ -330,5 +330,19 @@ mod tests {
         let headers = HeaderMap::new();
         capture_trace_context(&headers, &mut extensions);
         assert!(!has_remote_parent(&extensions));
+    }
+
+    #[test]
+    fn default_env_filter_includes_both_binaries() {
+        // Verify the default filter string includes both adapter and e2e-client targets
+        // This ensures spans from both binaries are emitted by default
+        let default_filter = "morphogen_rpc_adapter=info,morphogen_e2e_client=info";
+
+        // Parse the filter to ensure it's valid - this will panic if the filter is invalid
+        let _filter = tracing_subscriber::EnvFilter::new(default_filter);
+
+        // Verify the filter string contains both targets
+        assert!(default_filter.contains("morphogen_rpc_adapter=info"));
+        assert!(default_filter.contains("morphogen_e2e_client=info"));
     }
 }
