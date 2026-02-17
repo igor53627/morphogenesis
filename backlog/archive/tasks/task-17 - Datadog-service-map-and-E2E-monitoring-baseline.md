@@ -4,7 +4,7 @@ title: Datadog service map and E2E monitoring baseline
 status: In Progress
 assignee: []
 created_date: '2026-02-15 00:00'
-updated_date: '2026-02-17 11:11'
+updated_date: '2026-02-17 11:38'
 labels:
   - observability
   - datadog
@@ -48,4 +48,6 @@ Establish a production-like Datadog observability baseline for full E2E protocol
 2026-02-17: applied PR #7 review fixes and verified with cargo test -p morphogen-rpc-adapter (all tests passing).
 
 2026-02-17: ran roborev local review job 735, fixed findings (error log sanitization + header log hygiene + timeout/connect redaction tests), reran roborev job 736 with no issues.
+
+2026-02-17: switched to commit-based roborev flow and reviewed commit caa265f7 (job 737), no issues found.
 <!-- SECTION:NOTES:END -->
