@@ -1,7 +1,4 @@
-# KANBAN (Archived)
-
-Active task tracking has migrated to `backlog/` and should be managed with the `backlog` CLI.
-This file is retained only for historical notes recorded before migration.
+# KANBAN
 
 ## 2026-02-11
 
