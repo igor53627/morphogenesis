@@ -8,13 +8,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use wasm_bindgen::prelude::*;
 
-const PRIVATE_METHODS: &[&str] = &[
-    "eth_getBalance",
-    "eth_getTransactionCount",
-    "eth_getStorageAt",
-    "eth_getCode",
-];
-
 const SAFE_READ_ONLY_PASSTHROUGH_METHODS: &[&str] = &[
     "eth_chainId",
     "eth_blockNumber",
@@ -286,7 +279,7 @@ fn validate_private_block_param(
 }
 
 pub fn is_safe_read_only_passthrough(method: &str) -> bool {
-    if PRIVATE_METHODS.contains(&method) || UNSAFE_METHODS.contains(&method) {
+    if UNSAFE_METHODS.contains(&method) {
         return false;
     }
 
@@ -419,20 +412,25 @@ impl UpstreamApi for HttpUpstreamApi {
             .await
             .map_err(|e| upstream_request_error(method, &e))?;
 
+        let status = response.status();
+        if !status.is_success() {
+            if let Ok(response_json) = response.json::<Value>().await {
+                if let Some(error) = extract_json_rpc_error(&response_json) {
+                    return Err(error);
+                }
+            }
+            return Err(GatewayError::internal(format!(
+                "Upstream HTTP status {status} for {method}"
+            )));
+        }
+
         let response_json: Value = response
             .json::<Value>()
             .await
             .map_err(|_| GatewayError::internal(format!("Invalid JSON response for {method}")))?;
 
-        if let Some(error) = response_json.get("error") {
-            let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Upstream error")
-                .to_owned();
-            let data = error.get("data").cloned();
-            return Err(GatewayError::json_rpc(code, message, data));
+        if let Some(error) = extract_json_rpc_error(&response_json) {
+            return Err(error);
         }
 
         Ok(response_json.get("result").cloned().unwrap_or(Value::Null))
@@ -450,6 +448,18 @@ fn upstream_request_error(method: &str, error: &reqwest::Error) -> GatewayError 
     }
 
     GatewayError::internal(format!("Upstream request failed for {method}"))
+}
+
+fn extract_json_rpc_error(response_json: &Value) -> Option<GatewayError> {
+    let error = response_json.get("error")?.as_object()?;
+    let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Upstream error")
+        .to_owned();
+    let data = error.get("data").cloned();
+    Some(GatewayError::json_rpc(code, message, data))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -546,6 +556,11 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[cfg(not(target_arch = "wasm32"))]
+    use tokio::net::TcpListener;
 
     #[cfg(target_arch = "wasm32")]
     use wasm_bindgen_test::wasm_bindgen_test;
@@ -650,6 +665,30 @@ mod tests {
 
     fn sample_address() -> &'static str {
         "0x1111111111111111111111111111111111111111"
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn spawn_upstream_server(status_line: &str, body: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let status = status_line.to_owned();
+        let response_body = body.to_owned();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 2048];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+        format!("http://{}", addr)
     }
 
     #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
@@ -882,5 +921,60 @@ mod tests {
         assert_eq!(chain_id, Value::String("0x1".to_owned()));
         assert_eq!(log.private.borrow().as_slice(), ["eth_getBalance"]);
         assert_eq!(log.upstream.borrow().as_slice(), ["eth_chainId"]);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn upstream_error_null_returns_result() {
+        let url = spawn_upstream_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","id":1,"result":"0x1","error":null}"#,
+        )
+        .await;
+        let api = HttpUpstreamApi::new(url, 1000).expect("build upstream api");
+
+        let result = api
+            .request("eth_chainId", serde_json::json!([]))
+            .await
+            .expect("error:null should not be treated as failure");
+
+        assert_eq!(result, Value::String("0x1".to_owned()));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn upstream_non_success_status_reports_http_status() {
+        let url = spawn_upstream_server("500 Internal Server Error", r#"{"error":"boom"}"#).await;
+        let api = HttpUpstreamApi::new(url, 1000).expect("build upstream api");
+
+        let err = api
+            .request("eth_chainId", serde_json::json!([]))
+            .await
+            .expect_err("non-2xx upstream status should fail");
+        let err = err.into_json();
+
+        assert_eq!(err.code, -32000);
+        assert!(err.message.contains("500 Internal Server Error"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn upstream_non_success_status_with_json_rpc_error_is_forwarded() {
+        let url = spawn_upstream_server(
+            "500 Internal Server Error",
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32042,"message":"rate limited","data":{"retryAfter":1}}}"#,
+        )
+        .await;
+        let api = HttpUpstreamApi::new(url, 1000).expect("build upstream api");
+
+        let err = api
+            .request("eth_chainId", serde_json::json!([]))
+            .await
+            .expect_err("json-rpc error body should be forwarded even on non-2xx");
+        let err = err.into_json();
+
+        assert_eq!(err.code, -32042);
+        assert_eq!(err.message, "rate limited");
+        assert_eq!(err.data, Some(serde_json::json!({ "retryAfter": 1 })));
     }
 }
