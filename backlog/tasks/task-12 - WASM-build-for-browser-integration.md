@@ -1,10 +1,10 @@
 ---
 id: TASK-12
 title: WASM build for browser integration
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-03 14:38'
-updated_date: '2026-02-18 07:55'
+updated_date: '2026-02-18 08:34'
 labels:
   - rpc
   - research
@@ -48,18 +48,24 @@ MVP: ship a browser-runnable privacy gateway so wallet extensions can call Morph
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 cargo build -p morphogen-client --target wasm32-unknown-unknown succeeds, or a dedicated WASM crate build succeeds if introduced.
-- [ ] #2 WASM export provides request(method, params) compatible with EIP-1193 call shape.
-- [ ] #3 Private methods eth_getBalance, eth_getTransactionCount, eth_getStorageAt, and eth_getCode execute successfully in WASM tests against mocked PIR and upstream endpoints.
-- [ ] #4 Routing tests verify private methods do not call upstream on successful private path.
-- [ ] #5 Demo integration (example extension page or script) performs at least one private call and one passthrough call end-to-end.
-- [ ] #6 README/docs include setup instructions, supported method matrix, and explicit MVP non-goals.
+- [x] #1 cargo build -p morphogen-client --target wasm32-unknown-unknown succeeds, or a dedicated WASM crate build succeeds if introduced.
+- [x] #2 WASM export provides request(method, params) compatible with EIP-1193 call shape.
+- [x] #3 Private methods eth_getBalance, eth_getTransactionCount, eth_getStorageAt, and eth_getCode execute successfully in WASM tests against mocked PIR and upstream endpoints.
+- [x] #4 Routing tests verify private methods do not call upstream on successful private path.
+- [x] #5 Demo integration (example extension page or script) performs at least one private call and one passthrough call end-to-end.
+- [x] #6 README/docs include setup instructions, supported method matrix, and explicit MVP non-goals.
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented new crates/morphogen-wasm-gateway with wasm-bindgen EIP-1193 request({method,params}) API. Added private routing for eth_getBalance/eth_getTransactionCount/eth_getStorageAt/eth_getCode via morphogen-client PIR + CodeResolver; passthrough for eth_chainId/eth_blockNumber/eth_gasPrice plus safe read-only fallback. Added JSON-RPC error mapping tests and wasm harness tests with wasm-bindgen-test (run via wasm-pack test --node). Added demo integration under examples/wasm-gateway (provider bridge + page) and docs/WASM_GATEWAY.md with setup, method matrix, CORS, non-goals. Verified: cargo test -p morphogen-wasm-gateway; cargo build -p morphogen-wasm-gateway --target wasm32-unknown-unknown; cargo build -p morphogen-client --target wasm32-unknown-unknown; wasm-pack test --node crates/morphogen-wasm-gateway.
+<!-- SECTION:NOTES:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Code merged with WASM target build passing in CI, or local verification command documented if CI target is deferred.
-- [ ] #2 Unit/integration tests cover method routing and error mapping at the WASM boundary.
-- [ ] #3 Demo integration committed under examples/ or scripts/ with run instructions.
-- [ ] #4 Backlog task updated with implementation notes/final summary when completed.
+- [x] #1 Code merged with WASM target build passing in CI, or local verification command documented if CI target is deferred.
+- [x] #2 Unit/integration tests cover method routing and error mapping at the WASM boundary.
+- [x] #3 Demo integration committed under examples/ or scripts/ with run instructions.
+- [x] #4 Backlog task updated with implementation notes/final summary when completed.
 <!-- DOD:END -->

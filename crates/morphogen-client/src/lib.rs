@@ -1,4 +1,5 @@
 pub mod fixture;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod gpu;
 pub mod network;
 pub mod page;

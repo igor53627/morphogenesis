@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Morphogenesis WASM Gateway Demo</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        --bg: #f3efe8;
+        --fg: #202329;
+        --card: #fffaf2;
+        --border: #d7c9b7;
+        --accent: #005f73;
+      }
+      body {
+        margin: 0;
+        background: radial-gradient(circle at 10% 10%, #fff, var(--bg));
+        color: var(--fg);
+      }
+      main {
+        max-width: 960px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px;
+        margin-bottom: 16px;
+      }
+      label {
+        display: block;
+        font-size: 13px;
+        margin: 8px 0 4px;
+      }
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px;
+        font-family: "IBM Plex Mono", monospace;
+      }
+      .actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-top: 12px;
+      }
+      button {
+        border: 0;
+        border-radius: 999px;
+        padding: 10px 16px;
+        background: var(--accent);
+        color: #fff;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      pre {
+        min-height: 200px;
+        background: #101218;
+        color: #dce8ff;
+        border-radius: 8px;
+        padding: 12px;
+        overflow-x: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Morphogenesis WASM Gateway Demo</h1>
+      <p>
+        This demo initializes <code>WasmGateway</code>, installs a routed provider, then performs one
+        private call and one passthrough call.
+      </p>
+
+      <section class="card">
+        <h2>Endpoint Config</h2>
+        <label for="upstream">Upstream RPC URL</label>
+        <input id="upstream" value="https://ethereum-rpc.publicnode.com" />
+
+        <label for="pirA">PIR Server A URL</label>
+        <input id="pirA" value="http://127.0.0.1:3000" />
+
+        <label for="pirB">PIR Server B URL</label>
+        <input id="pirB" value="http://127.0.0.1:3001" />
+
+        <label for="dict">Dictionary URL</label>
+        <input id="dict" value="http://127.0.0.1:8080/mainnet_compact.dict" />
+
+        <label for="cas">CAS Base URL</label>
+        <input id="cas" value="http://127.0.0.1:8080/cas" />
+
+        <label for="address">Address for private call</label>
+        <input id="address" value="0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045" />
+
+        <div class="actions">
+          <button id="init">Initialize Gateway + Provider</button>
+          <button id="private">Run Private eth_getBalance</button>
+          <button id="passthrough">Run Passthrough eth_chainId</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Output</h2>
+        <pre id="output"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="./demo.js"></script>
+  </body>
+</html>

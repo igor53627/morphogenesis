@@ -6,10 +6,8 @@ edition = "2021"
 [dependencies]
 morphogen-core = { path = "../morphogen-core", default-features = false }
 morphogen-dpf = { path = "../morphogen-dpf", features = ["fss"] }
-morphogen-gpu-dpf = { path = "../morphogen-gpu-dpf" }
 rand = "0.8"
 reqwest = { version = "0.11", features = ["json"] }
-tokio = { version = "1", features = ["full"] }
 hex = "0.4"
 anyhow = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -17,6 +15,14 @@ serde_json = "1.0"
 alloy-primitives = "1.5"
 tracing = "0.1"
 binius_field = { git = "https://github.com/IrreducibleOSS/binius", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+morphogen-gpu-dpf = { path = "../morphogen-gpu-dpf" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 rand = "0.8"
