@@ -390,6 +390,10 @@ pub fn scan_delta_for_gpu(
 }
 
 #[cfg(feature = "parallel")]
+/// Backward-compatible parallel scan entrypoint.
+///
+/// The `batch_size` argument is retained only for API compatibility and is ignored.
+/// New call sites should use [`scan_consistent_parallel_no_batch`] directly.
 #[deprecated(
     since = "0.1.0",
     note = "batch_size is ignored; use scan_consistent_parallel_no_batch instead"
@@ -405,6 +409,7 @@ pub fn scan_consistent_parallel<K: DpfKey + Sync>(
 }
 
 #[cfg(feature = "parallel")]
+/// Preferred parallel scan entrypoint without unused batching knobs.
 pub fn scan_consistent_parallel_no_batch<K: DpfKey + Sync>(
     global: &GlobalState,
     pending: &DeltaBuffer,
@@ -421,6 +426,10 @@ pub fn scan_consistent_parallel_no_batch<K: DpfKey + Sync>(
 }
 
 #[cfg(feature = "parallel")]
+/// Backward-compatible retry variant.
+///
+/// This wrapper is kept to avoid breaking external callers while migrating to
+/// [`scan_consistent_parallel_with_max_retries_no_batch`].
 #[deprecated(
     since = "0.1.0",
     note = "use scan_consistent_parallel_with_max_retries_no_batch instead"
@@ -443,6 +452,7 @@ pub fn scan_consistent_parallel_with_max_retries<K: DpfKey + Sync>(
 }
 
 #[cfg(feature = "parallel")]
+/// Preferred retrying parallel scan variant without batch-size compatibility args.
 pub fn scan_consistent_parallel_with_max_retries_no_batch<K: DpfKey + Sync>(
     global: &GlobalState,
     pending: &DeltaBuffer,
