@@ -390,13 +390,28 @@ pub fn scan_delta_for_gpu(
 }
 
 #[cfg(feature = "parallel")]
+#[deprecated(
+    since = "0.1.0",
+    note = "batch_size is ignored; use scan_consistent_parallel_no_batch instead"
+)]
 pub fn scan_consistent_parallel<K: DpfKey + Sync>(
     global: &GlobalState,
     pending: &DeltaBuffer,
     keys: &[K; 3],
     row_size_bytes: usize,
+    _batch_size: usize,
 ) -> Result<([Vec<u8>; 3], u64), ScanError> {
-    scan_consistent_parallel_with_max_retries(
+    scan_consistent_parallel_no_batch(global, pending, keys, row_size_bytes)
+}
+
+#[cfg(feature = "parallel")]
+pub fn scan_consistent_parallel_no_batch<K: DpfKey + Sync>(
+    global: &GlobalState,
+    pending: &DeltaBuffer,
+    keys: &[K; 3],
+    row_size_bytes: usize,
+) -> Result<([Vec<u8>; 3], u64), ScanError> {
+    scan_consistent_parallel_with_max_retries_no_batch(
         global,
         pending,
         keys,
@@ -406,7 +421,29 @@ pub fn scan_consistent_parallel<K: DpfKey + Sync>(
 }
 
 #[cfg(feature = "parallel")]
+#[deprecated(
+    since = "0.1.0",
+    note = "batch_size is ignored; use scan_consistent_parallel_with_max_retries_no_batch instead"
+)]
+#[allow(dead_code)]
 pub fn scan_consistent_parallel_with_max_retries<K: DpfKey + Sync>(
+    global: &GlobalState,
+    pending: &DeltaBuffer,
+    keys: &[K; 3],
+    row_size_bytes: usize,
+    max_retries: usize,
+) -> Result<([Vec<u8>; 3], u64), ScanError> {
+    scan_consistent_parallel_with_max_retries_no_batch(
+        global,
+        pending,
+        keys,
+        row_size_bytes,
+        max_retries,
+    )
+}
+
+#[cfg(feature = "parallel")]
+pub fn scan_consistent_parallel_with_max_retries_no_batch<K: DpfKey + Sync>(
     global: &GlobalState,
     pending: &DeltaBuffer,
     keys: &[K; 3],

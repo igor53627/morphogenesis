@@ -7,7 +7,7 @@ use morphogen_storage::ChunkedMatrix;
 use crate::config::{ConfigError, ServerConfig};
 use crate::epoch::{try_build_next_snapshot, MergeError};
 #[cfg(feature = "parallel")]
-use crate::scan::scan_consistent_parallel;
+use crate::scan::scan_consistent_parallel_no_batch;
 use crate::scan::{scan_consistent, ScanError};
 
 pub struct MorphogenServer {
@@ -56,7 +56,7 @@ impl MorphogenServer {
         &self,
         keys: &[K; 3],
     ) -> Result<([Vec<u8>; 3], u64), ScanError> {
-        scan_consistent_parallel(
+        scan_consistent_parallel_no_batch(
             &self.state,
             self.state.load_pending().as_ref(),
             keys,
@@ -163,12 +163,19 @@ mod tests {
     #[test]
     fn scan_parallel_matches_scan() {
         use morphogen_dpf::AesDpfKey;
+        use rand::{rngs::StdRng, SeedableRng};
 
-        let server = MorphogenServer::new(test_config()).unwrap();
-        let mut rng = rand::thread_rng();
-        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
-        let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
-        let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+        let mut config = test_config();
+        config.bench_fill_seed = Some(0xBAD5EED);
+        let server = MorphogenServer::new(config).unwrap();
+        server
+            .submit_update(0, vec![0xAB, 0xCD, 0xEF, 0x12])
+            .expect("submit update should succeed");
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let key0 = AesDpfKey::new_single(&mut rng, 0);
+        let key1 = AesDpfKey::new_single(&mut rng, 1);
+        let key2 = AesDpfKey::new_single(&mut rng, 2);
         let keys = [key0, key1, key2];
 
         let (scan_results, scan_epoch) = server.scan(&keys).expect("scan should succeed");
@@ -178,5 +185,9 @@ mod tests {
 
         assert_eq!(parallel_epoch, scan_epoch);
         assert_eq!(parallel_results, scan_results);
+        assert!(
+            scan_results.iter().flatten().any(|&byte| byte != 0),
+            "seeded matrix + pending delta should yield non-zero scan output"
+        );
     }
 }
