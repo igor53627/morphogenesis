@@ -30,6 +30,14 @@ python3 -m http.server 4173
 
 The output panel will show one private call and one passthrough call end-to-end through the routed provider.
 
+## Bridge Tests
+
+Run the provider-routing unit tests for the demo bridge:
+
+```bash
+node --test examples/wasm-gateway/routing.test.mjs
+```
+
 ## Endpoint Requirements
 
 - PIR servers (`pirServerA`, `pirServerB`) and dictionary/CAS endpoints must allow browser `GET`/`POST` from your page origin.

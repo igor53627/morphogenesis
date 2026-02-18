@@ -1,37 +1,5 @@
 import init, { WasmGateway } from "./pkg/morphogen_wasm_gateway.js";
-
-const PRIVATE_METHODS = new Set([
-  "eth_getBalance",
-  "eth_getTransactionCount",
-  "eth_getStorageAt",
-  "eth_getCode",
-]);
-
-const BASE_PASSTHROUGH_METHODS = new Set([
-  "eth_chainId",
-  "eth_blockNumber",
-  "eth_gasPrice",
-]);
-
-const WALLET_OWNED_METHODS = new Set([
-  "eth_accounts",
-  "eth_requestAccounts",
-  "eth_sendTransaction",
-  "eth_sendRawTransaction",
-  "eth_sign",
-  "eth_signTransaction",
-  "personal_sign",
-  "eth_subscribe",
-  "eth_unsubscribe",
-  "eth_newFilter",
-  "eth_newBlockFilter",
-  "eth_newPendingTransactionFilter",
-  "eth_uninstallFilter",
-  "eth_getFilterChanges",
-  "eth_getFilterLogs",
-  "eth_submitWork",
-  "eth_submitHashrate",
-]);
+import { requestWithGatewayFallback } from "./routing.mjs";
 
 const outputEl = document.getElementById("output");
 let gateway;
@@ -43,18 +11,6 @@ function log(line) {
 
 function clearLog() {
   outputEl.textContent = "";
-}
-
-function shouldRouteToGateway(method) {
-  if (PRIVATE_METHODS.has(method) || BASE_PASSTHROUGH_METHODS.has(method)) {
-    return true;
-  }
-
-  if (WALLET_OWNED_METHODS.has(method)) {
-    return false;
-  }
-
-  return method.startsWith("eth_") || method.startsWith("net_") || method.startsWith("web3_");
 }
 
 function getConfig() {
@@ -73,28 +29,14 @@ function installProviderBridge() {
 
   routedProvider = {
     request: async (payload) => {
-      const method = payload?.method;
-      if (!method) {
-        throw new Error("request payload must include method");
-      }
-
-      if (shouldRouteToGateway(method)) {
-        try {
-          return await gateway.request(payload);
-        } catch (error) {
-          if (error?.code === -32601 && existing) {
-            log(`Gateway does not support ${method}; falling back to wallet provider.`);
-            return existing(payload);
-          }
-          throw error;
-        }
-      }
-
-      if (!existing) {
-        throw new Error(`No base provider available for method ${method}`);
-      }
-
-      return existing(payload);
+      return requestWithGatewayFallback({
+        payload,
+        gatewayRequest: (requestPayload) => gateway.request(requestPayload),
+        walletRequest: existing,
+        onFallback: (method) => {
+          log(`Gateway does not support ${method}; falling back to wallet provider.`);
+        },
+      });
     },
   };
 

@@ -54,7 +54,7 @@ const balance = await gateway.request({
 | `eth_chainId` | Upstream passthrough | Browser fetch JSON-RPC |
 | `eth_blockNumber` | Upstream passthrough | Browser fetch JSON-RPC |
 | `eth_gasPrice` | Upstream passthrough | Browser fetch JSON-RPC |
-| Safe read-only fallback (`eth_get*`, `net_*`, `web3_*`) | Upstream passthrough | Blocked for write/sign/filter methods |
+| Safe read-only allowlist | Upstream passthrough | Explicit allowlist in `SAFE_READ_ONLY_PASSTHROUGH_METHODS`; blocked for write/sign/filter methods |
 | Write/sign/filter methods (`eth_send*`, `eth_sign*`, `personal_sign`, filter state methods) | Rejected | Returns `-32601` unsupported method |
 
 ## CORS / Endpoint Configuration
