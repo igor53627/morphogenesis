@@ -395,7 +395,6 @@ pub fn scan_consistent_parallel<K: DpfKey + Sync>(
     pending: &DeltaBuffer,
     keys: &[K; 3],
     row_size_bytes: usize,
-    batch_size: usize,
 ) -> Result<([Vec<u8>; 3], u64), ScanError> {
     scan_consistent_parallel_with_max_retries(
         global,
@@ -403,7 +402,6 @@ pub fn scan_consistent_parallel<K: DpfKey + Sync>(
         keys,
         row_size_bytes,
         DEFAULT_MAX_RETRIES,
-        batch_size,
     )
 }
 
@@ -414,7 +412,6 @@ pub fn scan_consistent_parallel_with_max_retries<K: DpfKey + Sync>(
     keys: &[K; 3],
     row_size_bytes: usize,
     max_retries: usize,
-    batch_size: usize,
 ) -> Result<([Vec<u8>; 3], u64), ScanError> {
     for attempt in 0..max_retries {
         let snapshot1 = global.load();
@@ -426,12 +423,8 @@ pub fn scan_consistent_parallel_with_max_retries<K: DpfKey + Sync>(
 
         let snapshot2 = global.load();
         if snapshot2.epoch_id == epoch1 && pending_epoch == epoch1 {
-            let mut results = scan_main_matrix_parallel_batched(
-                snapshot1.matrix.as_ref(),
-                keys,
-                row_size_bytes,
-                batch_size,
-            );
+            let mut results =
+                scan_main_matrix_parallel(snapshot1.matrix.as_ref(), keys, row_size_bytes);
             for entry in &entries {
                 for (k, key) in keys.iter().enumerate() {
                     if key.eval_bit(entry.row_idx) {
@@ -459,18 +452,6 @@ fn empty_result(row_size_bytes: usize) -> [Vec<u8>; 3] {
         vec![0u8; row_size_bytes],
         vec![0u8; row_size_bytes],
     ]
-}
-
-#[cfg(feature = "parallel")]
-pub fn scan_main_matrix_parallel_batched<K: DpfKey + Sync>(
-    matrix: &ChunkedMatrix,
-    keys: &[K; 3],
-    row_size_bytes: usize,
-    batch_size: usize,
-) -> [Vec<u8>; 3] {
-    // TODO: Implement actual batched processing
-    // For now, delegate to single-query parallel scan
-    scan_main_matrix_parallel(matrix, keys, row_size_bytes)
 }
 
 #[cfg(feature = "parallel")]

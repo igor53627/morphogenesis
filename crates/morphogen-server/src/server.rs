@@ -61,7 +61,6 @@ impl MorphogenServer {
             self.state.load_pending().as_ref(),
             keys,
             self.config.row_size_bytes,
-            1, // Default batch size
         )
     }
 
@@ -158,5 +157,26 @@ mod tests {
             bench_fill_seed: None,
         };
         assert!(MorphogenServer::new(config).is_err());
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn scan_parallel_matches_scan() {
+        use morphogen_dpf::AesDpfKey;
+
+        let server = MorphogenServer::new(test_config()).unwrap();
+        let mut rng = rand::thread_rng();
+        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (key1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (key2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+        let keys = [key0, key1, key2];
+
+        let (scan_results, scan_epoch) = server.scan(&keys).expect("scan should succeed");
+        let (parallel_results, parallel_epoch) = server
+            .scan_parallel(&keys)
+            .expect("parallel scan should succeed");
+
+        assert_eq!(parallel_epoch, scan_epoch);
+        assert_eq!(parallel_results, scan_results);
     }
 }

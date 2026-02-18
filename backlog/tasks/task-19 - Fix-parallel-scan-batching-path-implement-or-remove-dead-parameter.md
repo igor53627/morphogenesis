@@ -1,9 +1,10 @@
 ---
 id: TASK-19
 title: Fix parallel scan batching path (implement or remove dead parameter)
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-18 19:52'
+updated_date: '2026-02-18 20:34'
 labels:
   - performance
   - server
@@ -26,13 +27,22 @@ Scope:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 No dead batching API remains (either real batching exists and is tested, or batch_size path is removed)
-- [ ] #2 All call sites and public exports compile cleanly with chosen direction
-- [ ] #3 Tests cover chosen behavior (batch semantics or simplified non-batch path)
+- [x] #1 No dead batching API remains (either real batching exists and is tested, or batch_size path is removed)
+- [x] #2 All call sites and public exports compile cleanly with chosen direction
+- [x] #3 Tests cover chosen behavior (batch semantics or simplified non-batch path)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Chose simplification path (Scope option 2): removed dead batch_size plumbing and deleted scan_main_matrix_parallel_batched stub, which previously ignored batch_size.
+Updated scan_consistent_parallel and scan_consistent_parallel_with_max_retries signatures/call path to invoke scan_main_matrix_parallel directly.
+Updated MorphogenServer::scan_parallel caller accordingly.
+Added regression test server::tests::scan_parallel_matches_scan to keep simplified behavior explicit.
+<!-- SECTION:NOTES:END -->
 
 ## Definition of Done
 <!-- DOD:BEGIN -->
-- [ ] #1 Server crate tests pass with parallel feature
-- [ ] #2 Task notes record chosen direction and rationale
+- [x] #1 Server crate tests pass with parallel feature
+- [x] #2 Task notes record chosen direction and rationale
 <!-- DOD:END -->
