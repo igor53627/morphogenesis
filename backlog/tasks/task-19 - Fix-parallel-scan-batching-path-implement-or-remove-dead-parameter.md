@@ -4,7 +4,7 @@ title: Fix parallel scan batching path (implement or remove dead parameter)
 status: Done
 assignee: []
 created_date: '2026-02-18 19:52'
-updated_date: '2026-02-18 20:38'
+updated_date: '2026-02-18 20:42'
 labels:
   - performance
   - server
@@ -41,6 +41,8 @@ Updated MorphogenServer::scan_parallel caller accordingly.
 Added regression test server::tests::scan_parallel_matches_scan to keep simplified behavior explicit.
 
 2026-02-19: Addressed roborev job 784 findings by adding deprecated compatibility wrappers for the old batch-size signatures (to avoid external API breakage) while using the no-batch API internally, and by strengthening scan_parallel_matches_scan with seeded non-zero matrix data, a pending delta, and deterministic RNG.
+
+2026-02-19: Addressed roborev job 786 low findings: clarified deprecation guidance for scan_consistent_parallel_with_max_retries and added scan::tests::parallel_compat_wrapper_matches_no_batch_api to exercise deprecated wrapper parity with no-batch API.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done

@@ -423,7 +423,7 @@ pub fn scan_consistent_parallel_no_batch<K: DpfKey + Sync>(
 #[cfg(feature = "parallel")]
 #[deprecated(
     since = "0.1.0",
-    note = "batch_size is ignored; use scan_consistent_parallel_with_max_retries_no_batch instead"
+    note = "use scan_consistent_parallel_with_max_retries_no_batch instead"
 )]
 #[allow(dead_code)]
 pub fn scan_consistent_parallel_with_max_retries<K: DpfKey + Sync>(
@@ -1393,6 +1393,31 @@ mod tests {
         let parallel = pool.install(|| super::scan_main_matrix_parallel(&matrix, &keys, row_size));
 
         assert_eq!(parallel, portable);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_compat_wrapper_matches_no_batch_api() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let row_size = 4;
+        let global = make_global_state(0, 64, 32, row_size);
+        let pending = DeltaBuffer::new_with_epoch(row_size, 0);
+        pending.push(0, vec![0xAB, 0xCD, 0xEF, 0x12]).unwrap();
+
+        let mut rng = StdRng::seed_from_u64(11);
+        let key0 = AesDpfKey::new_single(&mut rng, 0);
+        let key1 = AesDpfKey::new_single(&mut rng, 1);
+        let key2 = AesDpfKey::new_single(&mut rng, 2);
+        let keys = [key0, key1, key2];
+
+        #[allow(deprecated)]
+        let compat = super::scan_consistent_parallel(&global, &pending, &keys, row_size, 32)
+            .expect("compat wrapper should succeed");
+        let no_batch = super::scan_consistent_parallel_no_batch(&global, &pending, &keys, row_size)
+            .expect("no-batch API should succeed");
+
+        assert_eq!(compat, no_batch);
     }
 }
 
