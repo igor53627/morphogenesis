@@ -554,11 +554,9 @@ impl GpuScanner {
             .map(|_| self.device.fork_default_stream())
             .collect::<Result<Vec<_>, _>>()?;
 
-        let func = if !self.kernels_optimized.is_empty() {
-            self.kernels_optimized
-                .get(&1)
-                .or_else(|| self.kernels.get(&1))
-                .expect("Kernel not found")
+        let using_optimized_batch1 = self.kernels_optimized.contains_key(&1);
+        let func = if using_optimized_batch1 {
+            self.kernels_optimized.get(&1).expect("Kernel not found")
         } else {
             self.kernels.get(&1).expect("Kernel not found")
         };
@@ -566,7 +564,7 @@ impl GpuScanner {
         let accum_bytes = 3 * PAGE_SIZE_BYTES;
         let verif_bytes_sh = 3 * 16;
         let seed_bytes = 3 * 32;
-        let mask_bytes = if !self.kernels_optimized.is_empty() {
+        let mask_bytes = if using_optimized_batch1 {
             0
         } else {
             THREADS_PER_BLOCK * 3 * 16

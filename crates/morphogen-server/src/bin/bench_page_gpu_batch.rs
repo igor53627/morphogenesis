@@ -208,21 +208,15 @@ fn parse_arg_string(args: &[String], name: &str) -> Option<String> {
 #[cfg(feature = "network")]
 fn build_state(num_pages: usize) -> Arc<AppState> {
     let total_size = num_pages * PAGE_SIZE_BYTES;
-    let matrix = Arc::new(ChunkedMatrix::new(total_size, DEFAULT_CHUNK_SIZE_BYTES));
+    let mut matrix = ChunkedMatrix::new(total_size, DEFAULT_CHUNK_SIZE_BYTES);
 
     // Fill pages with deterministic bytes so checksum is stable.
+    let mut page = vec![0u8; PAGE_SIZE_BYTES];
     for page_idx in 0..num_pages {
-        let start = page_idx * PAGE_SIZE_BYTES;
-        let chunk_idx = start / matrix.chunk_size_bytes();
-        let chunk_offset = start % matrix.chunk_size_bytes();
-        let chunk = matrix.chunk(chunk_idx);
-        let slice = &chunk.as_slice()[chunk_offset..chunk_offset + PAGE_SIZE_BYTES];
-        let slice_ptr = slice.as_ptr() as *mut u8;
-        unsafe {
-            std::slice::from_raw_parts_mut(slice_ptr, PAGE_SIZE_BYTES)
-                .fill((page_idx & 0xFF) as u8);
-        }
+        page.fill((page_idx & 0xFF) as u8);
+        matrix.write_row(page_idx, PAGE_SIZE_BYTES, &page);
     }
+    let matrix = Arc::new(matrix);
 
     let snapshot = EpochSnapshot {
         epoch_id: 1,

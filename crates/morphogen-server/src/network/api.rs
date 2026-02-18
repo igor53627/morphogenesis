@@ -428,6 +428,14 @@ fn parse_gpu_stream_count(raw: Option<&str>) -> usize {
         .clamp(DEFAULT_GPU_STREAM_COUNT, MAX_GPU_STREAM_COUNT)
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn ensure_gpu_result_count(expected: usize, actual: usize) -> Result<(), StatusCode> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
 #[cfg(feature = "cuda")]
 fn configured_gpu_stream_count() -> usize {
     let raw = std::env::var(GPU_STREAM_COUNT_ENV).ok();
@@ -858,13 +866,12 @@ pub async fn page_query_gpu_batch_handler(
                         let mut chunk_results =
                             unsafe { scanner.scan_batch_optimized(matrix, key_batch) }
                                 .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                        if chunk_results.len() != key_batch.len() {
-                            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                        }
+                        ensure_gpu_result_count(key_batch.len(), chunk_results.len())?;
                         gpu_results.append(&mut chunk_results);
                     }
                     gpu_results
                 };
+                ensure_gpu_result_count(n, gpu_results.len())?;
 
                 let snapshot2 = state.global.load();
                 let pending_epoch_after = pending.pending_epoch();
@@ -1563,5 +1570,18 @@ mod tests {
         assert_eq!(parse_gpu_stream_count(Some("0")), 1);
         assert_eq!(parse_gpu_stream_count(Some("999")), 8);
         assert_eq!(parse_gpu_stream_count(Some("bad")), 1);
+    }
+
+    #[test]
+    fn ensure_gpu_result_count_accepts_matching_lengths() {
+        assert!(ensure_gpu_result_count(4, 4).is_ok());
+    }
+
+    #[test]
+    fn ensure_gpu_result_count_rejects_mismatched_lengths() {
+        assert_eq!(
+            ensure_gpu_result_count(4, 3),
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        );
     }
 }
