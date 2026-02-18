@@ -509,6 +509,131 @@ impl GpuScanner {
         Ok(results.into_iter().next().unwrap())
     }
 
+    /// Execute queries as single-query kernel launches distributed across multiple CUDA streams.
+    ///
+    /// This avoids large in-kernel batch sizes while still providing host-side overlap.
+    pub unsafe fn scan_batch_single_query_multistream_optimized(
+        &self,
+        db: &GpuPageMatrix,
+        queries: &[[ChaChaKey; 3]],
+        stream_count: usize,
+    ) -> Result<Vec<PirResult>, DriverError> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let total_queries = queries.len();
+        let stream_count = stream_count.max(1).min(total_queries);
+        if stream_count <= 1 {
+            return self.scan_batch_optimized(db, queries);
+        }
+
+        let num_pages = db.num_pages();
+        let db_pages = db.as_slice();
+        let start = std::time::Instant::now();
+
+        // Prepare all per-query buffers on default stream first, then fork streams.
+        let mut key_slices: Vec<CudaSlice<u8>> = Vec::with_capacity(total_queries);
+        let mut out_accumulators: Vec<CudaSlice<u8>> = Vec::with_capacity(total_queries);
+        let mut out_verifiers: Vec<CudaSlice<u8>> = Vec::with_capacity(total_queries);
+        for q in queries {
+            let gpu_keys = [
+                DpfKeyGpu::from_chacha_key(&q[0]),
+                DpfKeyGpu::from_chacha_key(&q[1]),
+                DpfKeyGpu::from_chacha_key(&q[2]),
+            ];
+            key_slices.push(
+                self.device
+                    .htod_sync_copy(bytemuck::cast_slice(&gpu_keys))?,
+            );
+            out_accumulators.push(self.device.alloc_zeros::<u8>(3 * PAGE_SIZE_BYTES)?);
+            out_verifiers.push(self.device.alloc_zeros::<u8>(3 * 16)?);
+        }
+
+        let streams = (0..stream_count)
+            .map(|_| self.device.fork_default_stream())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let func = if !self.kernels_optimized.is_empty() {
+            self.kernels_optimized
+                .get(&1)
+                .or_else(|| self.kernels.get(&1))
+                .expect("Kernel not found")
+        } else {
+            self.kernels.get(&1).expect("Kernel not found")
+        };
+
+        let accum_bytes = 3 * PAGE_SIZE_BYTES;
+        let verif_bytes_sh = 3 * 16;
+        let seed_bytes = 3 * 32;
+        let mask_bytes = if !self.kernels_optimized.is_empty() {
+            0
+        } else {
+            THREADS_PER_BLOCK * 3 * 16
+        };
+        let shared_mem_bytes = accum_bytes + verif_bytes_sh + seed_bytes + mask_bytes;
+
+        let cfg = LaunchConfig {
+            grid_dim: (((num_pages + SUBTREE_SIZE - 1) / SUBTREE_SIZE) as u32, 1, 1),
+            block_dim: (THREADS_PER_BLOCK as u32, 1, 1),
+            shared_mem_bytes: shared_mem_bytes as u32,
+        };
+
+        for idx in 0..total_queries {
+            let stream = &streams[idx % stream_count];
+            let mut out_slice = out_accumulators[idx].slice_mut(..);
+            let mut verif_slice = out_verifiers[idx].slice_mut(..);
+            let params = (
+                db_pages,
+                &key_slices[idx],
+                &mut out_slice,
+                &mut verif_slice,
+                num_pages as i32,
+                1i32,
+            );
+            func.clone().launch_on_stream(stream, cfg, params)?;
+        }
+
+        // Make default stream wait on all worker streams before reclaiming buffers.
+        for stream in &streams {
+            self.device.wait_for(stream)?;
+        }
+        drop(streams);
+
+        let total_ns = start.elapsed().as_nanos() as u64;
+        let avg_ns = total_ns / total_queries as u64;
+
+        let mut results = Vec::with_capacity(total_queries);
+        for (out_acc, out_verif) in out_accumulators.into_iter().zip(out_verifiers.into_iter()) {
+            let flat_results = self.device.sync_reclaim(out_acc)?;
+            let flat_verifs = self.device.sync_reclaim(out_verif)?;
+
+            let p0 = flat_results[0..PAGE_SIZE_BYTES].to_vec();
+            let p1 = flat_results[PAGE_SIZE_BYTES..2 * PAGE_SIZE_BYTES].to_vec();
+            let p2 = flat_results[2 * PAGE_SIZE_BYTES..3 * PAGE_SIZE_BYTES].to_vec();
+
+            let v0 = flat_verifs[0..16].to_vec();
+            let v1 = flat_verifs[16..32].to_vec();
+            let v2 = flat_verifs[32..48].to_vec();
+
+            results.push(PirResult {
+                page0: p0,
+                page1: p1,
+                page2: p2,
+                verif0: v0,
+                verif1: v1,
+                verif2: v2,
+                timing: KernelTiming {
+                    dpf_eval_ns: 0,
+                    xor_accumulate_ns: 0,
+                    total_ns: avg_ns,
+                },
+            });
+        }
+
+        Ok(results)
+    }
+
     /// Execute a fused PIR scan using optimized kernels v1 (Plinko-style fast PRG).
     ///
     /// This uses the optimized CUDA kernels with:

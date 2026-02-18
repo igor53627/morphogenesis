@@ -113,6 +113,12 @@ pub struct QueryResponse {
 pub const MAX_BATCH_SIZE: usize = 32;
 #[cfg(any(feature = "cuda", test))]
 const GPU_MICRO_BATCH_SIZE: usize = 2;
+#[cfg(feature = "cuda")]
+const GPU_STREAM_COUNT_ENV: &str = "MORPHOGEN_GPU_STREAMS";
+#[cfg(any(feature = "cuda", test))]
+const DEFAULT_GPU_STREAM_COUNT: usize = 1;
+#[cfg(any(feature = "cuda", test))]
+const MAX_GPU_STREAM_COUNT: usize = 8;
 
 #[derive(Deserialize)]
 pub struct BatchQueryRequest {
@@ -413,6 +419,19 @@ fn gpu_micro_batch_ranges(total_queries: usize) -> Vec<(usize, usize)> {
         start = end;
     }
     ranges
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn parse_gpu_stream_count(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_GPU_STREAM_COUNT)
+        .clamp(DEFAULT_GPU_STREAM_COUNT, MAX_GPU_STREAM_COUNT)
+}
+
+#[cfg(feature = "cuda")]
+fn configured_gpu_stream_count() -> usize {
+    let raw = std::env::var(GPU_STREAM_COUNT_ENV).ok();
+    parse_gpu_stream_count(raw.as_deref())
 }
 
 fn collect_gpu_page_refs<'a>(matrix: &'a morphogen_storage::ChunkedMatrix) -> Vec<&'a [u8]> {
@@ -822,17 +841,30 @@ pub async fn page_query_gpu_batch_handler(
                     continue;
                 }
 
-                let mut gpu_results = Vec::with_capacity(n);
-                for (start, end) in gpu_micro_batch_ranges(n) {
-                    let key_batch = &all_keys[start..end];
-                    let mut chunk_results =
-                        unsafe { scanner.scan_batch_optimized(matrix, key_batch) }
-                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                    if chunk_results.len() != key_batch.len() {
-                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                let stream_count = configured_gpu_stream_count();
+                let gpu_results = if stream_count > 1 {
+                    unsafe {
+                        scanner.scan_batch_single_query_multistream_optimized(
+                            matrix,
+                            &all_keys,
+                            stream_count,
+                        )
                     }
-                    gpu_results.append(&mut chunk_results);
-                }
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+                } else {
+                    let mut gpu_results = Vec::with_capacity(n);
+                    for (start, end) in gpu_micro_batch_ranges(n) {
+                        let key_batch = &all_keys[start..end];
+                        let mut chunk_results =
+                            unsafe { scanner.scan_batch_optimized(matrix, key_batch) }
+                                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                        if chunk_results.len() != key_batch.len() {
+                            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                        }
+                        gpu_results.append(&mut chunk_results);
+                    }
+                    gpu_results
+                };
 
                 let snapshot2 = state.global.load();
                 let pending_epoch_after = pending.pending_epoch();
@@ -1515,5 +1547,21 @@ mod tests {
             covered.extend(start..end);
         }
         assert_eq!(covered, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn parse_gpu_stream_count_supports_required_values() {
+        assert_eq!(parse_gpu_stream_count(Some("1")), 1);
+        assert_eq!(parse_gpu_stream_count(Some("2")), 2);
+        assert_eq!(parse_gpu_stream_count(Some("4")), 4);
+        assert_eq!(parse_gpu_stream_count(Some("8")), 8);
+    }
+
+    #[test]
+    fn parse_gpu_stream_count_defaults_and_clamps() {
+        assert_eq!(parse_gpu_stream_count(None), 1);
+        assert_eq!(parse_gpu_stream_count(Some("0")), 1);
+        assert_eq!(parse_gpu_stream_count(Some("999")), 8);
+        assert_eq!(parse_gpu_stream_count(Some("bad")), 1);
     }
 }
