@@ -4,12 +4,17 @@ title: WASM build for browser integration
 status: Done
 assignee: []
 created_date: '2026-02-03 14:38'
-updated_date: '2026-02-18 08:34'
+updated_date: '2026-02-18 09:08'
 labels:
   - rpc
   - research
   - wasm
 dependencies: []
+references:
+  - c9264ec - initial wasm gateway implementation (roborev job 748 addressed)
+  - 167033a - passthrough/block-tag hardening (roborev job 751 addressed)
+  - 3623013 - demo fallback tests + docs alignment (roborev job 754 addressed)
+  - 227319f - demo method validation hardening (roborev job 755 clean)
 priority: low
 ---
 
@@ -59,7 +64,7 @@ MVP: ship a browser-runnable privacy gateway so wallet extensions can call Morph
 ## Implementation Notes
 
 <!-- SECTION:NOTES:BEGIN -->
-Implemented new crates/morphogen-wasm-gateway with wasm-bindgen EIP-1193 request({method,params}) API. Added private routing for eth_getBalance/eth_getTransactionCount/eth_getStorageAt/eth_getCode via morphogen-client PIR + CodeResolver; passthrough for eth_chainId/eth_blockNumber/eth_gasPrice plus safe read-only fallback. Added JSON-RPC error mapping tests and wasm harness tests with wasm-bindgen-test (run via wasm-pack test --node). Added demo integration under examples/wasm-gateway (provider bridge + page) and docs/WASM_GATEWAY.md with setup, method matrix, CORS, non-goals. Verified: cargo test -p morphogen-wasm-gateway; cargo build -p morphogen-wasm-gateway --target wasm32-unknown-unknown; cargo build -p morphogen-client --target wasm32-unknown-unknown; wasm-pack test --node crates/morphogen-wasm-gateway.
+All roborev findings addressed. Final review job 755 reported no issues.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
