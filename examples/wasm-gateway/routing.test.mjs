@@ -68,3 +68,25 @@ test("non -32601 gateway errors do not fallback", async () => {
 
   assert.deepEqual(calls, ["gateway"]);
 });
+
+test("non-string method returns validation error", async () => {
+  await assert.rejects(
+    requestWithGatewayFallback({
+      payload: { method: 123, params: [] },
+      gatewayRequest: async () => "gateway",
+      walletRequest: async () => "wallet",
+    }),
+    /request payload must include method/,
+  );
+});
+
+test("missing wallet provider fails for wallet-owned methods", async () => {
+  await assert.rejects(
+    requestWithGatewayFallback({
+      payload: { method: "eth_accounts", params: [] },
+      gatewayRequest: async () => ["0xabc"],
+      walletRequest: undefined,
+    }),
+    /No base provider available for method eth_accounts/,
+  );
+});

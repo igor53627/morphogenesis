@@ -32,6 +32,10 @@ export const WALLET_OWNED_METHODS = new Set([
 ]);
 
 export function shouldRouteToGateway(method) {
+  if (typeof method !== "string" || method.length === 0) {
+    return false;
+  }
+
   if (PRIVATE_METHODS.has(method) || BASE_PASSTHROUGH_METHODS.has(method)) {
     return true;
   }
@@ -50,7 +54,7 @@ export async function requestWithGatewayFallback({
   onFallback,
 }) {
   const method = payload?.method;
-  if (!method) {
+  if (typeof method !== "string" || method.length === 0) {
     throw new Error("request payload must include method");
   }
 
