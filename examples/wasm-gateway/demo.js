@@ -13,6 +13,26 @@ const BASE_PASSTHROUGH_METHODS = new Set([
   "eth_gasPrice",
 ]);
 
+const WALLET_OWNED_METHODS = new Set([
+  "eth_accounts",
+  "eth_requestAccounts",
+  "eth_sendTransaction",
+  "eth_sendRawTransaction",
+  "eth_sign",
+  "eth_signTransaction",
+  "personal_sign",
+  "eth_subscribe",
+  "eth_unsubscribe",
+  "eth_newFilter",
+  "eth_newBlockFilter",
+  "eth_newPendingTransactionFilter",
+  "eth_uninstallFilter",
+  "eth_getFilterChanges",
+  "eth_getFilterLogs",
+  "eth_submitWork",
+  "eth_submitHashrate",
+]);
+
 const outputEl = document.getElementById("output");
 let gateway;
 let routedProvider;
@@ -29,9 +49,11 @@ function shouldRouteToGateway(method) {
   if (PRIVATE_METHODS.has(method) || BASE_PASSTHROUGH_METHODS.has(method)) {
     return true;
   }
-  if (method.startsWith("eth_send") || method.startsWith("eth_sign")) {
+
+  if (WALLET_OWNED_METHODS.has(method)) {
     return false;
   }
+
   return method.startsWith("eth_") || method.startsWith("net_") || method.startsWith("web3_");
 }
 
@@ -57,7 +79,15 @@ function installProviderBridge() {
       }
 
       if (shouldRouteToGateway(method)) {
-        return gateway.request(payload);
+        try {
+          return await gateway.request(payload);
+        } catch (error) {
+          if (error?.code === -32601 && existing) {
+            log(`Gateway does not support ${method}; falling back to wallet provider.`);
+            return existing(payload);
+          }
+          throw error;
+        }
       }
 
       if (!existing) {

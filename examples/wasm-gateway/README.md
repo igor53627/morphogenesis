@@ -4,7 +4,7 @@ This demo builds the `morphogen-wasm-gateway` package and installs a provider br
 
 - Private methods to PIR/CAS via WASM (`eth_getBalance`, `eth_getTransactionCount`, `eth_getStorageAt`, `eth_getCode`)
 - Base passthrough methods to upstream via WASM (`eth_chainId`, `eth_blockNumber`, `eth_gasPrice`)
-- Unsupported/unsafe methods to the original wallet provider (if present)
+- Unsupported/unsafe methods to the original wallet provider (if present, including fallback on gateway `-32601`)
 
 ## Run
 

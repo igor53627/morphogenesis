@@ -47,10 +47,10 @@ const balance = await gateway.request({
 
 | Method | Route | Notes |
 |---|---|---|
-| `eth_getBalance` | Private PIR | Never proxied upstream |
-| `eth_getTransactionCount` | Private PIR | Never proxied upstream |
-| `eth_getStorageAt` | Private PIR | Never proxied upstream |
-| `eth_getCode` | Private PIR + Dictionary + CAS | Never proxied upstream |
+| `eth_getBalance` | Private PIR | Never proxied upstream; only `latest` block tag currently supported |
+| `eth_getTransactionCount` | Private PIR | Never proxied upstream; only `latest` block tag currently supported |
+| `eth_getStorageAt` | Private PIR | Never proxied upstream; only `latest` block tag currently supported |
+| `eth_getCode` | Private PIR + Dictionary + CAS | Never proxied upstream; only `latest` block tag currently supported |
 | `eth_chainId` | Upstream passthrough | Browser fetch JSON-RPC |
 | `eth_blockNumber` | Upstream passthrough | Browser fetch JSON-RPC |
 | `eth_gasPrice` | Upstream passthrough | Browser fetch JSON-RPC |

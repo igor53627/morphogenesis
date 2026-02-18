@@ -15,7 +15,38 @@ const PRIVATE_METHODS: &[&str] = &[
     "eth_getCode",
 ];
 
-const BASE_PASSTHROUGH_METHODS: &[&str] = &["eth_chainId", "eth_blockNumber", "eth_gasPrice"];
+const SAFE_READ_ONLY_PASSTHROUGH_METHODS: &[&str] = &[
+    "eth_chainId",
+    "eth_blockNumber",
+    "eth_gasPrice",
+    "eth_call",
+    "eth_estimateGas",
+    "eth_feeHistory",
+    "eth_maxPriorityFeePerGas",
+    "eth_blobBaseFee",
+    "eth_syncing",
+    "eth_coinbase",
+    "eth_mining",
+    "eth_hashrate",
+    "eth_getBlockByHash",
+    "eth_getBlockByNumber",
+    "eth_getBlockTransactionCountByHash",
+    "eth_getBlockTransactionCountByNumber",
+    "eth_getUncleByBlockHashAndIndex",
+    "eth_getUncleByBlockNumberAndIndex",
+    "eth_getUncleCountByBlockHash",
+    "eth_getUncleCountByBlockNumber",
+    "eth_getTransactionByHash",
+    "eth_getTransactionByBlockHashAndIndex",
+    "eth_getTransactionByBlockNumberAndIndex",
+    "eth_getTransactionReceipt",
+    "eth_getLogs",
+    "net_version",
+    "net_listening",
+    "net_peerCount",
+    "web3_clientVersion",
+    "web3_sha3",
+];
 
 const UNSAFE_METHODS: &[&str] = &[
     "eth_sendRawTransaction",
@@ -33,6 +64,8 @@ const UNSAFE_METHODS: &[&str] = &[
     "eth_uninstallFilter",
     "eth_getFilterChanges",
     "eth_getFilterLogs",
+    "eth_submitWork",
+    "eth_submitHashrate",
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -131,12 +164,14 @@ where
             "eth_getBalance" => {
                 let args = expect_params_array(method, &params, 1)?;
                 let address = parse_address(&args[0])?;
+                validate_private_block_param(method, args.get(1))?;
                 let balance = self.private_api.get_balance(address).await?;
                 Ok(Value::String(format!("0x{:x}", balance)))
             }
             "eth_getTransactionCount" => {
                 let args = expect_params_array(method, &params, 1)?;
                 let address = parse_address(&args[0])?;
+                validate_private_block_param(method, args.get(1))?;
                 let nonce = self.private_api.get_transaction_count(address).await?;
                 Ok(Value::String(format!("0x{:x}", nonce)))
             }
@@ -144,12 +179,14 @@ where
                 let args = expect_params_array(method, &params, 2)?;
                 let address = parse_address(&args[0])?;
                 let slot = parse_storage_slot(&args[1])?;
+                validate_private_block_param(method, args.get(2))?;
                 let value = self.private_api.get_storage_at(address, slot).await?;
                 Ok(Value::String(format!("0x{}", hex::encode(value))))
             }
             "eth_getCode" => {
                 let args = expect_params_array(method, &params, 1)?;
                 let address = parse_address(&args[0])?;
+                validate_private_block_param(method, args.get(1))?;
                 let code = self.private_api.get_code(address).await?;
                 Ok(Value::String(format!("0x{}", hex::encode(code))))
             }
@@ -223,24 +260,37 @@ fn parse_storage_slot(value: &Value) -> Result<[u8; 32], GatewayError> {
     Ok(slot)
 }
 
+fn validate_private_block_param(
+    method: &str,
+    block_param: Option<&Value>,
+) -> Result<(), GatewayError> {
+    let Some(block_param) = block_param else {
+        return Ok(());
+    };
+
+    if block_param.is_null() {
+        return Ok(());
+    }
+
+    let tag = block_param.as_str().ok_or_else(|| {
+        GatewayError::invalid_params(format!("{method} block parameter must be a string tag"))
+    })?;
+
+    if tag.eq_ignore_ascii_case("latest") {
+        return Ok(());
+    }
+
+    Err(GatewayError::invalid_params(format!(
+        "{method} currently supports only \"latest\" block tag"
+    )))
+}
+
 pub fn is_safe_read_only_passthrough(method: &str) -> bool {
     if PRIVATE_METHODS.contains(&method) || UNSAFE_METHODS.contains(&method) {
         return false;
     }
 
-    if BASE_PASSTHROUGH_METHODS.contains(&method) {
-        return true;
-    }
-
-    if method.starts_with("eth_send")
-        || method.starts_with("eth_sign")
-        || method.starts_with("personal_")
-        || method.starts_with("wallet_")
-    {
-        return false;
-    }
-
-    method.starts_with("eth_") || method.starts_with("net_") || method.starts_with("web3_")
+    SAFE_READ_ONLY_PASSTHROUGH_METHODS.contains(&method)
 }
 
 pub struct PirPrivateApi {
@@ -704,6 +754,79 @@ mod tests {
             .expect_err("write method should be rejected");
 
         assert_eq!(err.code, -32601);
+        assert!(log.private.borrow().is_empty());
+        assert!(log.upstream.borrow().is_empty());
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    async fn unsafe_submit_methods_are_rejected() {
+        let (gateway, log) = build_gateway(None);
+
+        let submit_work = gateway
+            .request_json("eth_submitWork", serde_json::json!(["0x1", "0x2", "0x3"]))
+            .await
+            .expect_err("eth_submitWork should be rejected");
+        let submit_hashrate = gateway
+            .request_json(
+                "eth_submitHashrate",
+                serde_json::json!(["0x1", "0x1234567890abcdef"]),
+            )
+            .await
+            .expect_err("eth_submitHashrate should be rejected");
+
+        assert_eq!(submit_work.code, -32601);
+        assert_eq!(submit_hashrate.code, -32601);
+        assert!(log.private.borrow().is_empty());
+        assert!(log.upstream.borrow().is_empty());
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    async fn account_methods_are_not_passthrough() {
+        let (gateway, log) = build_gateway(None);
+        let err = gateway
+            .request_json("eth_accounts", serde_json::json!([]))
+            .await
+            .expect_err("eth_accounts should not route through gateway");
+
+        assert_eq!(err.code, -32601);
+        assert!(log.private.borrow().is_empty());
+        assert!(log.upstream.borrow().is_empty());
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    async fn non_latest_private_block_tag_is_rejected() {
+        let (gateway, log) = build_gateway(None);
+        let err = gateway
+            .request_json(
+                "eth_getBalance",
+                serde_json::json!([sample_address(), "0x10"]),
+            )
+            .await
+            .expect_err("historical block tags are not currently supported");
+
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("only \"latest\""));
+        assert!(log.private.borrow().is_empty());
+        assert!(log.upstream.borrow().is_empty());
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    async fn non_latest_storage_block_tag_is_rejected() {
+        let (gateway, log) = build_gateway(None);
+        let err = gateway
+            .request_json(
+                "eth_getStorageAt",
+                serde_json::json!([sample_address(), "0x01", "earliest"]),
+            )
+            .await
+            .expect_err("historical storage block tags are not currently supported");
+
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("only \"latest\""));
         assert!(log.private.borrow().is_empty());
         assert!(log.upstream.borrow().is_empty());
     }
