@@ -42,6 +42,7 @@ cargo run -p morphogen-rpc-adapter -- \
 ## Development Workflow
 
 Required tooling/hooks are documented in [.mandatory-tooling](.mandatory-tooling). Task tracking lives in [backlog/](backlog/) and reviews are managed with `roborev`.
+Every code or docs change must update the related backlog task status/notes before merge.
 
 ## Deterministic E2E
 
@@ -61,6 +62,7 @@ crates/
 ├── morphogen-storage/     # AlignedMatrix, ChunkedMatrix storage primitives
 ├── morphogen-server/      # Scan kernel, HTTP/WebSocket server, benchmarks
 ├── morphogen-client/      # PIR client with network layer, caching, batch aggregation
+├── morphogen-wasm-gateway/ # Browser EIP-1193 facade (WASM, private reads + passthrough)
 ├── morphogen-rpc-adapter/ # JSON-RPC proxy: private methods via PIR, passthrough to upstream
 └── reth-adapter/          # Reth integration for mainnet snapshot ETL
 ```
@@ -78,6 +80,13 @@ The adapter runs on `:8545` as a drop-in replacement for standard Ethereum RPC p
 | Relay | `eth_sendRawTransaction` | Flashbots Protect |
 | Passthrough | `eth_blockNumber`, `eth_chainId`, `eth_gasPrice`, `eth_getBlockByNumber`, etc. | Forwarded to upstream |
 
+## Browser WASM Gateway
+
+For browser-first EIP-1193 integration (without a localhost proxy), see:
+
+- [WASM Gateway Guide](docs/WASM_GATEWAY.md)
+- [WASM Demo Integration](examples/wasm-gateway/README.md)
+
 ## Features
 
 - `avx512` - Enable AVX-512 SIMD optimizations
@@ -90,6 +99,7 @@ The adapter runs on `:8545` as a drop-in replacement for standard Ethereum RPC p
 - [Protocol & Architecture](docs/morphogenesis_protocol.md) - v5.0
 - [Paper (LaTeX)](docs/paper/morphogenesis.pdf) - Academic paper
 - [Performance](docs/PERFORMANCE.md) - Benchmark results and analysis
+- [WASM Gateway](docs/WASM_GATEWAY.md) - Browser setup, method matrix, CORS, and MVP limits
 - [Profiling Guide](docs/PROFILING_GUIDE.md) - How to profile scan engines
 - [Cryptography](docs/CRYPTOGRAPHY.md) - Fused kernel and DPF internals
 - [Crypto Analysis](docs/CRYPTO_ANALYSIS.md) - ChaCha8 vs AES on GPUs

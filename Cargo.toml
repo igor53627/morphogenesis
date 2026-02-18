@@ -8,5 +8,6 @@
      "crates/morphogen-server",
      "crates/reth-adapter",
      "crates/morphogen-rpc-adapter",
+     "crates/morphogen-wasm-gateway",
  ]
  resolver = "2"

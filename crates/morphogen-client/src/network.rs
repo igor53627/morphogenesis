@@ -11,7 +11,9 @@ use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(not(target_arch = "wasm32"))]
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 2;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
@@ -143,22 +145,31 @@ pub struct PirClient {
 
 /// Determines whether a reqwest error is transient and worth retrying.
 fn is_transient(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout()
+    #[cfg(target_arch = "wasm32")]
+    {
+        err.is_timeout()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        err.is_connect() || err.is_timeout()
+    }
 }
 
 impl PirClient {
     pub fn new(server_a_url: String, server_b_url: String) -> Self {
-        let http_client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder();
+        #[cfg(not(target_arch = "wasm32"))]
+        let builder = builder
             .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-            .timeout(DEFAULT_REQUEST_TIMEOUT)
-            .build()
-            .unwrap_or_else(|e| {
-                warn!(
-                    "Failed to build HTTP client with timeouts ({}), using defaults",
-                    e
-                );
-                reqwest::Client::new()
-            });
+            .timeout(DEFAULT_REQUEST_TIMEOUT);
+
+        let http_client = builder.build().unwrap_or_else(|e| {
+            warn!(
+                "Failed to build HTTP client with timeouts ({}), using defaults",
+                e
+            );
+            reqwest::Client::new()
+        });
 
         Self {
             server_a_url,
