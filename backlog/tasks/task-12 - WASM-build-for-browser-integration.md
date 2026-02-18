@@ -4,7 +4,7 @@ title: WASM build for browser integration
 status: Done
 assignee: []
 created_date: '2026-02-03 14:38'
-updated_date: '2026-02-18 09:08'
+updated_date: '2026-02-18 18:39'
 labels:
   - rpc
   - research
@@ -65,6 +65,8 @@ MVP: ship a browser-runnable privacy gateway so wallet extensions can call Morph
 
 <!-- SECTION:NOTES:BEGIN -->
 All roborev findings addressed. Final review job 755 reported no issues.
+
+2026-02-18: Added direct README pointer to docs/WASM_GATEWAY.md and examples/wasm-gateway/README.md for faster discovery of browser setup docs.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done

@@ -80,6 +80,13 @@ The adapter runs on `:8545` as a drop-in replacement for standard Ethereum RPC p
 | Relay | `eth_sendRawTransaction` | Flashbots Protect |
 | Passthrough | `eth_blockNumber`, `eth_chainId`, `eth_gasPrice`, `eth_getBlockByNumber`, etc. | Forwarded to upstream |
 
+## Browser WASM Gateway
+
+For browser-first EIP-1193 integration (without a localhost proxy), see:
+
+- [WASM Gateway Guide](docs/WASM_GATEWAY.md)
+- [WASM Demo Integration](examples/wasm-gateway/README.md)
+
 ## Features
 
 - `avx512` - Enable AVX-512 SIMD optimizations
