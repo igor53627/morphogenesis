@@ -490,32 +490,39 @@ pub fn scan_main_matrix_parallel<K: DpfKey + Sync>(
     let chunk_size = matrix.chunk_size_bytes();
     let num_chunks = matrix.num_chunks();
 
-    let partial_results: Vec<[Vec<u8>; 3]> = (0..num_chunks)
+    (0..num_chunks)
         .into_par_iter()
-        .map(|chunk_idx| {
-            let chunk = &chunks[chunk_idx];
-            let chunk_len = matrix.chunk_size(chunk_idx);
-            let rows_in_chunk = chunk_len / row_size_bytes;
-            let global_row_start = chunk_idx * (chunk_size / row_size_bytes);
+        .fold(
+            || empty_result(row_size_bytes),
+            |mut acc, chunk_idx| {
+                let chunk = &chunks[chunk_idx];
+                let chunk_len = matrix.chunk_size(chunk_idx);
+                let rows_in_chunk = chunk_len / row_size_bytes;
+                let global_row_start = chunk_idx * (chunk_size / row_size_bytes);
 
-            scan_chunk_avx512(
-                chunk.as_ptr(),
-                rows_in_chunk,
-                global_row_start,
-                keys,
-                row_size_bytes,
-            )
-        })
-        .collect();
+                let partial = scan_chunk_avx512(
+                    chunk.as_ptr(),
+                    rows_in_chunk,
+                    global_row_start,
+                    keys,
+                    row_size_bytes,
+                );
 
-    let mut results = empty_result(row_size_bytes);
-    for partial in partial_results {
-        xor_into(&mut results[0], &partial[0]);
-        xor_into(&mut results[1], &partial[1]);
-        xor_into(&mut results[2], &partial[2]);
-    }
-
-    results
+                xor_into(&mut acc[0], &partial[0]);
+                xor_into(&mut acc[1], &partial[1]);
+                xor_into(&mut acc[2], &partial[2]);
+                acc
+            },
+        )
+        .reduce(
+            || empty_result(row_size_bytes),
+            |mut left, right| {
+                xor_into(&mut left[0], &right[0]);
+                xor_into(&mut left[1], &right[1]);
+                xor_into(&mut left[2], &right[2]);
+                left
+            },
+        )
 }
 
 #[cfg(feature = "parallel")]
@@ -1340,6 +1347,30 @@ mod tests {
         assert!(result.is_ok(), "scan should succeed when epochs match");
         let (_, epoch) = result.unwrap();
         assert_eq!(epoch, 5);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_scan_matches_portable_across_chunks() {
+        let row_size = 48;
+        let rows = 97;
+        let chunk_rows = 7;
+        let chunk_size = row_size * chunk_rows;
+        let total_size = row_size * rows;
+
+        let mut matrix = ChunkedMatrix::new(total_size, chunk_size);
+        matrix.fill_with_pattern(0xC0FFEE);
+
+        let mut rng = rand::thread_rng();
+        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 3);
+        let (key1, _) = AesDpfKey::generate_pair(&mut rng, rows / 2);
+        let (key2, _) = AesDpfKey::generate_pair(&mut rng, rows - 1);
+        let keys = [key0, key1, key2];
+
+        let portable = super::scan_main_matrix_portable(&matrix, &keys, rows, row_size);
+        let parallel = super::scan_main_matrix_parallel(&matrix, &keys, row_size);
+
+        assert_eq!(parallel, portable);
     }
 }
 
