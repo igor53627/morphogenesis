@@ -1368,7 +1368,11 @@ mod tests {
         let keys = [key0, key1, key2];
 
         let portable = super::scan_main_matrix_portable(&matrix, &keys, rows, row_size);
-        let parallel = super::scan_main_matrix_parallel(&matrix, &keys, row_size);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("build rayon thread pool");
+        let parallel = pool.install(|| super::scan_main_matrix_parallel(&matrix, &keys, row_size));
 
         assert_eq!(parallel, portable);
     }

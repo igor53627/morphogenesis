@@ -4,7 +4,7 @@ title: Optimize parallel scan reduction to avoid extra allocations
 status: Done
 assignee: []
 created_date: '2026-02-18 19:51'
-updated_date: '2026-02-18 19:59'
+updated_date: '2026-02-18 20:18'
 labels:
   - performance
   - server
@@ -41,6 +41,8 @@ Benchmark (dev profile, same command before/after):
   Before: scan_ms=3218, gb_per_sec=0.58
   After:  scan_ms=3240, gb_per_sec=0.58
 Observed latency/throughput difference is within noise; structural allocation reduction landed as intended.
+
+2026-02-19: Addressed roborev job 776 low finding by forcing parallel equivalence test to run inside a dedicated Rayon thread pool (num_threads=2), ensuring fold/reduce combiner path coverage in CI.
 <!-- SECTION:NOTES:END -->
 
 ## Definition of Done
