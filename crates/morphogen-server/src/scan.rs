@@ -390,31 +390,75 @@ pub fn scan_delta_for_gpu(
 }
 
 #[cfg(feature = "parallel")]
+/// Backward-compatible parallel scan entrypoint.
+///
+/// The `batch_size` argument is retained only for API compatibility and is ignored.
+/// New call sites should use [`scan_consistent_parallel_no_batch`] directly.
+#[deprecated(
+    since = "0.1.0",
+    note = "batch_size is ignored; use scan_consistent_parallel_no_batch instead"
+)]
 pub fn scan_consistent_parallel<K: DpfKey + Sync>(
     global: &GlobalState,
     pending: &DeltaBuffer,
     keys: &[K; 3],
     row_size_bytes: usize,
-    batch_size: usize,
+    _batch_size: usize,
 ) -> Result<([Vec<u8>; 3], u64), ScanError> {
-    scan_consistent_parallel_with_max_retries(
+    scan_consistent_parallel_no_batch(global, pending, keys, row_size_bytes)
+}
+
+#[cfg(feature = "parallel")]
+/// Preferred parallel scan entrypoint without unused batching knobs.
+pub fn scan_consistent_parallel_no_batch<K: DpfKey + Sync>(
+    global: &GlobalState,
+    pending: &DeltaBuffer,
+    keys: &[K; 3],
+    row_size_bytes: usize,
+) -> Result<([Vec<u8>; 3], u64), ScanError> {
+    scan_consistent_parallel_with_max_retries_no_batch(
         global,
         pending,
         keys,
         row_size_bytes,
         DEFAULT_MAX_RETRIES,
-        batch_size,
     )
 }
 
 #[cfg(feature = "parallel")]
+/// Backward-compatible retry variant.
+///
+/// This wrapper is kept to avoid breaking external callers while migrating to
+/// [`scan_consistent_parallel_with_max_retries_no_batch`].
+#[deprecated(
+    since = "0.1.0",
+    note = "use scan_consistent_parallel_with_max_retries_no_batch instead"
+)]
+#[allow(dead_code)]
 pub fn scan_consistent_parallel_with_max_retries<K: DpfKey + Sync>(
     global: &GlobalState,
     pending: &DeltaBuffer,
     keys: &[K; 3],
     row_size_bytes: usize,
     max_retries: usize,
-    batch_size: usize,
+) -> Result<([Vec<u8>; 3], u64), ScanError> {
+    scan_consistent_parallel_with_max_retries_no_batch(
+        global,
+        pending,
+        keys,
+        row_size_bytes,
+        max_retries,
+    )
+}
+
+#[cfg(feature = "parallel")]
+/// Preferred retrying parallel scan variant without batch-size compatibility args.
+pub fn scan_consistent_parallel_with_max_retries_no_batch<K: DpfKey + Sync>(
+    global: &GlobalState,
+    pending: &DeltaBuffer,
+    keys: &[K; 3],
+    row_size_bytes: usize,
+    max_retries: usize,
 ) -> Result<([Vec<u8>; 3], u64), ScanError> {
     for attempt in 0..max_retries {
         let snapshot1 = global.load();
@@ -426,12 +470,8 @@ pub fn scan_consistent_parallel_with_max_retries<K: DpfKey + Sync>(
 
         let snapshot2 = global.load();
         if snapshot2.epoch_id == epoch1 && pending_epoch == epoch1 {
-            let mut results = scan_main_matrix_parallel_batched(
-                snapshot1.matrix.as_ref(),
-                keys,
-                row_size_bytes,
-                batch_size,
-            );
+            let mut results =
+                scan_main_matrix_parallel(snapshot1.matrix.as_ref(), keys, row_size_bytes);
             for entry in &entries {
                 for (k, key) in keys.iter().enumerate() {
                     if key.eval_bit(entry.row_idx) {
@@ -462,18 +502,6 @@ fn empty_result(row_size_bytes: usize) -> [Vec<u8>; 3] {
 }
 
 #[cfg(feature = "parallel")]
-pub fn scan_main_matrix_parallel_batched<K: DpfKey + Sync>(
-    matrix: &ChunkedMatrix,
-    keys: &[K; 3],
-    row_size_bytes: usize,
-    batch_size: usize,
-) -> [Vec<u8>; 3] {
-    // TODO: Implement actual batched processing
-    // For now, delegate to single-query parallel scan
-    scan_main_matrix_parallel(matrix, keys, row_size_bytes)
-}
-
-#[cfg(feature = "parallel")]
 pub fn scan_main_matrix_parallel<K: DpfKey + Sync>(
     matrix: &ChunkedMatrix,
     keys: &[K; 3],
@@ -490,32 +518,39 @@ pub fn scan_main_matrix_parallel<K: DpfKey + Sync>(
     let chunk_size = matrix.chunk_size_bytes();
     let num_chunks = matrix.num_chunks();
 
-    let partial_results: Vec<[Vec<u8>; 3]> = (0..num_chunks)
+    (0..num_chunks)
         .into_par_iter()
-        .map(|chunk_idx| {
-            let chunk = &chunks[chunk_idx];
-            let chunk_len = matrix.chunk_size(chunk_idx);
-            let rows_in_chunk = chunk_len / row_size_bytes;
-            let global_row_start = chunk_idx * (chunk_size / row_size_bytes);
+        .fold(
+            || empty_result(row_size_bytes),
+            |mut acc, chunk_idx| {
+                let chunk = &chunks[chunk_idx];
+                let chunk_len = matrix.chunk_size(chunk_idx);
+                let rows_in_chunk = chunk_len / row_size_bytes;
+                let global_row_start = chunk_idx * (chunk_size / row_size_bytes);
 
-            scan_chunk_avx512(
-                chunk.as_ptr(),
-                rows_in_chunk,
-                global_row_start,
-                keys,
-                row_size_bytes,
-            )
-        })
-        .collect();
+                let partial = scan_chunk_avx512(
+                    chunk.as_ptr(),
+                    rows_in_chunk,
+                    global_row_start,
+                    keys,
+                    row_size_bytes,
+                );
 
-    let mut results = empty_result(row_size_bytes);
-    for partial in partial_results {
-        xor_into(&mut results[0], &partial[0]);
-        xor_into(&mut results[1], &partial[1]);
-        xor_into(&mut results[2], &partial[2]);
-    }
-
-    results
+                xor_into(&mut acc[0], &partial[0]);
+                xor_into(&mut acc[1], &partial[1]);
+                xor_into(&mut acc[2], &partial[2]);
+                acc
+            },
+        )
+        .reduce(
+            || empty_result(row_size_bytes),
+            |mut left, right| {
+                xor_into(&mut left[0], &right[0]);
+                xor_into(&mut left[1], &right[1]);
+                xor_into(&mut left[2], &right[2]);
+                left
+            },
+        )
 }
 
 #[cfg(feature = "parallel")]
@@ -1340,6 +1375,59 @@ mod tests {
         assert!(result.is_ok(), "scan should succeed when epochs match");
         let (_, epoch) = result.unwrap();
         assert_eq!(epoch, 5);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_scan_matches_portable_across_chunks() {
+        let row_size = 48;
+        let rows = 97;
+        let chunk_rows = 7;
+        let chunk_size = row_size * chunk_rows;
+        let total_size = row_size * rows;
+
+        let mut matrix = ChunkedMatrix::new(total_size, chunk_size);
+        matrix.fill_with_pattern(0xC0FFEE);
+
+        let mut rng = rand::thread_rng();
+        let (key0, _) = AesDpfKey::generate_pair(&mut rng, 3);
+        let (key1, _) = AesDpfKey::generate_pair(&mut rng, rows / 2);
+        let (key2, _) = AesDpfKey::generate_pair(&mut rng, rows - 1);
+        let keys = [key0, key1, key2];
+
+        let portable = super::scan_main_matrix_portable(&matrix, &keys, rows, row_size);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .expect("build rayon thread pool");
+        let parallel = pool.install(|| super::scan_main_matrix_parallel(&matrix, &keys, row_size));
+
+        assert_eq!(parallel, portable);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn parallel_compat_wrapper_matches_no_batch_api() {
+        use rand::{rngs::StdRng, SeedableRng};
+
+        let row_size = 4;
+        let global = make_global_state(0, 64, 32, row_size);
+        let pending = DeltaBuffer::new_with_epoch(row_size, 0);
+        pending.push(0, vec![0xAB, 0xCD, 0xEF, 0x12]).unwrap();
+
+        let mut rng = StdRng::seed_from_u64(11);
+        let key0 = AesDpfKey::new_single(&mut rng, 0);
+        let key1 = AesDpfKey::new_single(&mut rng, 1);
+        let key2 = AesDpfKey::new_single(&mut rng, 2);
+        let keys = [key0, key1, key2];
+
+        #[allow(deprecated)]
+        let compat = super::scan_consistent_parallel(&global, &pending, &keys, row_size, 32)
+            .expect("compat wrapper should succeed");
+        let no_batch = super::scan_consistent_parallel_no_batch(&global, &pending, &keys, row_size)
+            .expect("no-batch API should succeed");
+
+        assert_eq!(compat, no_batch);
     }
 }
 
