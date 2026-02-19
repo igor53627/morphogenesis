@@ -92,6 +92,7 @@ To mitigate adaptive leakage, we employ **Parallel Retrieval**. For target accou
 | POST | `/query/batch` | Batch PIR (up to `MAX_BATCH_SIZE` queries) |
 | POST | `/query/page` | Page-level PIR (3 PageDPF keys -> 3 pages) |
 | POST | `/query/page/gpu` | GPU page query (ChaChaKey) |
+| POST | `/query/page/gpu/batch` | Batched GPU page query (up to `MAX_BATCH_SIZE` queries) |
 
 **WebSocket Endpoints:**
 

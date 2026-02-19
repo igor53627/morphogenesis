@@ -1163,6 +1163,12 @@ mod gpu_query {
         format!(r#"{{"keys":["{hex0}","{hex0}","{hex0}"]}}"#)
     }
 
+    fn test_chacha_key_hex(target: usize) -> String {
+        let params = ChaChaParams::new(8).unwrap();
+        let (k0, _k1) = generate_chacha_dpf_keys(&params, target).unwrap();
+        format!("0x{}", hex::encode(k0.to_bytes()))
+    }
+
     #[tokio::test]
     async fn gpu_query_returns_correct_pages_cpu_fallback() {
         let state = test_state_for_gpu();
@@ -1211,6 +1217,131 @@ mod gpu_query {
                 Request::builder()
                     .method(Method::POST)
                     .uri("/query/page/gpu")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn gpu_batch_query_returns_results_in_request_order_cpu_fallback() {
+        let state = test_state_for_gpu();
+        let app = create_router(state);
+
+        let key_a = test_chacha_key_hex(42);
+        let key_b = test_chacha_key_hex(11);
+        let batch_body = format!(
+            r#"{{"queries":[{{"keys":["{a}","{a}","{a}"]}},{{"keys":["{b}","{b}","{b}"]}}]}}"#,
+            a = key_a,
+            b = key_b
+        );
+
+        let batch_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query/page/gpu/batch")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(batch_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(batch_response.status(), StatusCode::OK);
+
+        let batch_bytes = axum::body::to_bytes(batch_response.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let batch_json: serde_json::Value = serde_json::from_slice(&batch_bytes).unwrap();
+        assert_eq!(batch_json["epoch_id"], 42);
+        let batch_results = batch_json["results"].as_array().expect("results array");
+        assert_eq!(batch_results.len(), 2);
+
+        let single_a = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query/page/gpu")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"keys":["{a}","{a}","{a}"]}}"#,
+                        a = key_a
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(single_a.status(), StatusCode::OK);
+        let single_a_bytes = axum::body::to_bytes(single_a.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let single_a_json: serde_json::Value = serde_json::from_slice(&single_a_bytes).unwrap();
+
+        let single_b = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query/page/gpu")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"keys":["{b}","{b}","{b}"]}}"#,
+                        b = key_b
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(single_b.status(), StatusCode::OK);
+        let single_b_bytes = axum::body::to_bytes(single_b.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let single_b_json: serde_json::Value = serde_json::from_slice(&single_b_bytes).unwrap();
+
+        assert_eq!(batch_results[0]["pages"], single_a_json["pages"]);
+        assert_eq!(batch_results[1]["pages"], single_b_json["pages"]);
+    }
+
+    #[tokio::test]
+    async fn gpu_batch_query_rejects_empty_batch() {
+        let state = test_state_for_gpu();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query/page/gpu/batch")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"queries":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn gpu_batch_query_rejects_wrong_key_count() {
+        let state = test_state_for_gpu();
+        let app = create_router(state);
+        let params = ChaChaParams::new(8).unwrap();
+        let (k0, _) = generate_chacha_dpf_keys(&params, 0).unwrap();
+        let hex0 = format!("0x{}", hex::encode(k0.to_bytes()));
+        let body = format!(r#"{{"queries":[{{"keys":["{hex0}","{hex0}"]}}]}}"#);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/query/page/gpu/batch")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body))
                     .unwrap(),

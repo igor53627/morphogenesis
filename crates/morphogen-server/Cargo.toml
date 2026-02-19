@@ -39,9 +39,10 @@ morphogen-client = { path = "../morphogen-client", default-features = false }
  cuda = ["dep:morphogen-gpu-dpf", "morphogen-gpu-dpf/cuda"]
  profiling = []
  streaming_stores = []
- parallel = []
+parallel = []
 network = ["axum", "tokio", "serde", "serde_json", "hex", "tower", "tracing", "tracing-subscriber", "metrics", "metrics-exporter-prometheus", "dep:clap", "dep:morphogen-gpu-dpf"]
 verifiable-pir = ["morphogen-core/verifiable-pir"]
+fused-batch-scan = []
 
  [lib]
  name = "morphogen_server"

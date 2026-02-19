@@ -1,0 +1,9 @@
+gpu_info=NVIDIA H100 80GB HBM3, 81559 MiB
+matrix=file:/data/mainnet_compact.bin,pages:16817159,domain_bits:25,iterations:5,warmup:1,batch_sizes:2,4,8,gpu_streams:1,concurrency:1,policy:throughput
+graph_enabled,run_duration_s,q,single_ms_per_batch,batch_ms_per_batch,batch_vs_single_speedup,single_qps,batch_qps,checksum_single,checksum_batch
+false,254.55,2,61.23,58.85,1.04,32.67,33.99,15497145,15497145
+false,254.55,4,122.39,118.40,1.03,32.68,33.78,31381875,31381875
+false,254.55,8,244.98,236.20,1.04,32.66,33.87,62768850,62768850
+true,50.70,2,61.24,59.00,1.04,32.66,33.90,15587775,15587775
+true,50.70,4,122.47,119.07,1.03,32.66,33.59,31304190,31304190
+true,50.70,8,244.99,236.51,1.04,32.65,33.83,62711445,62711445

@@ -39,6 +39,8 @@ The server exposes a `/metrics` endpoint in Prometheus format.
 | `pir_query_duration_seconds` | Histogram | Latency distribution of PIR queries. |
 | `pir_epoch_id` | Gauge | The current active epoch ID. |
 | `gpu_scan_duration_seconds` | Histogram | Latency of the GPU-only scan kernel execution. |
+| `gpu_query_phase_duration_seconds` | Histogram | GPU request phase latency with labels `endpoint` (`gpu`/`gpu_batch`) and `phase` (`transfer_h2d`, `kernel`, `transfer_d2h`, `merge`). |
+| `gpu_batch_dispatch_mode_total` | Counter | GPU batch dispatch mode selections labeled by `mode` (`multistream`, `full_batch`, `micro_batch2`). |
 | `gpu_vram_used_bytes` | Gauge | Current VRAM utilization (if CUDA enabled). |
 
 ### Monitoring Endpoint
@@ -58,6 +60,15 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:3000']
 ```
+
+### GPU Batch Dispatch Knobs
+
+For `/query/page/gpu/batch`, runtime dispatch can be tuned with:
+
+- `MORPHOGEN_GPU_STREAMS`: stream count (clamped to `1..=8`).
+- `MORPHOGEN_GPU_BATCH_POLICY`: `adaptive` (default), `throughput`, or `latency`.
+- `MORPHOGEN_GPU_BATCH_ADAPTIVE_THRESHOLD`: query-count threshold used by `adaptive` mode (clamped to `1..=32`).
+- `MORPHOGEN_GPU_CUDA_GRAPH`: `true/false` toggle for CUDA graph capture+replay on eligible single-launch batch shapes (`1|2|4|8|16` queries).
 
 ## Performance Impact
 

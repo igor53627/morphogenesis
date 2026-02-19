@@ -18,6 +18,8 @@ use axum::{
 };
 #[cfg(feature = "metrics")]
 use metrics::counter;
+#[cfg(all(feature = "metrics", feature = "cuda"))]
+use metrics::histogram;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -115,10 +117,18 @@ pub const MAX_BATCH_SIZE: usize = 32;
 const GPU_MICRO_BATCH_SIZE: usize = 2;
 #[cfg(feature = "cuda")]
 const GPU_STREAM_COUNT_ENV: &str = "MORPHOGEN_GPU_STREAMS";
+#[cfg(feature = "cuda")]
+const GPU_BATCH_POLICY_ENV: &str = "MORPHOGEN_GPU_BATCH_POLICY";
+#[cfg(feature = "cuda")]
+const GPU_BATCH_ADAPTIVE_THRESHOLD_ENV: &str = "MORPHOGEN_GPU_BATCH_ADAPTIVE_THRESHOLD";
+#[cfg(feature = "cuda")]
+const GPU_CUDA_GRAPH_ENV: &str = "MORPHOGEN_GPU_CUDA_GRAPH";
 #[cfg(any(feature = "cuda", test))]
 const DEFAULT_GPU_STREAM_COUNT: usize = 1;
 #[cfg(any(feature = "cuda", test))]
 const MAX_GPU_STREAM_COUNT: usize = 8;
+#[cfg(any(feature = "cuda", test))]
+const DEFAULT_GPU_BATCH_ADAPTIVE_THRESHOLD: usize = 4;
 
 #[derive(Deserialize)]
 pub struct BatchQueryRequest {
@@ -406,10 +416,92 @@ fn gpu_micro_batch_ranges(total_queries: usize) -> Vec<(usize, usize)> {
 }
 
 #[cfg(any(feature = "cuda", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuBatchPolicy {
+    Adaptive,
+    Throughput,
+    Latency,
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GpuBatchPolicyConfig {
+    policy: GpuBatchPolicy,
+    adaptive_threshold: usize,
+}
+
+#[cfg(any(feature = "cuda", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuBatchDispatch {
+    MultiStream { stream_count: usize },
+    FullBatch,
+    MicroBatch2,
+}
+
+#[cfg(any(feature = "cuda", test))]
+impl GpuBatchDispatch {
+    #[cfg(any(feature = "metrics", test))]
+    fn mode_label(self) -> &'static str {
+        match self {
+            GpuBatchDispatch::MultiStream { .. } => "multistream",
+            GpuBatchDispatch::FullBatch => "full_batch",
+            GpuBatchDispatch::MicroBatch2 => "micro_batch2",
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn parse_gpu_batch_policy(raw: Option<&str>) -> GpuBatchPolicy {
+    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("throughput") => GpuBatchPolicy::Throughput,
+        Some("latency") => GpuBatchPolicy::Latency,
+        _ => GpuBatchPolicy::Adaptive,
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn parse_gpu_batch_adaptive_threshold(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_GPU_BATCH_ADAPTIVE_THRESHOLD)
+        .clamp(1, MAX_BATCH_SIZE)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn choose_gpu_batch_dispatch(
+    total_queries: usize,
+    stream_count: usize,
+    cfg: GpuBatchPolicyConfig,
+) -> GpuBatchDispatch {
+    if stream_count > 1 {
+        return GpuBatchDispatch::MultiStream { stream_count };
+    }
+
+    match cfg.policy {
+        GpuBatchPolicy::Throughput => GpuBatchDispatch::MicroBatch2,
+        GpuBatchPolicy::Latency => GpuBatchDispatch::FullBatch,
+        GpuBatchPolicy::Adaptive => {
+            if total_queries <= cfg.adaptive_threshold {
+                GpuBatchDispatch::FullBatch
+            } else {
+                GpuBatchDispatch::MicroBatch2
+            }
+        }
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
 fn parse_gpu_stream_count(raw: Option<&str>) -> usize {
     raw.and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(DEFAULT_GPU_STREAM_COUNT)
         .clamp(DEFAULT_GPU_STREAM_COUNT, MAX_GPU_STREAM_COUNT)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn parse_gpu_cuda_graph_enabled(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -421,10 +513,75 @@ fn ensure_gpu_result_count(expected: usize, actual: usize) -> Result<(), StatusC
 }
 
 #[cfg(any(feature = "cuda", test))]
-fn run_gpu_scan_branches_with<FMulti, FMicro>(
+fn with_gpu_matrix_ref<T, R, F>(
+    matrix_mutex: &std::sync::Mutex<Option<T>>,
+    scan: F,
+) -> Result<Option<R>, StatusCode>
+where
+    F: FnOnce(&T) -> Result<R, StatusCode>,
+{
+    let matrix_guard = matrix_mutex
+        .lock()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    matrix_guard.as_ref().map(scan).transpose()
+}
+
+#[cfg(any(test, all(feature = "metrics", feature = "cuda")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GpuTimingTotals {
+    h2d_ns: u64,
+    kernel_ns: u64,
+    d2h_ns: u64,
+}
+
+#[cfg(any(test, all(feature = "metrics", feature = "cuda")))]
+fn gpu_timing_totals_for_request(
+    timing: &morphogen_gpu_dpf::kernel::KernelTiming,
+    query_count: usize,
+) -> GpuTimingTotals {
+    let multiplier = query_count.max(1) as u64;
+    GpuTimingTotals {
+        h2d_ns: timing.h2d_ns.saturating_mul(multiplier),
+        kernel_ns: timing.kernel_ns.saturating_mul(multiplier),
+        d2h_ns: timing.d2h_ns.saturating_mul(multiplier),
+    }
+}
+
+#[cfg(all(feature = "metrics", feature = "cuda"))]
+fn ns_to_secs(ns: u64) -> f64 {
+    ns as f64 / 1_000_000_000.0
+}
+
+#[cfg(all(feature = "metrics", feature = "cuda"))]
+fn record_gpu_phase_duration(endpoint: &'static str, phase: &'static str, duration_ns: u64) {
+    histogram!(
+        "gpu_query_phase_duration_seconds",
+        "endpoint" => endpoint,
+        "phase" => phase
+    )
+    .record(ns_to_secs(duration_ns));
+}
+
+#[cfg(all(feature = "metrics", feature = "cuda"))]
+fn record_gpu_transfer_and_kernel_metrics(
+    endpoint: &'static str,
+    timing: &morphogen_gpu_dpf::kernel::KernelTiming,
+    query_count: usize,
+) {
+    let totals = gpu_timing_totals_for_request(timing, query_count);
+    record_gpu_phase_duration(endpoint, "transfer_h2d", totals.h2d_ns);
+    record_gpu_phase_duration(endpoint, "kernel", totals.kernel_ns);
+    record_gpu_phase_duration(endpoint, "transfer_d2h", totals.d2h_ns);
+    histogram!("gpu_scan_duration_seconds", "endpoint" => endpoint)
+        .record(ns_to_secs(totals.kernel_ns));
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn run_gpu_scan_branches_with<FMulti, FFull, FMicro>(
     all_keys: &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
-    stream_count: usize,
+    dispatch: GpuBatchDispatch,
     mut scan_multistream: FMulti,
+    mut scan_full_batch: FFull,
     mut scan_micro_batch: FMicro,
 ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
 where
@@ -432,22 +589,31 @@ where
         &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
         usize,
     ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>,
+    FFull: FnMut(
+        &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+    ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>,
     FMicro: FnMut(
         &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
     ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>,
 {
     let n = all_keys.len();
-    let gpu_results = if stream_count > 1 {
-        scan_multistream(all_keys, stream_count)?
-    } else {
-        let mut gpu_results = Vec::with_capacity(n);
-        for (start, end) in gpu_micro_batch_ranges(n) {
-            let key_batch = &all_keys[start..end];
-            let mut chunk_results = scan_micro_batch(key_batch)?;
-            ensure_gpu_result_count(key_batch.len(), chunk_results.len())?;
-            gpu_results.append(&mut chunk_results);
+    let gpu_results = match dispatch {
+        GpuBatchDispatch::MultiStream { stream_count } => scan_multistream(all_keys, stream_count)?,
+        GpuBatchDispatch::FullBatch => {
+            let results = scan_full_batch(all_keys)?;
+            ensure_gpu_result_count(n, results.len())?;
+            results
         }
-        gpu_results
+        GpuBatchDispatch::MicroBatch2 => {
+            let mut gpu_results = Vec::with_capacity(n);
+            for (start, end) in gpu_micro_batch_ranges(n) {
+                let key_batch = &all_keys[start..end];
+                let mut chunk_results = scan_micro_batch(key_batch)?;
+                ensure_gpu_result_count(key_batch.len(), chunk_results.len())?;
+                gpu_results.append(&mut chunk_results);
+            }
+            gpu_results
+        }
     };
     ensure_gpu_result_count(n, gpu_results.len())?;
     Ok(gpu_results)
@@ -458,6 +624,15 @@ type TestGpuBatchMultistreamScan = std::sync::Arc<
     dyn Fn(
             &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
             usize,
+        ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+type TestGpuBatchFullScan = std::sync::Arc<
+    dyn Fn(
+            &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
         ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
         + Send
         + Sync,
@@ -475,8 +650,9 @@ type TestGpuBatchMicroScan = std::sync::Arc<
 #[cfg(test)]
 #[derive(Clone)]
 struct TestGpuBatchHooks {
-    stream_count: usize,
+    dispatch: GpuBatchDispatch,
     multistream_scan: TestGpuBatchMultistreamScan,
+    full_batch_scan: TestGpuBatchFullScan,
     micro_batch_scan: TestGpuBatchMicroScan,
 }
 
@@ -492,7 +668,23 @@ fn configured_gpu_stream_count() -> usize {
     parse_gpu_stream_count(raw.as_deref())
 }
 
-fn collect_gpu_page_refs<'a>(matrix: &'a morphogen_storage::ChunkedMatrix) -> Vec<&'a [u8]> {
+#[cfg(feature = "cuda")]
+fn configured_gpu_batch_policy() -> GpuBatchPolicyConfig {
+    let policy_raw = std::env::var(GPU_BATCH_POLICY_ENV).ok();
+    let threshold_raw = std::env::var(GPU_BATCH_ADAPTIVE_THRESHOLD_ENV).ok();
+    GpuBatchPolicyConfig {
+        policy: parse_gpu_batch_policy(policy_raw.as_deref()),
+        adaptive_threshold: parse_gpu_batch_adaptive_threshold(threshold_raw.as_deref()),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn configured_gpu_cuda_graph_enabled() -> bool {
+    let raw = std::env::var(GPU_CUDA_GRAPH_ENV).ok();
+    parse_gpu_cuda_graph_enabled(raw.as_deref())
+}
+
+fn collect_gpu_page_refs(matrix: &morphogen_storage::ChunkedMatrix) -> Vec<&[u8]> {
     let page_size = morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
     let num_pages = matrix.total_size_bytes() / page_size;
     let mut pages_refs = Vec::with_capacity(num_pages);
@@ -766,81 +958,79 @@ pub async fn page_query_gpu_handler(
 
         for _ in 0..10 {
             let snapshot1 = state.global.load();
+            let pending = state.global.load_pending();
+            let pending_epoch = pending.pending_epoch();
+            if pending_epoch != snapshot1.epoch_id {
+                std::thread::yield_now();
+                continue;
+            }
 
-            // 1. Get GPU lock and matrix
-            let matrix_guard = matrix_mutex
-                .lock()
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-            // 2. Check epochs
-            if let Some(matrix) = matrix_guard.as_ref() {
-                let pending = state.global.load_pending();
-                let pending_epoch = pending.pending_epoch(); // Relaxed check
-                if pending_epoch != snapshot1.epoch_id {
-                    drop(matrix_guard);
+            let mut results = match with_gpu_matrix_ref(matrix_mutex.as_ref(), |matrix| {
+                unsafe { scanner.scan(matrix, [&keys[0], &keys[1], &keys[2]]) }
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+            })? {
+                Some(result) => result,
+                None => {
                     std::thread::yield_now();
                     continue;
                 }
+            };
 
-                // 3. Scan GPU
-                let mut results = unsafe { scanner.scan(matrix, [&keys[0], &keys[1], &keys[2]]) }
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            #[cfg(feature = "metrics")]
+            record_gpu_transfer_and_kernel_metrics("gpu", &results.timing, 1);
 
-                // 4. Scan Delta
-                let delta_results = scan_delta_for_gpu(pending.as_ref(), &keys, PAGE_SIZE_BYTES)
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let merge_start = std::time::Instant::now();
+            let delta_results = scan_delta_for_gpu(pending.as_ref(), &keys, PAGE_SIZE_BYTES)
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let snapshot2 = state.global.load();
+            let pending_epoch_after = pending.pending_epoch();
+            if snapshot1.epoch_id != snapshot2.epoch_id || pending_epoch_after != snapshot1.epoch_id
+            {
+                std::thread::yield_now();
+                continue;
+            }
 
-                // 5. Verify consistency after scan
-                let snapshot2 = state.global.load();
-                let pending_epoch_after = pending.pending_epoch();
-
-                if snapshot1.epoch_id == snapshot2.epoch_id
-                    && pending_epoch_after == snapshot1.epoch_id
-                {
-                    // Merge results
-                    for k in 0..3 {
-                        let gpu_page = match k {
-                            0 => &mut results.page0,
-                            1 => &mut results.page1,
-                            _ => &mut results.page2,
-                        };
-                        for (i, b) in delta_results[k].iter().enumerate() {
-                            gpu_page[i] ^= *b;
-                        }
-                    }
-
-                    // Construct Proof (Round 0)
-                    // In Binius Sum-Check for Dot Product, the round polynomial g(X) is quadratic.
-                    // We need evaluations at 0, 1, and alpha.
-                    // The GPU kernel returns the sum for each key.
-                    // Since standard PIR is just sum(D * Q) where Q is 0/1,
-                    // the "verification" result is the GF(2^128) dot product.
-                    // We assume verif0..2 are the dot products for the 3 keys.
-                    // For a full proof, we'd need to combine them or prove each separately.
-                    // Here we package them as a single "proof" for the client to verify against C_D.
-
-                    #[cfg(feature = "verifiable-pir")]
-                    let proof = {
-                        let v0 = u128::from_le_bytes(results.verif0.try_into().unwrap_or([0; 16]));
-                        let v1 = u128::from_le_bytes(results.verif1.try_into().unwrap_or([0; 16]));
-                        let v2 = u128::from_le_bytes(results.verif2.try_into().unwrap_or([0; 16]));
-
-                        SumCheckProof {
-                            round_polynomials: vec![], // Populated in later rounds (on CPU/Client or next step)
-                            sum: v0 ^ v1 ^ v2,         // Aggregate for simple check
-                        }
-                    };
-
-                    return Ok(Json(PageQueryResponse {
-                        epoch_id: snapshot1.epoch_id,
-                        pages: vec![results.page0, results.page1, results.page2],
-                        #[cfg(feature = "verifiable-pir")]
-                        proof: Some(proof),
-                    }));
+            for k in 0..3 {
+                let gpu_page = match k {
+                    0 => &mut results.page0,
+                    1 => &mut results.page1,
+                    _ => &mut results.page2,
+                };
+                for (i, b) in delta_results[k].iter().enumerate() {
+                    gpu_page[i] ^= *b;
                 }
             }
-            drop(matrix_guard);
-            std::thread::yield_now();
+            #[cfg(feature = "metrics")]
+            record_gpu_phase_duration("gpu", "merge", merge_start.elapsed().as_nanos() as u64);
+
+            // Construct Proof (Round 0)
+            // In Binius Sum-Check for Dot Product, the round polynomial g(X) is quadratic.
+            // We need evaluations at 0, 1, and alpha.
+            // The GPU kernel returns the sum for each key.
+            // Since standard PIR is just sum(D * Q) where Q is 0/1,
+            // the "verification" result is the GF(2^128) dot product.
+            // We assume verif0..2 are the dot products for the 3 keys.
+            // For a full proof, we'd need to combine them or prove each separately.
+            // Here we package them as a single "proof" for the client to verify against C_D.
+
+            #[cfg(feature = "verifiable-pir")]
+            let proof = {
+                let v0 = u128::from_le_bytes(results.verif0.try_into().unwrap_or([0; 16]));
+                let v1 = u128::from_le_bytes(results.verif1.try_into().unwrap_or([0; 16]));
+                let v2 = u128::from_le_bytes(results.verif2.try_into().unwrap_or([0; 16]));
+
+                SumCheckProof {
+                    round_polynomials: vec![], // Populated in later rounds (on CPU/Client or next step)
+                    sum: v0 ^ v1 ^ v2,         // Aggregate for simple check
+                }
+            };
+
+            return Ok(Json(PageQueryResponse {
+                epoch_id: snapshot1.epoch_id,
+                pages: vec![results.page0, results.page1, results.page2],
+                #[cfg(feature = "verifiable-pir")]
+                proof: Some(proof),
+            }));
         }
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -880,8 +1070,9 @@ pub async fn page_query_gpu_batch_handler(
     if let Some(hooks) = TEST_GPU_BATCH_HOOKS.with(|slot| slot.borrow().clone()) {
         let gpu_results = run_gpu_scan_branches_with(
             &all_keys,
-            hooks.stream_count,
+            hooks.dispatch,
             |keys, count| (hooks.multistream_scan)(keys, count),
+            |keys| (hooks.full_batch_scan)(keys),
             |key_batch| (hooks.micro_batch_scan)(key_batch),
         )?;
         let results = gpu_results
@@ -907,91 +1098,123 @@ pub async fn page_query_gpu_batch_handler(
 
         for _ in 0..10 {
             let snapshot1 = state.global.load();
-            let matrix_guard = matrix_mutex
-                .lock()
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let pending = state.global.load_pending();
+            let pending_epoch = pending.pending_epoch();
+            if pending_epoch != snapshot1.epoch_id {
+                std::thread::yield_now();
+                continue;
+            }
 
-            if let Some(matrix) = matrix_guard.as_ref() {
-                let pending = state.global.load_pending();
-                let pending_epoch = pending.pending_epoch();
-                if pending_epoch != snapshot1.epoch_id {
-                    drop(matrix_guard);
-                    std::thread::yield_now();
-                    continue;
-                }
-
-                let stream_count = configured_gpu_stream_count();
-                let gpu_results = run_gpu_scan_branches_with(
+            let stream_count = configured_gpu_stream_count();
+            let policy_cfg = configured_gpu_batch_policy();
+            let cuda_graph_enabled = configured_gpu_cuda_graph_enabled();
+            let dispatch = choose_gpu_batch_dispatch(n, stream_count, policy_cfg);
+            #[cfg(feature = "metrics")]
+            counter!("gpu_batch_dispatch_mode_total", "mode" => dispatch.mode_label()).increment(1);
+            let gpu_results = match with_gpu_matrix_ref(matrix_mutex.as_ref(), |matrix| {
+                run_gpu_scan_branches_with(
                     &all_keys,
-                    stream_count,
+                    dispatch,
                     |keys, count| {
                         unsafe {
-                            scanner
-                                .scan_batch_single_query_multistream_optimized(matrix, keys, count)
+                            scanner.scan_batch_single_query_multistream_optimized_with_graph(
+                                matrix,
+                                keys,
+                                count,
+                                cuda_graph_enabled,
+                            )
+                        }
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                    },
+                    |keys| {
+                        unsafe {
+                            scanner.scan_batch_optimized_with_graph(
+                                matrix,
+                                keys,
+                                cuda_graph_enabled,
+                            )
                         }
                         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
                     },
                     |key_batch| {
-                        unsafe { scanner.scan_batch_optimized(matrix, key_batch) }
-                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                        unsafe {
+                            scanner.scan_batch_optimized_with_graph(
+                                matrix,
+                                key_batch,
+                                cuda_graph_enabled,
+                            )
+                        }
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
                     },
-                )?;
-                let snapshot2 = state.global.load();
-                let pending_epoch_after = pending.pending_epoch();
-                if snapshot1.epoch_id != snapshot2.epoch_id
-                    || pending_epoch_after != snapshot1.epoch_id
-                {
-                    drop(matrix_guard);
+                )
+            })? {
+                Some(results) => results,
+                None => {
                     std::thread::yield_now();
                     continue;
                 }
+            };
 
-                let mut results = Vec::with_capacity(n);
-                for (mut gpu_result, keys) in gpu_results.into_iter().zip(all_keys.iter()) {
-                    let delta_results = scan_delta_for_gpu(pending.as_ref(), keys, PAGE_SIZE_BYTES)
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-                    for k in 0..3 {
-                        let gpu_page = match k {
-                            0 => &mut gpu_result.page0,
-                            1 => &mut gpu_result.page1,
-                            _ => &mut gpu_result.page2,
-                        };
-                        for (i, b) in delta_results[k].iter().enumerate() {
-                            gpu_page[i] ^= *b;
-                        }
-                    }
-
-                    #[cfg(feature = "verifiable-pir")]
-                    let proof = {
-                        let v0 =
-                            u128::from_le_bytes(gpu_result.verif0.try_into().unwrap_or([0; 16]));
-                        let v1 =
-                            u128::from_le_bytes(gpu_result.verif1.try_into().unwrap_or([0; 16]));
-                        let v2 =
-                            u128::from_le_bytes(gpu_result.verif2.try_into().unwrap_or([0; 16]));
-
-                        Some(SumCheckProof {
-                            round_polynomials: vec![],
-                            sum: v0 ^ v1 ^ v2,
-                        })
-                    };
-
-                    results.push(BatchGpuPageQueryResult {
-                        pages: vec![gpu_result.page0, gpu_result.page1, gpu_result.page2],
-                        #[cfg(feature = "verifiable-pir")]
-                        proof,
-                    });
-                }
-
-                return Ok(Json(BatchGpuPageQueryResponse {
-                    epoch_id: snapshot1.epoch_id,
-                    results,
-                }));
+            #[cfg(feature = "metrics")]
+            if let Some(first) = gpu_results.first() {
+                record_gpu_transfer_and_kernel_metrics("gpu_batch", &first.timing, n);
             }
 
-            drop(matrix_guard);
-            std::thread::yield_now();
+            let merge_start = std::time::Instant::now();
+            let mut results = Vec::with_capacity(n);
+            for (mut gpu_result, keys) in gpu_results.into_iter().zip(all_keys.iter()) {
+                let delta_results = scan_delta_for_gpu(pending.as_ref(), keys, PAGE_SIZE_BYTES)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                for k in 0..3 {
+                    let gpu_page = match k {
+                        0 => &mut gpu_result.page0,
+                        1 => &mut gpu_result.page1,
+                        _ => &mut gpu_result.page2,
+                    };
+                    for (i, b) in delta_results[k].iter().enumerate() {
+                        gpu_page[i] ^= *b;
+                    }
+                }
+
+                #[cfg(feature = "verifiable-pir")]
+                let proof = {
+                    let v0 = u128::from_le_bytes(gpu_result.verif0.try_into().unwrap_or([0; 16]));
+                    let v1 = u128::from_le_bytes(gpu_result.verif1.try_into().unwrap_or([0; 16]));
+                    let v2 = u128::from_le_bytes(gpu_result.verif2.try_into().unwrap_or([0; 16]));
+
+                    Some(SumCheckProof {
+                        round_polynomials: vec![],
+                        sum: v0 ^ v1 ^ v2,
+                    })
+                };
+
+                results.push(BatchGpuPageQueryResult {
+                    pages: vec![gpu_result.page0, gpu_result.page1, gpu_result.page2],
+                    #[cfg(feature = "verifiable-pir")]
+                    proof,
+                });
+            }
+
+            let snapshot2 = state.global.load();
+            let pending_epoch_after = pending.pending_epoch();
+            if snapshot1.epoch_id != snapshot2.epoch_id || pending_epoch_after != snapshot1.epoch_id
+            {
+                std::thread::yield_now();
+                continue;
+            }
+
+            #[cfg(feature = "metrics")]
+            record_gpu_phase_duration(
+                "gpu_batch",
+                "merge",
+                merge_start.elapsed().as_nanos() as u64,
+            );
+
+            return Ok(Json(BatchGpuPageQueryResponse {
+                epoch_id: snapshot1.epoch_id,
+                results,
+            }));
         }
 
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -1669,6 +1892,86 @@ mod tests {
     }
 
     #[test]
+    fn parse_gpu_cuda_graph_enabled_defaults_and_supports_expected_values() {
+        assert!(!parse_gpu_cuda_graph_enabled(None));
+        assert!(!parse_gpu_cuda_graph_enabled(Some("0")));
+        assert!(!parse_gpu_cuda_graph_enabled(Some("false")));
+        assert!(parse_gpu_cuda_graph_enabled(Some("1")));
+        assert!(parse_gpu_cuda_graph_enabled(Some("true")));
+        assert!(parse_gpu_cuda_graph_enabled(Some("yes")));
+        assert!(parse_gpu_cuda_graph_enabled(Some("on")));
+        assert!(!parse_gpu_cuda_graph_enabled(Some("bad")));
+    }
+
+    #[test]
+    fn parse_gpu_batch_policy_defaults_and_supports_expected_values() {
+        assert_eq!(parse_gpu_batch_policy(None), GpuBatchPolicy::Adaptive);
+        assert_eq!(
+            parse_gpu_batch_policy(Some("adaptive")),
+            GpuBatchPolicy::Adaptive
+        );
+        assert_eq!(
+            parse_gpu_batch_policy(Some("throughput")),
+            GpuBatchPolicy::Throughput
+        );
+        assert_eq!(
+            parse_gpu_batch_policy(Some("latency")),
+            GpuBatchPolicy::Latency
+        );
+        assert_eq!(
+            parse_gpu_batch_policy(Some("bad")),
+            GpuBatchPolicy::Adaptive
+        );
+    }
+
+    #[test]
+    fn parse_gpu_batch_adaptive_threshold_defaults_and_clamps() {
+        assert_eq!(parse_gpu_batch_adaptive_threshold(None), 4);
+        assert_eq!(parse_gpu_batch_adaptive_threshold(Some("0")), 1);
+        assert_eq!(
+            parse_gpu_batch_adaptive_threshold(Some("999")),
+            MAX_BATCH_SIZE
+        );
+        assert_eq!(parse_gpu_batch_adaptive_threshold(Some("bad")), 4);
+    }
+
+    #[test]
+    fn choose_gpu_batch_dispatch_prefers_multistream_when_enabled() {
+        let cfg = GpuBatchPolicyConfig {
+            policy: GpuBatchPolicy::Latency,
+            adaptive_threshold: 8,
+        };
+        let dispatch = choose_gpu_batch_dispatch(3, 4, cfg);
+        assert_eq!(dispatch, GpuBatchDispatch::MultiStream { stream_count: 4 });
+    }
+
+    #[test]
+    fn choose_gpu_batch_dispatch_uses_adaptive_threshold() {
+        let cfg = GpuBatchPolicyConfig {
+            policy: GpuBatchPolicy::Adaptive,
+            adaptive_threshold: 4,
+        };
+        assert_eq!(
+            choose_gpu_batch_dispatch(3, 1, cfg),
+            GpuBatchDispatch::FullBatch
+        );
+        assert_eq!(
+            choose_gpu_batch_dispatch(5, 1, cfg),
+            GpuBatchDispatch::MicroBatch2
+        );
+    }
+
+    #[test]
+    fn gpu_batch_dispatch_mode_label_matches_variants() {
+        assert_eq!(
+            GpuBatchDispatch::MultiStream { stream_count: 2 }.mode_label(),
+            "multistream"
+        );
+        assert_eq!(GpuBatchDispatch::FullBatch.mode_label(), "full_batch");
+        assert_eq!(GpuBatchDispatch::MicroBatch2.mode_label(), "micro_batch2");
+    }
+
+    #[test]
     fn ensure_gpu_result_count_accepts_matching_lengths() {
         assert!(ensure_gpu_result_count(4, 4).is_ok());
     }
@@ -1679,6 +1982,60 @@ mod tests {
             ensure_gpu_result_count(4, 3),
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         );
+    }
+
+    #[test]
+    fn gpu_timing_totals_scale_with_query_count() {
+        let timing = morphogen_gpu_dpf::kernel::KernelTiming {
+            h2d_ns: 7,
+            kernel_ns: 11,
+            d2h_ns: 13,
+            total_ns: 31,
+            ..Default::default()
+        };
+
+        let totals = gpu_timing_totals_for_request(&timing, 4);
+        assert_eq!(totals.h2d_ns, 28);
+        assert_eq!(totals.kernel_ns, 44);
+        assert_eq!(totals.d2h_ns, 52);
+    }
+
+    #[test]
+    fn gpu_timing_totals_treat_zero_queries_as_one() {
+        let timing = morphogen_gpu_dpf::kernel::KernelTiming {
+            h2d_ns: 5,
+            kernel_ns: 6,
+            d2h_ns: 7,
+            total_ns: 18,
+            ..Default::default()
+        };
+
+        let totals = gpu_timing_totals_for_request(&timing, 0);
+        assert_eq!(totals.h2d_ns, 5);
+        assert_eq!(totals.kernel_ns, 6);
+        assert_eq!(totals.d2h_ns, 7);
+    }
+
+    #[test]
+    fn with_gpu_matrix_ref_holds_lock_for_scan_then_releases_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let matrix_mutex = Arc::new(Mutex::new(Some(41usize)));
+        let saw_lock_held = Arc::new(AtomicBool::new(false));
+        let matrix_for_scan = Arc::clone(&matrix_mutex);
+        let saw_lock_held_for_scan = Arc::clone(&saw_lock_held);
+
+        let result = with_gpu_matrix_ref(matrix_mutex.as_ref(), move |value| {
+            assert_eq!(*value, 41);
+            assert!(matrix_for_scan.try_lock().is_err());
+            saw_lock_held_for_scan.store(true, Ordering::Relaxed);
+            Ok::<usize, StatusCode>(value + 1)
+        });
+
+        assert_eq!(result, Ok(Some(42)));
+        assert!(saw_lock_held.load(Ordering::Relaxed));
+        assert!(matrix_mutex.try_lock().is_ok());
     }
 
     fn test_gpu_keys(count: usize) -> Vec<[morphogen_gpu_dpf::dpf::ChaChaKey; 3]> {
@@ -1761,8 +2118,9 @@ mod tests {
         let all_keys = test_gpu_keys(2);
         let result = run_gpu_scan_branches_with(
             &all_keys,
-            4,
+            GpuBatchDispatch::MultiStream { stream_count: 4 },
             |_keys, _stream_count| Ok(vec![test_pir_result()]),
+            |_keys| unreachable!("full batch path should not run"),
             |_key_batch| unreachable!("micro-batch path should not run"),
         );
 
@@ -1774,8 +2132,9 @@ mod tests {
         let all_keys = test_gpu_keys(3);
         let result = run_gpu_scan_branches_with(
             &all_keys,
-            4,
+            GpuBatchDispatch::MultiStream { stream_count: 4 },
             |keys, _stream_count| Ok(vec![test_pir_result(); keys.len()]),
+            |_keys| unreachable!("full batch path should not run"),
             |_key_batch| unreachable!("micro-batch path should not run"),
         )
         .expect("multistream path should preserve result count");
@@ -1788,8 +2147,9 @@ mod tests {
         let all_keys = test_gpu_keys(3);
         let result = run_gpu_scan_branches_with(
             &all_keys,
-            1,
+            GpuBatchDispatch::MicroBatch2,
             |_keys, _stream_count| unreachable!("multistream path should not run"),
+            |_keys| unreachable!("full batch path should not run"),
             |_key_batch| Ok(vec![test_pir_result()]),
         );
 
@@ -1801,11 +2161,27 @@ mod tests {
         let all_keys = test_gpu_keys(3);
         let result = run_gpu_scan_branches_with(
             &all_keys,
-            1,
+            GpuBatchDispatch::MicroBatch2,
             |_keys, _stream_count| unreachable!("multistream path should not run"),
+            |_keys| unreachable!("full batch path should not run"),
             |key_batch| Ok(vec![test_pir_result(); key_batch.len()]),
         )
         .expect("micro-batch path should preserve result count");
+
+        assert_eq!(result.len(), all_keys.len());
+    }
+
+    #[test]
+    fn run_gpu_scan_branches_with_full_batch_collects_full_result_set() {
+        let all_keys = test_gpu_keys(5);
+        let result = run_gpu_scan_branches_with(
+            &all_keys,
+            GpuBatchDispatch::FullBatch,
+            |_keys, _stream_count| unreachable!("multistream path should not run"),
+            |keys| Ok(vec![test_pir_result(); keys.len()]),
+            |_key_batch| unreachable!("micro-batch path should not run"),
+        )
+        .expect("full-batch path should preserve result count");
 
         assert_eq!(result.len(), all_keys.len());
     }
@@ -1815,9 +2191,12 @@ mod tests {
         let state = test_state();
         let request = test_gpu_batch_request(2);
         let hooks = TestGpuBatchHooks {
-            stream_count: 4,
+            dispatch: GpuBatchDispatch::MultiStream { stream_count: 4 },
             multistream_scan: std::sync::Arc::new(|_keys, _stream_count| {
                 Ok(vec![test_pir_result()])
+            }),
+            full_batch_scan: std::sync::Arc::new(|_keys| {
+                unreachable!("full batch path should not run")
             }),
             micro_batch_scan: std::sync::Arc::new(|_key_batch| {
                 unreachable!("micro-batch path should not run")
@@ -1837,9 +2216,12 @@ mod tests {
         let state = test_state();
         let request = test_gpu_batch_request(3);
         let hooks = TestGpuBatchHooks {
-            stream_count: 1,
+            dispatch: GpuBatchDispatch::MicroBatch2,
             multistream_scan: std::sync::Arc::new(|_keys, _stream_count| {
                 unreachable!("multistream path should not run")
+            }),
+            full_batch_scan: std::sync::Arc::new(|_keys| {
+                unreachable!("full batch path should not run")
             }),
             micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(vec![test_pir_result()])),
         };
@@ -1857,13 +2239,16 @@ mod tests {
         let state = test_state();
         let request = test_gpu_batch_request(2);
         let hooks = TestGpuBatchHooks {
-            stream_count: 4,
+            dispatch: GpuBatchDispatch::MultiStream { stream_count: 4 },
             multistream_scan: std::sync::Arc::new(|keys, _stream_count| {
                 Ok(keys
                     .iter()
                     .enumerate()
                     .map(|(idx, _)| test_pir_result_with_marker((idx as u8) * 10))
                     .collect())
+            }),
+            full_batch_scan: std::sync::Arc::new(|_keys| {
+                unreachable!("full batch path should not run")
             }),
             micro_batch_scan: std::sync::Arc::new(|_key_batch| {
                 unreachable!("micro-batch path should not run")
@@ -1889,8 +2274,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn with_test_gpu_batch_hooks_clears_state_after_panic() {
         let hooks = TestGpuBatchHooks {
-            stream_count: 4,
+            dispatch: GpuBatchDispatch::MultiStream { stream_count: 4 },
             multistream_scan: std::sync::Arc::new(|_keys, _stream_count| Ok(Vec::new())),
+            full_batch_scan: std::sync::Arc::new(|_keys| Ok(Vec::new())),
             micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(Vec::new())),
         };
 
@@ -1905,8 +2291,9 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn with_test_gpu_batch_hooks_nested_call_panics_without_leaking_state() {
         let hooks = TestGpuBatchHooks {
-            stream_count: 4,
+            dispatch: GpuBatchDispatch::MultiStream { stream_count: 4 },
             multistream_scan: std::sync::Arc::new(|_keys, _stream_count| Ok(Vec::new())),
+            full_batch_scan: std::sync::Arc::new(|_keys| Ok(Vec::new())),
             micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(Vec::new())),
         };
 

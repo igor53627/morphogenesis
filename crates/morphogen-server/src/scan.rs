@@ -101,6 +101,94 @@ pub fn scan_main_matrix<K: DpfKey>(
     result
 }
 
+/// Portable fused scan for multiple queries in a single matrix pass.
+///
+/// Each query still has 3 keys, but the matrix is traversed only once.
+#[cfg(any(feature = "network", test))]
+pub fn scan_main_matrix_multi<K: DpfKey>(
+    matrix: &ChunkedMatrix,
+    all_keys: &[[K; 3]],
+    row_size_bytes: usize,
+) -> Vec<[Vec<u8>; 3]> {
+    if all_keys.is_empty() {
+        return Vec::new();
+    }
+    if row_size_bytes == 0 {
+        return (0..all_keys.len())
+            .map(|_| empty_result(row_size_bytes))
+            .collect();
+    }
+
+    let num_rows = matrix.total_size_bytes() / row_size_bytes;
+    scan_main_matrix_multi_portable(matrix, all_keys, num_rows, row_size_bytes)
+}
+
+#[cfg(any(feature = "network", test))]
+fn scan_main_matrix_multi_portable<K: DpfKey>(
+    matrix: &ChunkedMatrix,
+    all_keys: &[[K; 3]],
+    num_rows: usize,
+    row_size_bytes: usize,
+) -> Vec<[Vec<u8>; 3]> {
+    let mut results: Vec<[Vec<u8>; 3]> = (0..all_keys.len())
+        .map(|_| empty_result(row_size_bytes))
+        .collect();
+    let mut row_masks = vec![[0u8; 3]; all_keys.len()];
+
+    let chunk_size = matrix.chunk_size_bytes();
+    let mut global_row = 0usize;
+
+    for (chunk_idx, chunk) in matrix.chunks().iter().enumerate() {
+        let chunk_len = matrix.chunk_size(chunk_idx);
+        let rows_in_chunk = chunk_len / row_size_bytes;
+        let chunk_ptr = chunk.as_ptr();
+
+        for row_offset in 0..rows_in_chunk {
+            if global_row >= num_rows {
+                break;
+            }
+
+            let row_ptr = unsafe { chunk_ptr.add(row_offset * row_size_bytes) };
+
+            for (query_idx, keys) in all_keys.iter().enumerate() {
+                row_masks[query_idx] = [
+                    mask_byte(keys[0].eval_bit(global_row)),
+                    mask_byte(keys[1].eval_bit(global_row)),
+                    mask_byte(keys[2].eval_bit(global_row)),
+                ];
+            }
+
+            let mut i = 0usize;
+            while i + 64 <= row_size_bytes {
+                let src = unsafe { std::slice::from_raw_parts(row_ptr.add(i), 64) };
+                for (query_idx, masks) in row_masks.iter().enumerate() {
+                    xor_masked(&mut results[query_idx][0], src, i, masks[0]);
+                    xor_masked(&mut results[query_idx][1], src, i, masks[1]);
+                    xor_masked(&mut results[query_idx][2], src, i, masks[2]);
+                }
+                i += 64;
+            }
+
+            if i < row_size_bytes {
+                let src = unsafe { std::slice::from_raw_parts(row_ptr.add(i), row_size_bytes - i) };
+                for (query_idx, masks) in row_masks.iter().enumerate() {
+                    xor_masked(&mut results[query_idx][0], src, i, masks[0]);
+                    xor_masked(&mut results[query_idx][1], src, i, masks[1]);
+                    xor_masked(&mut results[query_idx][2], src, i, masks[2]);
+                }
+            }
+
+            global_row += 1;
+        }
+
+        if chunk_len < chunk_size {
+            break;
+        }
+    }
+
+    results
+}
+
 pub fn try_scan_delta<K: DpfKey>(
     delta: &DeltaBuffer,
     keys: &[K; 3],
@@ -1428,6 +1516,51 @@ mod tests {
             .expect("no-batch API should succeed");
 
         assert_eq!(compat, no_batch);
+    }
+
+    #[test]
+    fn multi_scan_matches_independent_scans() {
+        let row_size = 48;
+        let rows = 97;
+        let chunk_rows = 7;
+        let chunk_size = row_size * chunk_rows;
+        let total_size = row_size * rows;
+
+        let mut matrix = ChunkedMatrix::new(total_size, chunk_size);
+        matrix.fill_with_pattern(0xA11C_E0DE);
+
+        let mut rng = rand::thread_rng();
+        let mut queries: Vec<[AesDpfKey; 3]> = Vec::new();
+        for targets in [(1, 10, 90), (2, 20, 80), (3, 30, 70), (4, 40, 60)] {
+            let (k0, _) = AesDpfKey::generate_pair(&mut rng, targets.0);
+            let (k1, _) = AesDpfKey::generate_pair(&mut rng, targets.1);
+            let (k2, _) = AesDpfKey::generate_pair(&mut rng, targets.2);
+            queries.push([k0, k1, k2]);
+        }
+
+        let fused = super::scan_main_matrix_multi(&matrix, &queries, row_size);
+        assert_eq!(fused.len(), queries.len());
+
+        for (i, keys) in queries.iter().enumerate() {
+            let expected = super::scan_main_matrix(&matrix, keys, row_size);
+            assert_eq!(
+                fused[i], expected,
+                "fused result mismatch at query index {}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn multi_scan_empty_queries_returns_empty_results() {
+        let row_size = 16;
+        let rows = 8;
+        let total_size = row_size * rows;
+        let matrix = ChunkedMatrix::new(total_size, total_size);
+
+        let queries: Vec<[AesDpfKey; 3]> = Vec::new();
+        let fused = super::scan_main_matrix_multi(&matrix, &queries, row_size);
+        assert!(fused.is_empty());
     }
 }
 
