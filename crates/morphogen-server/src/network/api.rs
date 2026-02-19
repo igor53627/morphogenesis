@@ -1732,8 +1732,9 @@ mod tests {
         Fut: std::future::Future<Output = R>,
     {
         TEST_GPU_BATCH_HOOKS.with(|slot| {
-            let prev = slot.replace(Some(hooks));
-            assert!(prev.is_none(), "nested test hooks are not supported");
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "nested test hooks are not supported");
+            *slot = Some(hooks);
         });
         let _guard = TestGpuHookResetGuard;
         f().await
@@ -1862,6 +1863,26 @@ mod tests {
 
         assert_eq!(response.results.len(), 2);
         assert_eq!(response.results[0].pages[0], vec![0u8]);
+        assert_eq!(response.results[0].pages[1], vec![1u8]);
+        assert_eq!(response.results[0].pages[2], vec![2u8]);
         assert_eq!(response.results[1].pages[0], vec![10u8]);
+        assert_eq!(response.results[1].pages[1], vec![11u8]);
+        assert_eq!(response.results[1].pages[2], vec![12u8]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_test_gpu_batch_hooks_clears_state_after_panic() {
+        let hooks = TestGpuBatchHooks {
+            stream_count: 4,
+            multistream_scan: std::sync::Arc::new(|_keys, _stream_count| Ok(Vec::new())),
+            micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(Vec::new())),
+        };
+
+        let join = tokio::spawn(with_test_gpu_batch_hooks(hooks, || async {
+            panic!("intentional panic for hook cleanup test");
+        }))
+        .await;
+        assert!(join.is_err());
+        assert!(TEST_GPU_BATCH_HOOKS.with(|slot| slot.borrow().is_none()));
     }
 }

@@ -4,7 +4,7 @@ title: Prototype multi-stream single-query dispatch for GPU page PIR
 status: Done
 assignee: []
 created_date: '2026-02-19 12:04'
-updated_date: '2026-02-19 16:28'
+updated_date: '2026-02-19 16:32'
 labels:
   - performance
   - cuda
@@ -59,4 +59,6 @@ Correctness: checksum_single == checksum_batch on all benchmark rows.
 2026-02-19: Added handler-level mismatch tests for page_query_gpu_batch_handler using test-only GPU scan hooks (thread-local) for both multistream and micro-batch branches, plus positive multistream count-preservation coverage.
 
 2026-02-19: Hardened test hooks with panic-safe cleanup (Drop guard), and test-hook success path now maps returned GPU results into BatchGpuPageQueryResponse for fidelity; added success-path order/mapping assertion test.
+
+2026-02-19: Fixed test-hook setup ordering to avoid leaked hooks on nested-hook panic, expanded success-path assertions to all three page vectors, and added explicit panic-cleanup coverage for hook state reset.
 <!-- SECTION:NOTES:END -->
