@@ -469,6 +469,39 @@ where
     Ok(gpu_results)
 }
 
+#[cfg(test)]
+type TestGpuBatchMultistreamScan = std::sync::Arc<
+    dyn Fn(
+            &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+            usize,
+        ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+type TestGpuBatchMicroScan = std::sync::Arc<
+    dyn Fn(
+            &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+        ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestGpuBatchHooks {
+    stream_count: usize,
+    multistream_scan: TestGpuBatchMultistreamScan,
+    micro_batch_scan: TestGpuBatchMicroScan,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GPU_BATCH_HOOKS: std::cell::RefCell<Option<TestGpuBatchHooks>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 #[cfg(feature = "cuda")]
 fn configured_gpu_stream_count() -> usize {
     let raw = std::env::var(GPU_STREAM_COUNT_ENV).ok();
@@ -858,6 +891,20 @@ pub async fn page_query_gpu_batch_handler(
     let mut all_keys = Vec::with_capacity(n);
     for query in &request.queries {
         all_keys.push(parse_gpu_query_keys(query)?);
+    }
+
+    #[cfg(test)]
+    if let Some(hooks) = TEST_GPU_BATCH_HOOKS.with(|slot| slot.borrow().clone()) {
+        let _gpu_results = run_gpu_scan_branches_with(
+            &all_keys,
+            hooks.stream_count,
+            |keys, count| (hooks.multistream_scan)(keys, count),
+            |key_batch| (hooks.micro_batch_scan)(key_batch),
+        )?;
+        return Ok(Json(BatchGpuPageQueryResponse {
+            epoch_id: state.global.load().epoch_id,
+            results: Vec::new(),
+        }));
     }
 
     #[cfg(feature = "cuda")]
@@ -1634,6 +1681,37 @@ mod tests {
         }
     }
 
+    fn test_gpu_batch_request(count: usize) -> BatchGpuPageQueryRequest {
+        let all_keys = test_gpu_keys(count);
+        let queries = all_keys
+            .iter()
+            .map(|keys| GpuPageQueryRequest {
+                keys: vec![
+                    keys[0].to_bytes().to_vec(),
+                    keys[1].to_bytes().to_vec(),
+                    keys[2].to_bytes().to_vec(),
+                ],
+            })
+            .collect();
+        BatchGpuPageQueryRequest { queries }
+    }
+
+    async fn with_test_gpu_batch_hooks<F, Fut, R>(hooks: TestGpuBatchHooks, f: F) -> R
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = R>,
+    {
+        TEST_GPU_BATCH_HOOKS.with(|slot| {
+            let prev = slot.replace(Some(hooks));
+            assert!(prev.is_none(), "nested test hooks are not supported");
+        });
+        let result = f().await;
+        TEST_GPU_BATCH_HOOKS.with(|slot| {
+            slot.replace(None);
+        });
+        result
+    }
+
     #[test]
     fn run_gpu_scan_branches_with_multistream_rejects_mismatched_lengths() {
         let all_keys = test_gpu_keys(2);
@@ -1645,6 +1723,20 @@ mod tests {
         );
 
         assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+    }
+
+    #[test]
+    fn run_gpu_scan_branches_with_multistream_collects_full_result_set() {
+        let all_keys = test_gpu_keys(3);
+        let result = run_gpu_scan_branches_with(
+            &all_keys,
+            4,
+            |keys, _stream_count| Ok(vec![test_pir_result(); keys.len()]),
+            |_key_batch| unreachable!("micro-batch path should not run"),
+        )
+        .expect("multistream path should preserve result count");
+
+        assert_eq!(result.len(), all_keys.len());
     }
 
     #[test]
@@ -1672,5 +1764,47 @@ mod tests {
         .expect("micro-batch path should preserve result count");
 
         assert_eq!(result.len(), all_keys.len());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_query_gpu_batch_handler_returns_internal_error_on_multistream_mismatch() {
+        let state = test_state();
+        let request = test_gpu_batch_request(2);
+        let hooks = TestGpuBatchHooks {
+            stream_count: 4,
+            multistream_scan: std::sync::Arc::new(|_keys, _stream_count| {
+                Ok(vec![test_pir_result()])
+            }),
+            micro_batch_scan: std::sync::Arc::new(|_key_batch| {
+                unreachable!("micro-batch path should not run")
+            }),
+        };
+
+        let result = with_test_gpu_batch_hooks(hooks, move || {
+            page_query_gpu_batch_handler(State(state), Json(request))
+        })
+        .await;
+
+        assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_query_gpu_batch_handler_returns_internal_error_on_micro_batch_mismatch() {
+        let state = test_state();
+        let request = test_gpu_batch_request(3);
+        let hooks = TestGpuBatchHooks {
+            stream_count: 1,
+            multistream_scan: std::sync::Arc::new(|_keys, _stream_count| {
+                unreachable!("multistream path should not run")
+            }),
+            micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(vec![test_pir_result()])),
+        };
+
+        let result = with_test_gpu_batch_hooks(hooks, move || {
+            page_query_gpu_batch_handler(State(state), Json(request))
+        })
+        .await;
+
+        assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
     }
 }

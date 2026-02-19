@@ -4,7 +4,7 @@ title: Prototype multi-stream single-query dispatch for GPU page PIR
 status: Done
 assignee: []
 created_date: '2026-02-19 12:04'
-updated_date: '2026-02-19 16:21'
+updated_date: '2026-02-19 16:25'
 labels:
   - performance
   - cuda
@@ -55,4 +55,6 @@ Correctness: checksum_single == checksum_batch on all benchmark rows.
 2026-02-19: Added branch-boundary invariant helper validated_gpu_results_with_keys and tests for matching/mismatched lengths to prevent zip-truncation regressions in page_query_gpu_batch_handler.
 
 2026-02-19: Refined GPU batch invariants by extracting run_gpu_scan_branches_with (used directly by page_query_gpu_batch_handler) to cover both multistream and micro-batch mismatch paths in tests while keeping the hot path allocation-free.
+
+2026-02-19: Added handler-level mismatch tests for page_query_gpu_batch_handler using test-only GPU scan hooks (thread-local) for both multistream and micro-batch branches, plus positive multistream count-preservation coverage.
 <!-- SECTION:NOTES:END -->
