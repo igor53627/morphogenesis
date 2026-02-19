@@ -324,16 +324,6 @@ fn scan_error_to_status(e: crate::scan::ScanError) -> StatusCode {
     }
 }
 
-#[cfg(feature = "fused-batch-scan")]
-fn should_use_fused_batch_scan(query_count: usize) -> bool {
-    query_count > 1
-}
-
-#[cfg(not(feature = "fused-batch-scan"))]
-fn should_use_fused_batch_scan(_query_count: usize) -> bool {
-    false
-}
-
 fn apply_delta_entries_to_payloads<K: morphogen_dpf::DpfKey>(
     payloads: &mut [Vec<u8>; 3],
     keys: &[K; 3],
@@ -359,22 +349,7 @@ fn scan_batch_results_from_snapshot<K: morphogen_dpf::DpfKey>(
     all_keys: &[[K; 3]],
     entries: &[morphogen_core::DeltaEntry],
     row_size_bytes: usize,
-    use_fused_scan: bool,
 ) -> Result<Vec<BatchQueryResult>, StatusCode> {
-    if use_fused_scan {
-        let mut fused_payloads =
-            crate::scan::scan_main_matrix_multi(matrix, all_keys, row_size_bytes);
-        for (payloads, keys) in fused_payloads.iter_mut().zip(all_keys.iter()) {
-            apply_delta_entries_to_payloads(payloads, keys, entries)?;
-        }
-        return Ok(fused_payloads
-            .into_iter()
-            .map(|payloads| BatchQueryResult {
-                payloads: payloads.to_vec(),
-            })
-            .collect());
-    }
-
     let mut results = Vec::with_capacity(all_keys.len());
     for keys in all_keys {
         let mut payloads = crate::scan::scan_main_matrix(matrix, keys, row_size_bytes);
@@ -390,6 +365,7 @@ fn parse_gpu_query_keys(
     request: &GpuPageQueryRequest,
 ) -> Result<[morphogen_gpu_dpf::dpf::ChaChaKey; 3], StatusCode> {
     use morphogen_gpu_dpf::dpf::ChaChaKey;
+    use morphogen_gpu_dpf::kernel::MAX_DOMAIN_BITS;
 
     if request.keys.len() != 3 {
         return Err(StatusCode::BAD_REQUEST);
@@ -400,7 +376,15 @@ fn parse_gpu_query_keys(
         ChaChaKey::from_bytes(&request.keys[1]),
         ChaChaKey::from_bytes(&request.keys[2]),
     ) {
-        (Ok(k0), Ok(k1), Ok(k2)) => Ok([k0, k1, k2]),
+        (Ok(k0), Ok(k1), Ok(k2)) => {
+            if k0.domain_bits > MAX_DOMAIN_BITS
+                || k1.domain_bits > MAX_DOMAIN_BITS
+                || k2.domain_bits > MAX_DOMAIN_BITS
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Ok([k0, k1, k2])
+        }
         _ => Err(StatusCode::BAD_REQUEST),
     }
 }
@@ -658,7 +642,6 @@ pub async fn batch_query_handler(
         &all_keys,
         &entries,
         state.row_size_bytes,
-        should_use_fused_batch_scan(n),
     )?;
 
     Ok(Json(BatchQueryResponse {
@@ -1414,6 +1397,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_gpu_query_keys_rejects_domain_bits_above_kernel_limit() {
+        use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+        use morphogen_gpu_dpf::kernel::MAX_DOMAIN_BITS;
+
+        let params = ChaChaParams::new(MAX_DOMAIN_BITS + 1).expect("valid params");
+        let (k0, _) = generate_chacha_dpf_keys(&params, 0).expect("key generation should succeed");
+        let key_bytes = k0.to_bytes().to_vec();
+        let request = GpuPageQueryRequest {
+            keys: vec![key_bytes.clone(), key_bytes.clone(), key_bytes],
+        };
+
+        assert!(matches!(
+            parse_gpu_query_keys(&request),
+            Err(StatusCode::BAD_REQUEST)
+        ));
+    }
+
+    #[test]
+    fn parse_gpu_query_keys_accepts_kernel_max_domain_bits() {
+        use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+        use morphogen_gpu_dpf::kernel::MAX_DOMAIN_BITS;
+
+        let params = ChaChaParams::new(MAX_DOMAIN_BITS).expect("valid params");
+        let (k0, _) = generate_chacha_dpf_keys(&params, 0).expect("key generation should succeed");
+        let key_bytes = k0.to_bytes().to_vec();
+        let request = GpuPageQueryRequest {
+            keys: vec![key_bytes.clone(), key_bytes.clone(), key_bytes],
+        };
+
+        assert!(parse_gpu_query_keys(&request).is_ok());
+    }
+
+    #[test]
     fn batch_request_deserializes() {
         let json = r#"{"queries":[{"keys":["0xaabb","0xccdd","0xeeff"]}]}"#;
         let request: BatchQueryRequest = serde_json::from_str(json).unwrap();
@@ -1536,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_snapshot_scan_fused_matches_legacy_with_pending_delta() {
+    fn batch_snapshot_scan_applies_pending_delta_for_all_queries() {
         use morphogen_dpf::AesDpfKey;
 
         let state = test_state();
@@ -1563,26 +1579,26 @@ mod tests {
             .expect("snapshot should succeed");
         assert_eq!(pending_epoch, snapshot.epoch_id);
 
-        let legacy = scan_batch_results_from_snapshot(
+        let batch_results = scan_batch_results_from_snapshot(
             snapshot.matrix.as_ref(),
             &all_keys,
             &entries,
             state.row_size_bytes,
-            false,
         )
-        .expect("legacy path should succeed");
-        let fused = scan_batch_results_from_snapshot(
-            snapshot.matrix.as_ref(),
-            &all_keys,
-            &entries,
-            state.row_size_bytes,
-            true,
-        )
-        .expect("fused path should succeed");
+        .expect("batch path should succeed");
 
-        let legacy_payloads: Vec<Vec<Vec<u8>>> = legacy.into_iter().map(|r| r.payloads).collect();
-        let fused_payloads: Vec<Vec<Vec<u8>>> = fused.into_iter().map(|r| r.payloads).collect();
-        assert_eq!(fused_payloads, legacy_payloads);
+        let mut expected_payloads = Vec::with_capacity(all_keys.len());
+        for keys in &all_keys {
+            let mut payloads =
+                crate::scan::scan_main_matrix(snapshot.matrix.as_ref(), keys, state.row_size_bytes);
+            apply_delta_entries_to_payloads(&mut payloads, keys, &entries)
+                .expect("delta application should succeed");
+            expected_payloads.push(payloads.to_vec());
+        }
+
+        let actual_payloads: Vec<Vec<Vec<u8>>> =
+            batch_results.into_iter().map(|r| r.payloads).collect();
+        assert_eq!(actual_payloads, expected_payloads);
     }
 
     #[tokio::test]

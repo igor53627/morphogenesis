@@ -4,7 +4,7 @@ title: Prototype multi-stream single-query dispatch for GPU page PIR
 status: Done
 assignee: []
 created_date: '2026-02-19 12:04'
-updated_date: '2026-02-19 16:34'
+updated_date: '2026-02-19 17:56'
 labels:
   - performance
   - cuda
@@ -63,4 +63,6 @@ Correctness: checksum_single == checksum_batch on all benchmark rows.
 2026-02-19: Fixed test-hook setup ordering to avoid leaked hooks on nested-hook panic, expanded success-path assertions to all three page vectors, and added explicit panic-cleanup coverage for hook state reset.
 
 2026-02-19: Added nested-hook regression test to ensure setup-assert panics do not leak thread-local hook state.
+
+2026-02-19: Addressed PR review + CI breakage by enforcing ChaChaKey domain_bits <= MAX_DOMAIN_BITS in parse_gpu_query_keys and simplifying batch snapshot scan path to remove fused-batch-scan cfg/function dependency from this branch.
 <!-- SECTION:NOTES:END -->
