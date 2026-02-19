@@ -111,6 +111,14 @@ pub struct QueryResponse {
 
 /// Maximum number of queries in a single batch request.
 pub const MAX_BATCH_SIZE: usize = 32;
+#[cfg(any(feature = "cuda", test))]
+const GPU_MICRO_BATCH_SIZE: usize = 2;
+#[cfg(feature = "cuda")]
+const GPU_STREAM_COUNT_ENV: &str = "MORPHOGEN_GPU_STREAMS";
+#[cfg(any(feature = "cuda", test))]
+const DEFAULT_GPU_STREAM_COUNT: usize = 1;
+#[cfg(any(feature = "cuda", test))]
+const MAX_GPU_STREAM_COUNT: usize = 8;
 
 #[derive(Deserialize)]
 pub struct BatchQueryRequest {
@@ -163,6 +171,26 @@ pub struct PageQueryRequest {
 pub struct GpuPageQueryRequest {
     #[serde(with = "hex_bytes_vec")]
     pub keys: Vec<Vec<u8>>,
+}
+
+#[derive(Deserialize)]
+pub struct BatchGpuPageQueryRequest {
+    pub queries: Vec<GpuPageQueryRequest>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchGpuPageQueryResponse {
+    pub epoch_id: u64,
+    pub results: Vec<BatchGpuPageQueryResult>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchGpuPageQueryResult {
+    #[serde(with = "hex_bytes_vec")]
+    pub pages: Vec<Vec<u8>>,
+    #[cfg(feature = "verifiable-pir")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proof: Option<SumCheckProof>,
 }
 
 #[derive(Deserialize)]
@@ -296,6 +324,211 @@ fn scan_error_to_status(e: crate::scan::ScanError) -> StatusCode {
     }
 }
 
+fn apply_delta_entries_to_payloads<K: morphogen_dpf::DpfKey>(
+    payloads: &mut [Vec<u8>; 3],
+    keys: &[K; 3],
+    entries: &[morphogen_core::DeltaEntry],
+) -> Result<(), StatusCode> {
+    for entry in entries {
+        for (k, key) in keys.iter().enumerate() {
+            if key.eval_bit(entry.row_idx) {
+                if entry.diff.len() != payloads[k].len() {
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+                for (d, s) in payloads[k].iter_mut().zip(entry.diff.iter()) {
+                    *d ^= s;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn scan_batch_results_from_snapshot<K: morphogen_dpf::DpfKey>(
+    matrix: &morphogen_storage::ChunkedMatrix,
+    all_keys: &[[K; 3]],
+    entries: &[morphogen_core::DeltaEntry],
+    row_size_bytes: usize,
+) -> Result<Vec<BatchQueryResult>, StatusCode> {
+    let mut results = Vec::with_capacity(all_keys.len());
+    for keys in all_keys {
+        let mut payloads = crate::scan::scan_main_matrix(matrix, keys, row_size_bytes);
+        apply_delta_entries_to_payloads(&mut payloads, keys, entries)?;
+        results.push(BatchQueryResult {
+            payloads: payloads.to_vec(),
+        });
+    }
+    Ok(results)
+}
+
+fn parse_gpu_query_keys(
+    request: &GpuPageQueryRequest,
+) -> Result<[morphogen_gpu_dpf::dpf::ChaChaKey; 3], StatusCode> {
+    use morphogen_gpu_dpf::dpf::ChaChaKey;
+    use morphogen_gpu_dpf::kernel::MAX_DOMAIN_BITS;
+
+    if request.keys.len() != 3 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    match (
+        ChaChaKey::from_bytes(&request.keys[0]),
+        ChaChaKey::from_bytes(&request.keys[1]),
+        ChaChaKey::from_bytes(&request.keys[2]),
+    ) {
+        (Ok(k0), Ok(k1), Ok(k2)) => {
+            if k0.domain_bits > MAX_DOMAIN_BITS
+                || k1.domain_bits > MAX_DOMAIN_BITS
+                || k2.domain_bits > MAX_DOMAIN_BITS
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Ok([k0, k1, k2])
+        }
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn gpu_micro_batch_ranges(total_queries: usize) -> Vec<(usize, usize)> {
+    if total_queries == 0 {
+        return Vec::new();
+    }
+    let mut ranges =
+        Vec::with_capacity((total_queries + GPU_MICRO_BATCH_SIZE - 1) / GPU_MICRO_BATCH_SIZE);
+    let mut start = 0usize;
+    while start < total_queries {
+        let end = (start + GPU_MICRO_BATCH_SIZE).min(total_queries);
+        ranges.push((start, end));
+        start = end;
+    }
+    ranges
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn parse_gpu_stream_count(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_GPU_STREAM_COUNT)
+        .clamp(DEFAULT_GPU_STREAM_COUNT, MAX_GPU_STREAM_COUNT)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn ensure_gpu_result_count(expected: usize, actual: usize) -> Result<(), StatusCode> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn run_gpu_scan_branches_with<FMulti, FMicro>(
+    all_keys: &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+    stream_count: usize,
+    mut scan_multistream: FMulti,
+    mut scan_micro_batch: FMicro,
+) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
+where
+    FMulti: FnMut(
+        &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+        usize,
+    ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>,
+    FMicro: FnMut(
+        &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+    ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>,
+{
+    let n = all_keys.len();
+    let gpu_results = if stream_count > 1 {
+        scan_multistream(all_keys, stream_count)?
+    } else {
+        let mut gpu_results = Vec::with_capacity(n);
+        for (start, end) in gpu_micro_batch_ranges(n) {
+            let key_batch = &all_keys[start..end];
+            let mut chunk_results = scan_micro_batch(key_batch)?;
+            ensure_gpu_result_count(key_batch.len(), chunk_results.len())?;
+            gpu_results.append(&mut chunk_results);
+        }
+        gpu_results
+    };
+    ensure_gpu_result_count(n, gpu_results.len())?;
+    Ok(gpu_results)
+}
+
+#[cfg(test)]
+type TestGpuBatchMultistreamScan = std::sync::Arc<
+    dyn Fn(
+            &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+            usize,
+        ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+type TestGpuBatchMicroScan = std::sync::Arc<
+    dyn Fn(
+            &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+        ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TestGpuBatchHooks {
+    stream_count: usize,
+    multistream_scan: TestGpuBatchMultistreamScan,
+    micro_batch_scan: TestGpuBatchMicroScan,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GPU_BATCH_HOOKS: std::cell::RefCell<Option<TestGpuBatchHooks>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "cuda")]
+fn configured_gpu_stream_count() -> usize {
+    let raw = std::env::var(GPU_STREAM_COUNT_ENV).ok();
+    parse_gpu_stream_count(raw.as_deref())
+}
+
+fn collect_gpu_page_refs<'a>(matrix: &'a morphogen_storage::ChunkedMatrix) -> Vec<&'a [u8]> {
+    let page_size = morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+    let num_pages = matrix.total_size_bytes() / page_size;
+    let mut pages_refs = Vec::with_capacity(num_pages);
+    for i in 0..num_pages {
+        let start = i * page_size;
+        let (chunk_idx, chunk_offset) = (
+            start / matrix.chunk_size_bytes(),
+            start % matrix.chunk_size_bytes(),
+        );
+        let chunk = matrix.chunk(chunk_idx);
+        pages_refs.push(&chunk.as_slice()[chunk_offset..chunk_offset + page_size]);
+    }
+    pages_refs
+}
+
+fn cpu_eval_gpu_page_batch(
+    all_keys: &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+    matrix: &morphogen_storage::ChunkedMatrix,
+) -> Result<Vec<BatchGpuPageQueryResult>, StatusCode> {
+    let pages_refs = collect_gpu_page_refs(matrix);
+    let mut results = Vec::with_capacity(all_keys.len());
+    for keys in all_keys {
+        let result = morphogen_gpu_dpf::kernel::eval_fused_3dpf_cpu(
+            [&keys[0], &keys[1], &keys[2]],
+            &pages_refs,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        results.push(BatchGpuPageQueryResult {
+            pages: vec![result.page0, result.page1, result.page2],
+            #[cfg(feature = "verifiable-pir")]
+            proof: None,
+        });
+    }
+    Ok(results)
+}
+
 #[cfg_attr(feature = "tracing", instrument(skip(state, request)))]
 pub async fn query_handler(
     State(state): State<Arc<AppState>>,
@@ -343,7 +576,7 @@ pub async fn batch_query_handler(
     #[cfg(feature = "metrics")]
     counter!("pir_query_count_total", "type" => "batch").increment(1);
 
-    use morphogen_dpf::{AesDpfKey, DpfKey};
+    use morphogen_dpf::AesDpfKey;
 
     let n = request.queries.len();
     if n == 0 || n > MAX_BATCH_SIZE {
@@ -404,27 +637,12 @@ pub async fn batch_query_handler(
     }
 
     // All queries share the same consistent snapshot
-    let mut results = Vec::with_capacity(n);
-    for keys in &all_keys {
-        let mut payloads =
-            crate::scan::scan_main_matrix(snapshot1.matrix.as_ref(), keys, state.row_size_bytes);
-        // Apply delta entries
-        for entry in &entries {
-            for (k, key) in keys.iter().enumerate() {
-                if key.eval_bit(entry.row_idx) {
-                    if entry.diff.len() != payloads[k].len() {
-                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                    }
-                    for (d, s) in payloads[k].iter_mut().zip(entry.diff.iter()) {
-                        *d ^= s;
-                    }
-                }
-            }
-        }
-        results.push(BatchQueryResult {
-            payloads: payloads.to_vec(),
-        });
-    }
+    let results = scan_batch_results_from_snapshot(
+        snapshot1.matrix.as_ref(),
+        &all_keys,
+        &entries,
+        state.row_size_bytes,
+    )?;
 
     Ok(Json(BatchQueryResponse {
         epoch_id: epoch1,
@@ -537,20 +755,7 @@ pub async fn page_query_gpu_handler(
     #[cfg(feature = "metrics")]
     counter!("pir_query_count_total", "type" => "gpu").increment(1);
 
-    use morphogen_gpu_dpf::dpf::ChaChaKey;
-
-    if request.keys.len() != 3 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let keys: [ChaChaKey; 3] = match (
-        ChaChaKey::from_bytes(&request.keys[0]),
-        ChaChaKey::from_bytes(&request.keys[1]),
-        ChaChaKey::from_bytes(&request.keys[2]),
-    ) {
-        (Ok(k0), Ok(k1), Ok(k2)) => [k0, k1, k2],
-        _ => return Err(StatusCode::BAD_REQUEST),
-    };
+    let keys = parse_gpu_query_keys(&request)?;
 
     #[cfg(feature = "cuda")]
     if let (Some(scanner), Some(matrix_mutex)) = (&state.gpu_scanner, &state.gpu_matrix) {
@@ -582,12 +787,8 @@ pub async fn page_query_gpu_handler(
                     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                 // 4. Scan Delta
-                let delta_results = scan_delta_for_gpu(
-                    pending.as_ref(),
-                    &[keys[0], keys[1], keys[2]],
-                    PAGE_SIZE_BYTES,
-                )
-                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                let delta_results = scan_delta_for_gpu(pending.as_ref(), &keys, PAGE_SIZE_BYTES)
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
                 // 5. Verify consistency after scan
                 let snapshot2 = state.global.load();
@@ -644,36 +845,164 @@ pub async fn page_query_gpu_handler(
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    // CPU Fallback (or if CUDA is disabled)
+    // CPU fallback (or if CUDA is disabled)
     let snapshot = state.global.load();
-    let num_pages =
-        snapshot.matrix.total_size_bytes() / morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
-
-    // We need to collect pages from the ChunkedMatrix
-    // This is slow on CPU but provides a reference implementation
-    let mut pages_refs = Vec::with_capacity(num_pages);
-    for i in 0..num_pages {
-        let start = i * morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
-        let (chunk_idx, chunk_offset) = (
-            start / snapshot.matrix.chunk_size_bytes(),
-            start % snapshot.matrix.chunk_size_bytes(),
-        );
-        let chunk = snapshot.matrix.chunk(chunk_idx);
-        pages_refs.push(
-            &chunk.as_slice()
-                [chunk_offset..chunk_offset + morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES],
-        );
-    }
-
-    let result =
-        morphogen_gpu_dpf::kernel::eval_fused_3dpf_cpu([&keys[0], &keys[1], &keys[2]], &pages_refs)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut batch = cpu_eval_gpu_page_batch(std::slice::from_ref(&keys), snapshot.matrix.as_ref())?;
+    let result = batch.pop().ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(PageQueryResponse {
         epoch_id: snapshot.epoch_id,
-        pages: vec![result.page0, result.page1, result.page2],
+        pages: result.pages,
         #[cfg(feature = "verifiable-pir")]
-        proof: None, // No proof for CPU fallback yet
+        proof: result.proof, // No proof for CPU fallback path
+    }))
+}
+
+#[cfg_attr(feature = "tracing", instrument(skip(state, request)))]
+pub async fn page_query_gpu_batch_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BatchGpuPageQueryRequest>,
+) -> Result<Json<BatchGpuPageQueryResponse>, StatusCode> {
+    #[cfg(feature = "metrics")]
+    counter!("pir_query_count_total", "type" => "gpu_batch").increment(1);
+
+    let n = request.queries.len();
+    if n == 0 || n > MAX_BATCH_SIZE {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let mut all_keys = Vec::with_capacity(n);
+    for query in &request.queries {
+        all_keys.push(parse_gpu_query_keys(query)?);
+    }
+
+    #[cfg(test)]
+    if let Some(hooks) = TEST_GPU_BATCH_HOOKS.with(|slot| slot.borrow().clone()) {
+        let gpu_results = run_gpu_scan_branches_with(
+            &all_keys,
+            hooks.stream_count,
+            |keys, count| (hooks.multistream_scan)(keys, count),
+            |key_batch| (hooks.micro_batch_scan)(key_batch),
+        )?;
+        let results = gpu_results
+            .into_iter()
+            .map(|gpu_result| BatchGpuPageQueryResult {
+                pages: vec![gpu_result.page0, gpu_result.page1, gpu_result.page2],
+                #[cfg(feature = "verifiable-pir")]
+                proof: None,
+            })
+            .collect();
+        return Ok(Json(BatchGpuPageQueryResponse {
+            epoch_id: state.global.load().epoch_id,
+            results,
+        }));
+    }
+
+    #[cfg(feature = "cuda")]
+    if let (Some(scanner), Some(matrix_mutex)) = (&state.gpu_scanner, &state.gpu_matrix) {
+        use crate::scan::scan_delta_for_gpu;
+        #[cfg(feature = "verifiable-pir")]
+        use morphogen_core::sumcheck::SumCheckProof;
+        use morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+
+        for _ in 0..10 {
+            let snapshot1 = state.global.load();
+            let matrix_guard = matrix_mutex
+                .lock()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+            if let Some(matrix) = matrix_guard.as_ref() {
+                let pending = state.global.load_pending();
+                let pending_epoch = pending.pending_epoch();
+                if pending_epoch != snapshot1.epoch_id {
+                    drop(matrix_guard);
+                    std::thread::yield_now();
+                    continue;
+                }
+
+                let stream_count = configured_gpu_stream_count();
+                let gpu_results = run_gpu_scan_branches_with(
+                    &all_keys,
+                    stream_count,
+                    |keys, count| {
+                        unsafe {
+                            scanner
+                                .scan_batch_single_query_multistream_optimized(matrix, keys, count)
+                        }
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                    },
+                    |key_batch| {
+                        unsafe { scanner.scan_batch_optimized(matrix, key_batch) }
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                    },
+                )?;
+                let snapshot2 = state.global.load();
+                let pending_epoch_after = pending.pending_epoch();
+                if snapshot1.epoch_id != snapshot2.epoch_id
+                    || pending_epoch_after != snapshot1.epoch_id
+                {
+                    drop(matrix_guard);
+                    std::thread::yield_now();
+                    continue;
+                }
+
+                let mut results = Vec::with_capacity(n);
+                for (mut gpu_result, keys) in gpu_results.into_iter().zip(all_keys.iter()) {
+                    let delta_results = scan_delta_for_gpu(pending.as_ref(), keys, PAGE_SIZE_BYTES)
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+                    for k in 0..3 {
+                        let gpu_page = match k {
+                            0 => &mut gpu_result.page0,
+                            1 => &mut gpu_result.page1,
+                            _ => &mut gpu_result.page2,
+                        };
+                        for (i, b) in delta_results[k].iter().enumerate() {
+                            gpu_page[i] ^= *b;
+                        }
+                    }
+
+                    #[cfg(feature = "verifiable-pir")]
+                    let proof = {
+                        let v0 =
+                            u128::from_le_bytes(gpu_result.verif0.try_into().unwrap_or([0; 16]));
+                        let v1 =
+                            u128::from_le_bytes(gpu_result.verif1.try_into().unwrap_or([0; 16]));
+                        let v2 =
+                            u128::from_le_bytes(gpu_result.verif2.try_into().unwrap_or([0; 16]));
+
+                        Some(SumCheckProof {
+                            round_polynomials: vec![],
+                            sum: v0 ^ v1 ^ v2,
+                        })
+                    };
+
+                    results.push(BatchGpuPageQueryResult {
+                        pages: vec![gpu_result.page0, gpu_result.page1, gpu_result.page2],
+                        #[cfg(feature = "verifiable-pir")]
+                        proof,
+                    });
+                }
+
+                return Ok(Json(BatchGpuPageQueryResponse {
+                    epoch_id: snapshot1.epoch_id,
+                    results,
+                }));
+            }
+
+            drop(matrix_guard);
+            std::thread::yield_now();
+        }
+
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // CPU fallback (or if CUDA is disabled)
+    let snapshot = state.global.load();
+    let results = cpu_eval_gpu_page_batch(&all_keys, snapshot.matrix.as_ref())?;
+    Ok(Json(BatchGpuPageQueryResponse {
+        epoch_id: snapshot.epoch_id,
+        results,
     }))
 }
 
@@ -900,6 +1229,7 @@ pub fn create_router_with_concurrency(
         .route("/query/batch", post(batch_query_handler))
         .route("/query/page", post(page_query_handler))
         .route("/query/page/gpu", post(page_query_gpu_handler))
+        .route("/query/page/gpu/batch", post(page_query_gpu_batch_handler))
         .layer(ConcurrencyLimitLayer::new(max_concurrent));
 
     let mut app = Router::new()
@@ -1067,6 +1397,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_gpu_query_keys_rejects_domain_bits_above_kernel_limit() {
+        use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+        use morphogen_gpu_dpf::kernel::MAX_DOMAIN_BITS;
+
+        let params = ChaChaParams::new(MAX_DOMAIN_BITS + 1).expect("valid params");
+        let (k0, _) = generate_chacha_dpf_keys(&params, 0).expect("key generation should succeed");
+        let key_bytes = k0.to_bytes().to_vec();
+        let request = GpuPageQueryRequest {
+            keys: vec![key_bytes.clone(), key_bytes.clone(), key_bytes],
+        };
+
+        assert!(matches!(
+            parse_gpu_query_keys(&request),
+            Err(StatusCode::BAD_REQUEST)
+        ));
+    }
+
+    #[test]
+    fn parse_gpu_query_keys_accepts_kernel_max_domain_bits() {
+        use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+        use morphogen_gpu_dpf::kernel::MAX_DOMAIN_BITS;
+
+        let params = ChaChaParams::new(MAX_DOMAIN_BITS).expect("valid params");
+        let (k0, _) = generate_chacha_dpf_keys(&params, 0).expect("key generation should succeed");
+        let key_bytes = k0.to_bytes().to_vec();
+        let request = GpuPageQueryRequest {
+            keys: vec![key_bytes.clone(), key_bytes.clone(), key_bytes],
+        };
+
+        assert!(parse_gpu_query_keys(&request).is_ok());
+    }
+
+    #[test]
     fn batch_request_deserializes() {
         let json = r#"{"queries":[{"keys":["0xaabb","0xccdd","0xeeff"]}]}"#;
         let request: BatchQueryRequest = serde_json::from_str(json).unwrap();
@@ -1186,5 +1549,378 @@ mod tests {
         for r in &response.results {
             assert_eq!(r.payloads.len(), 3);
         }
+    }
+
+    #[test]
+    fn batch_snapshot_scan_applies_pending_delta_for_all_queries() {
+        use morphogen_dpf::AesDpfKey;
+
+        let state = test_state();
+        state
+            .global
+            .load_pending()
+            .push(0, vec![0xAB; state.row_size_bytes])
+            .expect("delta insert should succeed");
+
+        let mut rng = rand::thread_rng();
+        let mut all_keys: Vec<[AesDpfKey; 3]> = Vec::new();
+        for target in [0, 1, 2, 3] {
+            let (k0, _) = AesDpfKey::generate_pair(&mut rng, target);
+            let (k1, _) = AesDpfKey::generate_pair(&mut rng, target + 1);
+            let (k2, _) = AesDpfKey::generate_pair(&mut rng, target + 2);
+            all_keys.push([k0, k1, k2]);
+        }
+
+        let snapshot = state.global.load();
+        let (pending_epoch, entries) = state
+            .global
+            .load_pending()
+            .snapshot_with_epoch()
+            .expect("snapshot should succeed");
+        assert_eq!(pending_epoch, snapshot.epoch_id);
+
+        let batch_results = scan_batch_results_from_snapshot(
+            snapshot.matrix.as_ref(),
+            &all_keys,
+            &entries,
+            state.row_size_bytes,
+        )
+        .expect("batch path should succeed");
+
+        let mut expected_payloads = Vec::with_capacity(all_keys.len());
+        for keys in &all_keys {
+            let mut payloads =
+                crate::scan::scan_main_matrix(snapshot.matrix.as_ref(), keys, state.row_size_bytes);
+            apply_delta_entries_to_payloads(&mut payloads, keys, &entries)
+                .expect("delta application should succeed");
+            expected_payloads.push(payloads.to_vec());
+        }
+
+        let actual_payloads: Vec<Vec<Vec<u8>>> =
+            batch_results.into_iter().map(|r| r.payloads).collect();
+        assert_eq!(actual_payloads, expected_payloads);
+    }
+
+    #[tokio::test]
+    async fn batch_query_consistency_fallback_returns_service_unavailable_on_persistent_mismatch() {
+        use morphogen_dpf::AesDpfKey;
+
+        let state = test_state();
+        state
+            .global
+            .load_pending()
+            .drain_for_epoch(43)
+            .expect("force pending epoch mismatch");
+
+        let mut rng = rand::thread_rng();
+        let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let (k1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+        let (k2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+        let request = BatchQueryRequest {
+            queries: vec![QueryRequest {
+                keys: vec![
+                    k0.to_bytes().to_vec(),
+                    k1.to_bytes().to_vec(),
+                    k2.to_bytes().to_vec(),
+                ],
+            }],
+        };
+
+        let result = batch_query_handler(State(state), Json(request)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn gpu_micro_batch_ranges_caps_each_batch_to_two() {
+        assert_eq!(gpu_micro_batch_ranges(1), vec![(0, 1)]);
+        assert_eq!(gpu_micro_batch_ranges(2), vec![(0, 2)]);
+        assert_eq!(gpu_micro_batch_ranges(3), vec![(0, 2), (2, 3)]);
+        assert_eq!(gpu_micro_batch_ranges(4), vec![(0, 2), (2, 4)]);
+        assert_eq!(gpu_micro_batch_ranges(5), vec![(0, 2), (2, 4), (4, 5)]);
+    }
+
+    #[test]
+    fn gpu_micro_batch_ranges_preserves_order_and_full_coverage() {
+        let ranges = gpu_micro_batch_ranges(7);
+        let mut covered = Vec::new();
+        for (start, end) in ranges {
+            assert!(end > start);
+            assert!(end - start <= 2);
+            covered.extend(start..end);
+        }
+        assert_eq!(covered, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn parse_gpu_stream_count_supports_required_values() {
+        assert_eq!(parse_gpu_stream_count(Some("1")), 1);
+        assert_eq!(parse_gpu_stream_count(Some("2")), 2);
+        assert_eq!(parse_gpu_stream_count(Some("4")), 4);
+        assert_eq!(parse_gpu_stream_count(Some("8")), 8);
+    }
+
+    #[test]
+    fn parse_gpu_stream_count_defaults_and_clamps() {
+        assert_eq!(parse_gpu_stream_count(None), 1);
+        assert_eq!(parse_gpu_stream_count(Some("0")), 1);
+        assert_eq!(parse_gpu_stream_count(Some("999")), 8);
+        assert_eq!(parse_gpu_stream_count(Some("bad")), 1);
+    }
+
+    #[test]
+    fn ensure_gpu_result_count_accepts_matching_lengths() {
+        assert!(ensure_gpu_result_count(4, 4).is_ok());
+    }
+
+    #[test]
+    fn ensure_gpu_result_count_rejects_mismatched_lengths() {
+        assert_eq!(
+            ensure_gpu_result_count(4, 3),
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        );
+    }
+
+    fn test_gpu_keys(count: usize) -> Vec<[morphogen_gpu_dpf::dpf::ChaChaKey; 3]> {
+        use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+
+        let params = ChaChaParams::new(8).expect("valid params");
+        let mut keys = Vec::with_capacity(count);
+        for i in 0..count {
+            let (k0, _) = generate_chacha_dpf_keys(&params, i).expect("key generation should work");
+            keys.push([k0.clone(), k0.clone(), k0]);
+        }
+        keys
+    }
+
+    fn test_pir_result() -> morphogen_gpu_dpf::kernel::PirResult {
+        morphogen_gpu_dpf::kernel::PirResult {
+            page0: Vec::new(),
+            page1: Vec::new(),
+            page2: Vec::new(),
+            verif0: Vec::new(),
+            verif1: Vec::new(),
+            verif2: Vec::new(),
+            timing: morphogen_gpu_dpf::kernel::KernelTiming::default(),
+        }
+    }
+
+    fn test_pir_result_with_marker(marker: u8) -> morphogen_gpu_dpf::kernel::PirResult {
+        morphogen_gpu_dpf::kernel::PirResult {
+            page0: vec![marker],
+            page1: vec![marker.wrapping_add(1)],
+            page2: vec![marker.wrapping_add(2)],
+            verif0: Vec::new(),
+            verif1: Vec::new(),
+            verif2: Vec::new(),
+            timing: morphogen_gpu_dpf::kernel::KernelTiming::default(),
+        }
+    }
+
+    fn test_gpu_batch_request(count: usize) -> BatchGpuPageQueryRequest {
+        let all_keys = test_gpu_keys(count);
+        let queries = all_keys
+            .iter()
+            .map(|keys| GpuPageQueryRequest {
+                keys: vec![
+                    keys[0].to_bytes().to_vec(),
+                    keys[1].to_bytes().to_vec(),
+                    keys[2].to_bytes().to_vec(),
+                ],
+            })
+            .collect();
+        BatchGpuPageQueryRequest { queries }
+    }
+
+    struct TestGpuHookResetGuard;
+
+    impl Drop for TestGpuHookResetGuard {
+        fn drop(&mut self) {
+            TEST_GPU_BATCH_HOOKS.with(|slot| {
+                slot.replace(None);
+            });
+        }
+    }
+
+    async fn with_test_gpu_batch_hooks<F, Fut, R>(hooks: TestGpuBatchHooks, f: F) -> R
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = R>,
+    {
+        TEST_GPU_BATCH_HOOKS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            assert!(slot.is_none(), "nested test hooks are not supported");
+            *slot = Some(hooks);
+        });
+        let _guard = TestGpuHookResetGuard;
+        f().await
+    }
+
+    #[test]
+    fn run_gpu_scan_branches_with_multistream_rejects_mismatched_lengths() {
+        let all_keys = test_gpu_keys(2);
+        let result = run_gpu_scan_branches_with(
+            &all_keys,
+            4,
+            |_keys, _stream_count| Ok(vec![test_pir_result()]),
+            |_key_batch| unreachable!("micro-batch path should not run"),
+        );
+
+        assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+    }
+
+    #[test]
+    fn run_gpu_scan_branches_with_multistream_collects_full_result_set() {
+        let all_keys = test_gpu_keys(3);
+        let result = run_gpu_scan_branches_with(
+            &all_keys,
+            4,
+            |keys, _stream_count| Ok(vec![test_pir_result(); keys.len()]),
+            |_key_batch| unreachable!("micro-batch path should not run"),
+        )
+        .expect("multistream path should preserve result count");
+
+        assert_eq!(result.len(), all_keys.len());
+    }
+
+    #[test]
+    fn run_gpu_scan_branches_with_micro_batch_rejects_mismatched_chunk_lengths() {
+        let all_keys = test_gpu_keys(3);
+        let result = run_gpu_scan_branches_with(
+            &all_keys,
+            1,
+            |_keys, _stream_count| unreachable!("multistream path should not run"),
+            |_key_batch| Ok(vec![test_pir_result()]),
+        );
+
+        assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+    }
+
+    #[test]
+    fn run_gpu_scan_branches_with_micro_batch_collects_full_result_set() {
+        let all_keys = test_gpu_keys(3);
+        let result = run_gpu_scan_branches_with(
+            &all_keys,
+            1,
+            |_keys, _stream_count| unreachable!("multistream path should not run"),
+            |key_batch| Ok(vec![test_pir_result(); key_batch.len()]),
+        )
+        .expect("micro-batch path should preserve result count");
+
+        assert_eq!(result.len(), all_keys.len());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_query_gpu_batch_handler_returns_internal_error_on_multistream_mismatch() {
+        let state = test_state();
+        let request = test_gpu_batch_request(2);
+        let hooks = TestGpuBatchHooks {
+            stream_count: 4,
+            multistream_scan: std::sync::Arc::new(|_keys, _stream_count| {
+                Ok(vec![test_pir_result()])
+            }),
+            micro_batch_scan: std::sync::Arc::new(|_key_batch| {
+                unreachable!("micro-batch path should not run")
+            }),
+        };
+
+        let result = with_test_gpu_batch_hooks(hooks, move || {
+            page_query_gpu_batch_handler(State(state), Json(request))
+        })
+        .await;
+
+        assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_query_gpu_batch_handler_returns_internal_error_on_micro_batch_mismatch() {
+        let state = test_state();
+        let request = test_gpu_batch_request(3);
+        let hooks = TestGpuBatchHooks {
+            stream_count: 1,
+            multistream_scan: std::sync::Arc::new(|_keys, _stream_count| {
+                unreachable!("multistream path should not run")
+            }),
+            micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(vec![test_pir_result()])),
+        };
+
+        let result = with_test_gpu_batch_hooks(hooks, move || {
+            page_query_gpu_batch_handler(State(state), Json(request))
+        })
+        .await;
+
+        assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_query_gpu_batch_handler_maps_test_hook_results_in_order() {
+        let state = test_state();
+        let request = test_gpu_batch_request(2);
+        let hooks = TestGpuBatchHooks {
+            stream_count: 4,
+            multistream_scan: std::sync::Arc::new(|keys, _stream_count| {
+                Ok(keys
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _)| test_pir_result_with_marker((idx as u8) * 10))
+                    .collect())
+            }),
+            micro_batch_scan: std::sync::Arc::new(|_key_batch| {
+                unreachable!("micro-batch path should not run")
+            }),
+        };
+
+        let response = with_test_gpu_batch_hooks(hooks, move || {
+            page_query_gpu_batch_handler(State(state), Json(request))
+        })
+        .await
+        .expect("test hook success path should return response")
+        .0;
+
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.results[0].pages[0], vec![0u8]);
+        assert_eq!(response.results[0].pages[1], vec![1u8]);
+        assert_eq!(response.results[0].pages[2], vec![2u8]);
+        assert_eq!(response.results[1].pages[0], vec![10u8]);
+        assert_eq!(response.results[1].pages[1], vec![11u8]);
+        assert_eq!(response.results[1].pages[2], vec![12u8]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_test_gpu_batch_hooks_clears_state_after_panic() {
+        let hooks = TestGpuBatchHooks {
+            stream_count: 4,
+            multistream_scan: std::sync::Arc::new(|_keys, _stream_count| Ok(Vec::new())),
+            micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(Vec::new())),
+        };
+
+        let join = tokio::spawn(with_test_gpu_batch_hooks(hooks, || async {
+            panic!("intentional panic for hook cleanup test");
+        }))
+        .await;
+        assert!(join.is_err());
+        assert!(TEST_GPU_BATCH_HOOKS.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_test_gpu_batch_hooks_nested_call_panics_without_leaking_state() {
+        let hooks = TestGpuBatchHooks {
+            stream_count: 4,
+            multistream_scan: std::sync::Arc::new(|_keys, _stream_count| Ok(Vec::new())),
+            micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(Vec::new())),
+        };
+
+        let join = tokio::spawn(with_test_gpu_batch_hooks(hooks.clone(), move || {
+            let nested_hooks = hooks.clone();
+            async move {
+                let _ =
+                    with_test_gpu_batch_hooks(nested_hooks, || async { Ok::<(), StatusCode>(()) })
+                        .await;
+            }
+        }))
+        .await;
+
+        assert!(join.is_err());
+        assert!(TEST_GPU_BATCH_HOOKS.with(|slot| slot.borrow().is_none()));
     }
 }
