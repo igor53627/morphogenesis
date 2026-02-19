@@ -895,15 +895,23 @@ pub async fn page_query_gpu_batch_handler(
 
     #[cfg(test)]
     if let Some(hooks) = TEST_GPU_BATCH_HOOKS.with(|slot| slot.borrow().clone()) {
-        let _gpu_results = run_gpu_scan_branches_with(
+        let gpu_results = run_gpu_scan_branches_with(
             &all_keys,
             hooks.stream_count,
             |keys, count| (hooks.multistream_scan)(keys, count),
             |key_batch| (hooks.micro_batch_scan)(key_batch),
         )?;
+        let results = gpu_results
+            .into_iter()
+            .map(|gpu_result| BatchGpuPageQueryResult {
+                pages: vec![gpu_result.page0, gpu_result.page1, gpu_result.page2],
+                #[cfg(feature = "verifiable-pir")]
+                proof: None,
+            })
+            .collect();
         return Ok(Json(BatchGpuPageQueryResponse {
             epoch_id: state.global.load().epoch_id,
-            results: Vec::new(),
+            results,
         }));
     }
 
@@ -1681,6 +1689,18 @@ mod tests {
         }
     }
 
+    fn test_pir_result_with_marker(marker: u8) -> morphogen_gpu_dpf::kernel::PirResult {
+        morphogen_gpu_dpf::kernel::PirResult {
+            page0: vec![marker],
+            page1: vec![marker.wrapping_add(1)],
+            page2: vec![marker.wrapping_add(2)],
+            verif0: Vec::new(),
+            verif1: Vec::new(),
+            verif2: Vec::new(),
+            timing: morphogen_gpu_dpf::kernel::KernelTiming::default(),
+        }
+    }
+
     fn test_gpu_batch_request(count: usize) -> BatchGpuPageQueryRequest {
         let all_keys = test_gpu_keys(count);
         let queries = all_keys
@@ -1696,6 +1716,16 @@ mod tests {
         BatchGpuPageQueryRequest { queries }
     }
 
+    struct TestGpuHookResetGuard;
+
+    impl Drop for TestGpuHookResetGuard {
+        fn drop(&mut self) {
+            TEST_GPU_BATCH_HOOKS.with(|slot| {
+                slot.replace(None);
+            });
+        }
+    }
+
     async fn with_test_gpu_batch_hooks<F, Fut, R>(hooks: TestGpuBatchHooks, f: F) -> R
     where
         F: FnOnce() -> Fut,
@@ -1705,11 +1735,8 @@ mod tests {
             let prev = slot.replace(Some(hooks));
             assert!(prev.is_none(), "nested test hooks are not supported");
         });
-        let result = f().await;
-        TEST_GPU_BATCH_HOOKS.with(|slot| {
-            slot.replace(None);
-        });
-        result
+        let _guard = TestGpuHookResetGuard;
+        f().await
     }
 
     #[test]
@@ -1806,5 +1833,35 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_query_gpu_batch_handler_maps_test_hook_results_in_order() {
+        let state = test_state();
+        let request = test_gpu_batch_request(2);
+        let hooks = TestGpuBatchHooks {
+            stream_count: 4,
+            multistream_scan: std::sync::Arc::new(|keys, _stream_count| {
+                Ok(keys
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, _)| test_pir_result_with_marker((idx as u8) * 10))
+                    .collect())
+            }),
+            micro_batch_scan: std::sync::Arc::new(|_key_batch| {
+                unreachable!("micro-batch path should not run")
+            }),
+        };
+
+        let response = with_test_gpu_batch_hooks(hooks, move || {
+            page_query_gpu_batch_handler(State(state), Json(request))
+        })
+        .await
+        .expect("test hook success path should return response")
+        .0;
+
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.results[0].pages[0], vec![0u8]);
+        assert_eq!(response.results[1].pages[0], vec![10u8]);
     }
 }
