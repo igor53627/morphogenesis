@@ -437,18 +437,36 @@ fn ensure_gpu_result_count(expected: usize, actual: usize) -> Result<(), StatusC
 }
 
 #[cfg(any(feature = "cuda", test))]
-fn validated_gpu_results_with_keys<'a>(
-    gpu_results: Vec<morphogen_gpu_dpf::kernel::PirResult>,
-    all_keys: &'a [[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
-) -> Result<
-    Vec<(
-        morphogen_gpu_dpf::kernel::PirResult,
-        &'a [morphogen_gpu_dpf::dpf::ChaChaKey; 3],
-    )>,
-    StatusCode,
-> {
-    ensure_gpu_result_count(all_keys.len(), gpu_results.len())?;
-    Ok(gpu_results.into_iter().zip(all_keys.iter()).collect())
+fn run_gpu_scan_branches_with<FMulti, FMicro>(
+    all_keys: &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+    stream_count: usize,
+    mut scan_multistream: FMulti,
+    mut scan_micro_batch: FMicro,
+) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
+where
+    FMulti: FnMut(
+        &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+        usize,
+    ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>,
+    FMicro: FnMut(
+        &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+    ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>,
+{
+    let n = all_keys.len();
+    let gpu_results = if stream_count > 1 {
+        scan_multistream(all_keys, stream_count)?
+    } else {
+        let mut gpu_results = Vec::with_capacity(n);
+        for (start, end) in gpu_micro_batch_ranges(n) {
+            let key_batch = &all_keys[start..end];
+            let mut chunk_results = scan_micro_batch(key_batch)?;
+            ensure_gpu_result_count(key_batch.len(), chunk_results.len())?;
+            gpu_results.append(&mut chunk_results);
+        }
+        gpu_results
+    };
+    ensure_gpu_result_count(n, gpu_results.len())?;
+    Ok(gpu_results)
 }
 
 #[cfg(feature = "cuda")]
@@ -865,29 +883,21 @@ pub async fn page_query_gpu_batch_handler(
                 }
 
                 let stream_count = configured_gpu_stream_count();
-                let gpu_results = if stream_count > 1 {
-                    unsafe {
-                        scanner.scan_batch_single_query_multistream_optimized(
-                            matrix,
-                            &all_keys,
-                            stream_count,
-                        )
-                    }
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-                } else {
-                    let mut gpu_results = Vec::with_capacity(n);
-                    for (start, end) in gpu_micro_batch_ranges(n) {
-                        let key_batch = &all_keys[start..end];
-                        let mut chunk_results =
-                            unsafe { scanner.scan_batch_optimized(matrix, key_batch) }
-                                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-                        ensure_gpu_result_count(key_batch.len(), chunk_results.len())?;
-                        gpu_results.append(&mut chunk_results);
-                    }
-                    gpu_results
-                };
-                let gpu_results_with_keys =
-                    validated_gpu_results_with_keys(gpu_results, &all_keys)?;
+                let gpu_results = run_gpu_scan_branches_with(
+                    &all_keys,
+                    stream_count,
+                    |keys, count| {
+                        unsafe {
+                            scanner
+                                .scan_batch_single_query_multistream_optimized(matrix, keys, count)
+                        }
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                    },
+                    |key_batch| {
+                        unsafe { scanner.scan_batch_optimized(matrix, key_batch) }
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                    },
+                )?;
                 let snapshot2 = state.global.load();
                 let pending_epoch_after = pending.pending_epoch();
                 if snapshot1.epoch_id != snapshot2.epoch_id
@@ -899,7 +909,7 @@ pub async fn page_query_gpu_batch_handler(
                 }
 
                 let mut results = Vec::with_capacity(n);
-                for (mut gpu_result, keys) in gpu_results_with_keys {
+                for (mut gpu_result, keys) in gpu_results.into_iter().zip(all_keys.iter()) {
                     let delta_results = scan_delta_for_gpu(pending.as_ref(), keys, PAGE_SIZE_BYTES)
                         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -1625,23 +1635,42 @@ mod tests {
     }
 
     #[test]
-    fn validated_gpu_results_with_keys_accepts_matching_lengths() {
+    fn run_gpu_scan_branches_with_multistream_rejects_mismatched_lengths() {
         let all_keys = test_gpu_keys(2);
-        let gpu_results = vec![test_pir_result(), test_pir_result()];
+        let result = run_gpu_scan_branches_with(
+            &all_keys,
+            4,
+            |_keys, _stream_count| Ok(vec![test_pir_result()]),
+            |_key_batch| unreachable!("micro-batch path should not run"),
+        );
 
-        let paired =
-            validated_gpu_results_with_keys(gpu_results, &all_keys).expect("lengths should match");
-        assert_eq!(paired.len(), 2);
+        assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
     }
 
     #[test]
-    fn validated_gpu_results_with_keys_rejects_mismatched_lengths() {
-        let all_keys = test_gpu_keys(2);
-        let gpu_results = vec![test_pir_result()];
+    fn run_gpu_scan_branches_with_micro_batch_rejects_mismatched_chunk_lengths() {
+        let all_keys = test_gpu_keys(3);
+        let result = run_gpu_scan_branches_with(
+            &all_keys,
+            1,
+            |_keys, _stream_count| unreachable!("multistream path should not run"),
+            |_key_batch| Ok(vec![test_pir_result()]),
+        );
 
-        assert!(matches!(
-            validated_gpu_results_with_keys(gpu_results, &all_keys),
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        ));
+        assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+    }
+
+    #[test]
+    fn run_gpu_scan_branches_with_micro_batch_collects_full_result_set() {
+        let all_keys = test_gpu_keys(3);
+        let result = run_gpu_scan_branches_with(
+            &all_keys,
+            1,
+            |_keys, _stream_count| unreachable!("multistream path should not run"),
+            |key_batch| Ok(vec![test_pir_result(); key_batch.len()]),
+        )
+        .expect("micro-batch path should preserve result count");
+
+        assert_eq!(result.len(), all_keys.len());
     }
 }
