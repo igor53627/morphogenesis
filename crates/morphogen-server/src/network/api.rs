@@ -1885,4 +1885,26 @@ mod tests {
         assert!(join.is_err());
         assert!(TEST_GPU_BATCH_HOOKS.with(|slot| slot.borrow().is_none()));
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn with_test_gpu_batch_hooks_nested_call_panics_without_leaking_state() {
+        let hooks = TestGpuBatchHooks {
+            stream_count: 4,
+            multistream_scan: std::sync::Arc::new(|_keys, _stream_count| Ok(Vec::new())),
+            micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(Vec::new())),
+        };
+
+        let join = tokio::spawn(with_test_gpu_batch_hooks(hooks.clone(), move || {
+            let nested_hooks = hooks.clone();
+            async move {
+                let _ =
+                    with_test_gpu_batch_hooks(nested_hooks, || async { Ok::<(), StatusCode>(()) })
+                        .await;
+            }
+        }))
+        .await;
+
+        assert!(join.is_err());
+        assert!(TEST_GPU_BATCH_HOOKS.with(|slot| slot.borrow().is_none()));
+    }
 }
