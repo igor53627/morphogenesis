@@ -4,7 +4,7 @@ title: Prototype multi-stream single-query dispatch for GPU page PIR
 status: Done
 assignee: []
 created_date: '2026-02-19 12:04'
-updated_date: '2026-02-19 16:13'
+updated_date: '2026-02-19 16:17'
 labels:
   - performance
   - cuda
@@ -51,4 +51,6 @@ On tested workload, stream=4 was best overall for Q>=4.
 Correctness: checksum_single == checksum_batch on all benchmark rows.
 
 2026-02-19: Addressed RoboRev findings post-commit adf33cd7. Fixes: (1) CUDA multistream kernel selection now uses a single `using_optimized_batch1` guard for both kernel function and shared-memory mask sizing; (2) /query/page/gpu/batch now enforces strict GPU result count invariants (including multistream path) and adds unit tests for mismatch handling; (3) bench_page_gpu_batch state initialization no longer mutates immutable slices via pointer cast and now uses safe `ChunkedMatrix::write_row` filling.
+
+2026-02-19: Added branch-boundary invariant helper validated_gpu_results_with_keys and tests for matching/mismatched lengths to prevent zip-truncation regressions in page_query_gpu_batch_handler.
 <!-- SECTION:NOTES:END -->

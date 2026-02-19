@@ -436,6 +436,21 @@ fn ensure_gpu_result_count(expected: usize, actual: usize) -> Result<(), StatusC
     Err(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn validated_gpu_results_with_keys<'a>(
+    gpu_results: Vec<morphogen_gpu_dpf::kernel::PirResult>,
+    all_keys: &'a [[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
+) -> Result<
+    Vec<(
+        morphogen_gpu_dpf::kernel::PirResult,
+        &'a [morphogen_gpu_dpf::dpf::ChaChaKey; 3],
+    )>,
+    StatusCode,
+> {
+    ensure_gpu_result_count(all_keys.len(), gpu_results.len())?;
+    Ok(gpu_results.into_iter().zip(all_keys.iter()).collect())
+}
+
 #[cfg(feature = "cuda")]
 fn configured_gpu_stream_count() -> usize {
     let raw = std::env::var(GPU_STREAM_COUNT_ENV).ok();
@@ -871,8 +886,8 @@ pub async fn page_query_gpu_batch_handler(
                     }
                     gpu_results
                 };
-                ensure_gpu_result_count(n, gpu_results.len())?;
-
+                let gpu_results_with_keys =
+                    validated_gpu_results_with_keys(gpu_results, &all_keys)?;
                 let snapshot2 = state.global.load();
                 let pending_epoch_after = pending.pending_epoch();
                 if snapshot1.epoch_id != snapshot2.epoch_id
@@ -884,7 +899,7 @@ pub async fn page_query_gpu_batch_handler(
                 }
 
                 let mut results = Vec::with_capacity(n);
-                for (mut gpu_result, keys) in gpu_results.into_iter().zip(all_keys.iter()) {
+                for (mut gpu_result, keys) in gpu_results_with_keys {
                     let delta_results = scan_delta_for_gpu(pending.as_ref(), keys, PAGE_SIZE_BYTES)
                         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -1583,5 +1598,50 @@ mod tests {
             ensure_gpu_result_count(4, 3),
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         );
+    }
+
+    fn test_gpu_keys(count: usize) -> Vec<[morphogen_gpu_dpf::dpf::ChaChaKey; 3]> {
+        use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+
+        let params = ChaChaParams::new(8).expect("valid params");
+        let mut keys = Vec::with_capacity(count);
+        for i in 0..count {
+            let (k0, _) = generate_chacha_dpf_keys(&params, i).expect("key generation should work");
+            keys.push([k0.clone(), k0.clone(), k0]);
+        }
+        keys
+    }
+
+    fn test_pir_result() -> morphogen_gpu_dpf::kernel::PirResult {
+        morphogen_gpu_dpf::kernel::PirResult {
+            page0: Vec::new(),
+            page1: Vec::new(),
+            page2: Vec::new(),
+            verif0: Vec::new(),
+            verif1: Vec::new(),
+            verif2: Vec::new(),
+            timing: morphogen_gpu_dpf::kernel::KernelTiming::default(),
+        }
+    }
+
+    #[test]
+    fn validated_gpu_results_with_keys_accepts_matching_lengths() {
+        let all_keys = test_gpu_keys(2);
+        let gpu_results = vec![test_pir_result(), test_pir_result()];
+
+        let paired =
+            validated_gpu_results_with_keys(gpu_results, &all_keys).expect("lengths should match");
+        assert_eq!(paired.len(), 2);
+    }
+
+    #[test]
+    fn validated_gpu_results_with_keys_rejects_mismatched_lengths() {
+        let all_keys = test_gpu_keys(2);
+        let gpu_results = vec![test_pir_result()];
+
+        assert!(matches!(
+            validated_gpu_results_with_keys(gpu_results, &all_keys),
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        ));
     }
 }
