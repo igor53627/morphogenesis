@@ -60,6 +60,8 @@ const DEFAULT_GPU_CUDA_GRAPH: bool = false;
 #[cfg(feature = "network")]
 const DEFAULT_GPU_BATCH_TILE_SIZE: usize = 16;
 #[cfg(feature = "network")]
+const MAX_GPU_BATCH_TILE_SIZE: usize = 16;
+#[cfg(feature = "network")]
 const DEFAULT_ROW_SIZE_BYTES: usize = 256;
 #[cfg(feature = "network")]
 const DEFAULT_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
@@ -209,9 +211,8 @@ fn parse_config(args: Vec<String>) -> BenchConfig {
     assert!(concurrency > 0, "--concurrency must be > 0");
     let gpu_cuda_graph =
         parse_arg_bool(&args, "--gpu-cuda-graph").unwrap_or(DEFAULT_GPU_CUDA_GRAPH);
-    let gpu_batch_tile_size =
-        parse_arg(&args, "--gpu-batch-tile-size").unwrap_or(DEFAULT_GPU_BATCH_TILE_SIZE);
-    assert!(gpu_batch_tile_size > 0, "--gpu-batch-tile-size must be > 0");
+    let gpu_batch_tile_size_raw = parse_arg_string(&args, "--gpu-batch-tile-size");
+    let gpu_batch_tile_size = parse_gpu_batch_tile_size(gpu_batch_tile_size_raw.as_deref());
     let chunk_size_bytes =
         parse_arg(&args, "--chunk-size-bytes").unwrap_or(DEFAULT_CHUNK_SIZE_BYTES);
     assert!(chunk_size_bytes > 0, "--chunk-size-bytes must be > 0");
@@ -264,6 +265,13 @@ fn parse_batch_sizes(value: &str) -> Result<Vec<usize>, String> {
         return Err("at least one batch size is required".to_string());
     }
     Ok(out)
+}
+
+#[cfg(feature = "network")]
+fn parse_gpu_batch_tile_size(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_GPU_BATCH_TILE_SIZE)
+        .clamp(1, MAX_GPU_BATCH_TILE_SIZE)
 }
 
 #[cfg(feature = "network")]
@@ -648,6 +656,28 @@ mod tests {
         ];
         let cfg = parse_config(args);
         assert_eq!(cfg.gpu_batch_tile_size, 4);
+    }
+
+    #[test]
+    fn parse_config_clamps_gpu_batch_tile_size_to_upper_bound() {
+        let args = vec![
+            "bench_page_gpu_batch".to_string(),
+            "--gpu-batch-tile-size".to_string(),
+            "64".to_string(),
+        ];
+        let cfg = parse_config(args);
+        assert_eq!(cfg.gpu_batch_tile_size, 16);
+    }
+
+    #[test]
+    fn parse_config_clamps_gpu_batch_tile_size_zero_to_one() {
+        let args = vec![
+            "bench_page_gpu_batch".to_string(),
+            "--gpu-batch-tile-size".to_string(),
+            "0".to_string(),
+        ];
+        let cfg = parse_config(args);
+        assert_eq!(cfg.gpu_batch_tile_size, 1);
     }
 
     #[test]
