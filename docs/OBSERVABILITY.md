@@ -68,6 +68,7 @@ For `/query/page/gpu/batch`, runtime dispatch can be tuned with:
 - `MORPHOGEN_GPU_STREAMS`: stream count (clamped to `1..=8`).
 - `MORPHOGEN_GPU_BATCH_POLICY`: `adaptive` (default), `throughput`, or `latency`.
 - `MORPHOGEN_GPU_BATCH_ADAPTIVE_THRESHOLD`: query-count threshold used by `adaptive` mode (clamped to `1..=32`).
+- `MORPHOGEN_GPU_BATCH_TILE_SIZE`: per-launch query tile cap for optimized batch scans (clamped to `1..=16`).
 - `MORPHOGEN_GPU_CUDA_GRAPH`: `true/false` toggle for CUDA graph capture+replay on eligible single-launch batch shapes (`1|2|4|8|16` queries).
 
 ## Performance Impact

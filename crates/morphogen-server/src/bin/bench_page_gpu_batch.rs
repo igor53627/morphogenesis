@@ -58,6 +58,8 @@ const DEFAULT_CONCURRENCY: usize = 1;
 #[cfg(feature = "network")]
 const DEFAULT_GPU_CUDA_GRAPH: bool = false;
 #[cfg(feature = "network")]
+const DEFAULT_GPU_BATCH_TILE_SIZE: usize = 16;
+#[cfg(feature = "network")]
 const DEFAULT_ROW_SIZE_BYTES: usize = 256;
 #[cfg(feature = "network")]
 const DEFAULT_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
@@ -73,6 +75,7 @@ struct BenchConfig {
     gpu_streams: usize,
     concurrency: usize,
     gpu_cuda_graph: bool,
+    gpu_batch_tile_size: usize,
     chunk_size_bytes: usize,
     matrix_file: Option<String>,
 }
@@ -94,12 +97,16 @@ async fn main() {
         "MORPHOGEN_GPU_CUDA_GRAPH",
         if cfg.gpu_cuda_graph { "1" } else { "0" },
     );
+    env::set_var(
+        "MORPHOGEN_GPU_BATCH_TILE_SIZE",
+        cfg.gpu_batch_tile_size.to_string(),
+    );
     let loaded = build_state(&cfg);
     let params = ChaChaParams::new(loaded.domain_bits).expect("invalid domain bits");
     let mode = bench_mode(loaded.state.as_ref());
 
     println!(
-        "gpu_page_batch_bench mode={} pages={} domain_bits={} iterations={} warmup={} gpu_streams={} concurrency={} gpu_cuda_graph={}",
+        "gpu_page_batch_bench mode={} pages={} domain_bits={} iterations={} warmup={} gpu_streams={} concurrency={} gpu_cuda_graph={} gpu_batch_tile_size={}",
         mode,
         loaded.num_pages,
         loaded.domain_bits,
@@ -107,7 +114,8 @@ async fn main() {
         cfg.warmup_iterations,
         cfg.gpu_streams,
         cfg.concurrency,
-        cfg.gpu_cuda_graph
+        cfg.gpu_cuda_graph,
+        cfg.gpu_batch_tile_size
     );
     println!("gpu_page_batch_bench_backend={mode}");
     println!(
@@ -201,6 +209,9 @@ fn parse_config(args: Vec<String>) -> BenchConfig {
     assert!(concurrency > 0, "--concurrency must be > 0");
     let gpu_cuda_graph =
         parse_arg_bool(&args, "--gpu-cuda-graph").unwrap_or(DEFAULT_GPU_CUDA_GRAPH);
+    let gpu_batch_tile_size =
+        parse_arg(&args, "--gpu-batch-tile-size").unwrap_or(DEFAULT_GPU_BATCH_TILE_SIZE);
+    assert!(gpu_batch_tile_size > 0, "--gpu-batch-tile-size must be > 0");
     let chunk_size_bytes =
         parse_arg(&args, "--chunk-size-bytes").unwrap_or(DEFAULT_CHUNK_SIZE_BYTES);
     assert!(chunk_size_bytes > 0, "--chunk-size-bytes must be > 0");
@@ -222,6 +233,7 @@ fn parse_config(args: Vec<String>) -> BenchConfig {
         gpu_streams,
         concurrency,
         gpu_cuda_graph,
+        gpu_batch_tile_size,
         chunk_size_bytes,
         matrix_file,
     }
@@ -297,7 +309,7 @@ fn load_matrix_from_file(path: &str, chunk_size_bytes: usize) -> (Arc<ChunkedMat
         .len() as usize;
     assert!(file_len > 0, "--matrix-file must be non-empty");
 
-    let padding = if file_len % PAGE_SIZE_BYTES == 0 {
+    let padding = if file_len.is_multiple_of(PAGE_SIZE_BYTES) {
         0
     } else {
         PAGE_SIZE_BYTES - (file_len % PAGE_SIZE_BYTES)
@@ -625,6 +637,17 @@ mod tests {
         ];
         let cfg = parse_config(args);
         assert!(cfg.gpu_cuda_graph);
+    }
+
+    #[test]
+    fn parse_config_reads_gpu_batch_tile_size() {
+        let args = vec![
+            "bench_page_gpu_batch".to_string(),
+            "--gpu-batch-tile-size".to_string(),
+            "4".to_string(),
+        ];
+        let cfg = parse_config(args);
+        assert_eq!(cfg.gpu_batch_tile_size, 4);
     }
 
     #[test]

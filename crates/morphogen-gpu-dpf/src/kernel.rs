@@ -42,12 +42,45 @@ pub const THREADS_PER_BLOCK: usize = 256;
 /// Maximum domain bits supported by the GPU kernel.
 pub const MAX_DOMAIN_BITS: usize = 25;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", test))]
 const MAX_KERNEL_BATCH_SIZE: usize = 16;
 #[cfg(feature = "cuda")]
 const KEYS_PER_QUERY: usize = 3;
 #[cfg(feature = "cuda")]
 const VERIF_BYTES_PER_KEY: usize = 16;
+
+#[cfg(any(feature = "cuda", test))]
+fn clamp_tiled_launch_limit(tile_size: usize) -> usize {
+    tile_size.clamp(1, MAX_KERNEL_BATCH_SIZE)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn select_tiled_launch_batch_size(remaining_queries: usize, tile_size: usize) -> usize {
+    let capped_remaining = remaining_queries.min(clamp_tiled_launch_limit(tile_size));
+    if capped_remaining >= 16 {
+        16
+    } else if capped_remaining >= 8 {
+        8
+    } else if capped_remaining >= 4 {
+        4
+    } else if capped_remaining >= 2 {
+        2
+    } else {
+        1
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn plan_tiled_launch_batch_sizes(total_queries: usize, tile_size: usize) -> Vec<usize> {
+    let mut remaining = total_queries;
+    let mut plan = Vec::new();
+    while remaining > 0 {
+        let launch = select_tiled_launch_batch_size(remaining, tile_size);
+        plan.push(launch);
+        remaining -= launch;
+    }
+    plan
+}
 
 /// CUDA-compatible DPF key structure.
 /// Matches the struct in fused_kernel.cu.
@@ -623,7 +656,16 @@ impl GpuScanner {
         db: &GpuPageMatrix,
         queries: &[[ChaChaKey; 3]],
     ) -> Result<Vec<PirResult>, DriverError> {
-        self.scan_batch_opts(db, queries, false, false, false, false, false)
+        self.scan_batch_opts(
+            db,
+            queries,
+            false,
+            false,
+            false,
+            false,
+            false,
+            MAX_KERNEL_BATCH_SIZE,
+        )
     }
 
     /// Execute a fused PIR scan with options (e.g. transposed layout).
@@ -644,6 +686,7 @@ impl GpuScanner {
         optimized_v2: bool,
         optimized_v3: bool,
         use_cuda_graph: bool,
+        max_tile_size: usize,
     ) -> Result<Vec<PirResult>, DriverError> {
         if queries.is_empty() {
             return Ok(Vec::new());
@@ -676,7 +719,11 @@ impl GpuScanner {
         }
         h2d_ns = h2d_ns.saturating_add(clear_start.elapsed().as_nanos() as u64);
         let kernel_start = std::time::Instant::now();
-        if use_cuda_graph && Self::graph_eligible_batch_size(total_queries) {
+        let launch_tile_size = clamp_tiled_launch_limit(max_tile_size);
+        if use_cuda_graph
+            && total_queries <= launch_tile_size
+            && Self::graph_eligible_batch_size(total_queries)
+        {
             let batch_size = total_queries;
             gpu_keys.clear();
             for q in queries {
@@ -730,22 +777,7 @@ impl GpuScanner {
             )?;
         } else {
             let mut processed = 0usize;
-            while processed < total_queries {
-                let remaining = total_queries - processed;
-
-                // Greedily pick largest batch size
-                let batch_size = if remaining >= 16 {
-                    16
-                } else if remaining >= 8 {
-                    8
-                } else if remaining >= 4 {
-                    4
-                } else if remaining >= 2 {
-                    2
-                } else {
-                    1
-                };
-
+            for batch_size in plan_tiled_launch_batch_sizes(total_queries, launch_tile_size) {
                 // Prepare keys for this batch
                 gpu_keys.clear();
                 for i in 0..batch_size {
@@ -1053,7 +1085,48 @@ impl GpuScanner {
         queries: &[[ChaChaKey; 3]],
         use_cuda_graph: bool,
     ) -> Result<Vec<PirResult>, DriverError> {
-        self.scan_batch_opts(db, queries, false, true, false, false, use_cuda_graph)
+        self.scan_batch_opts(
+            db,
+            queries,
+            false,
+            true,
+            false,
+            false,
+            use_cuda_graph,
+            MAX_KERNEL_BATCH_SIZE,
+        )
+    }
+
+    /// Execute fused optimized scan while capping each kernel launch to `tile_size`.
+    ///
+    /// For example, with `queries.len()=16` and `tile_size=4`, this issues four batch-4 launches.
+    pub unsafe fn scan_batch_optimized_tiled(
+        &self,
+        db: &GpuPageMatrix,
+        queries: &[[ChaChaKey; 3]],
+        tile_size: usize,
+    ) -> Result<Vec<PirResult>, DriverError> {
+        self.scan_batch_optimized_tiled_with_graph(db, queries, tile_size, false)
+    }
+
+    /// Tiled optimized scan with optional CUDA Graph replay when the whole request is one tile.
+    pub unsafe fn scan_batch_optimized_tiled_with_graph(
+        &self,
+        db: &GpuPageMatrix,
+        queries: &[[ChaChaKey; 3]],
+        tile_size: usize,
+        use_cuda_graph: bool,
+    ) -> Result<Vec<PirResult>, DriverError> {
+        self.scan_batch_opts(
+            db,
+            queries,
+            false,
+            true,
+            false,
+            false,
+            use_cuda_graph,
+            tile_size,
+        )
     }
 
     /// Execute a fused PIR scan using optimized kernels v2 (minimal shared memory).
@@ -1068,7 +1141,16 @@ impl GpuScanner {
         db: &GpuPageMatrix,
         queries: &[[ChaChaKey; 3]],
     ) -> Result<Vec<PirResult>, DriverError> {
-        self.scan_batch_opts(db, queries, false, false, true, false, false)
+        self.scan_batch_opts(
+            db,
+            queries,
+            false,
+            false,
+            true,
+            false,
+            false,
+            MAX_KERNEL_BATCH_SIZE,
+        )
     }
 
     /// Execute a fused PIR scan using optimized kernels v3 (hybrid query grouping).
@@ -1083,7 +1165,16 @@ impl GpuScanner {
         db: &GpuPageMatrix,
         queries: &[[ChaChaKey; 3]],
     ) -> Result<Vec<PirResult>, DriverError> {
-        self.scan_batch_opts(db, queries, false, false, false, true, false)
+        self.scan_batch_opts(
+            db,
+            queries,
+            false,
+            false,
+            false,
+            true,
+            false,
+            MAX_KERNEL_BATCH_SIZE,
+        )
     }
 }
 
@@ -1280,6 +1371,17 @@ mod tests {
     }
 
     #[test]
+    fn tiled_launch_batch_sizes_respect_requested_tile_limit() {
+        assert_eq!(plan_tiled_launch_batch_sizes(17, 4), vec![4, 4, 4, 4, 1]);
+        assert_eq!(plan_tiled_launch_batch_sizes(6, 3), vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn tiled_launch_batch_sizes_default_to_supported_minimum_when_zero() {
+        assert_eq!(plan_tiled_launch_batch_sizes(5, 0), vec![1, 1, 1, 1, 1]);
+    }
+
+    #[test]
     fn single_dpf_recovers_target_page() {
         let params = ChaChaParams::new(8).unwrap();
         let target = 42;
@@ -1446,5 +1548,72 @@ mod tests {
             );
         }
         println!("GPU fused scan verified successfully!");
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    fn gpu_tiled_batch_matches_default_optimized_outputs() {
+        let scanner = GpuScanner::new(0).expect("Failed to create GpuScanner");
+        let device = scanner.device.clone();
+        let params = crate::dpf::ChaChaParams::new(8).unwrap();
+
+        let num_pages = 256;
+        let pages_data = make_test_pages(num_pages);
+        let mut pages_flat = Vec::with_capacity(num_pages * PAGE_SIZE_BYTES);
+        for p in &pages_data {
+            pages_flat.extend_from_slice(p);
+        }
+        let db = GpuPageMatrix::new(device, &pages_flat).expect("Failed to create GpuPageMatrix");
+
+        let mut queries = Vec::with_capacity(32);
+        for i in 0..32usize {
+            let t0 = i % num_pages;
+            let t1 = (i * 7 + 13) % num_pages;
+            let t2 = (i * 11 + 29) % num_pages;
+            let (k0, _) = crate::dpf::generate_chacha_dpf_keys(&params, t0).unwrap();
+            let (k1, _) = crate::dpf::generate_chacha_dpf_keys(&params, t1).unwrap();
+            let (k2, _) = crate::dpf::generate_chacha_dpf_keys(&params, t2).unwrap();
+            queries.push([k0, k1, k2]);
+        }
+
+        for &q in &[1usize, 2, 4, 8, 16, 32] {
+            let query_slice = &queries[..q];
+            let baseline =
+                unsafe { scanner.scan_batch_optimized(&db, query_slice) }.expect("baseline failed");
+            let tiled = unsafe { scanner.scan_batch_optimized_tiled(&db, query_slice, 4) }
+                .expect("tiled failed");
+
+            assert_eq!(
+                baseline.len(),
+                tiled.len(),
+                "result length mismatch for q={q}"
+            );
+            for (idx, (left, right)) in baseline.iter().zip(tiled.iter()).enumerate() {
+                assert_eq!(
+                    left.page0, right.page0,
+                    "page0 mismatch for q={q}, idx={idx}"
+                );
+                assert_eq!(
+                    left.page1, right.page1,
+                    "page1 mismatch for q={q}, idx={idx}"
+                );
+                assert_eq!(
+                    left.page2, right.page2,
+                    "page2 mismatch for q={q}, idx={idx}"
+                );
+                assert_eq!(
+                    left.verif0, right.verif0,
+                    "verif0 mismatch for q={q}, idx={idx}"
+                );
+                assert_eq!(
+                    left.verif1, right.verif1,
+                    "verif1 mismatch for q={q}, idx={idx}"
+                );
+                assert_eq!(
+                    left.verif2, right.verif2,
+                    "verif2 mismatch for q={q}, idx={idx}"
+                );
+            }
+        }
     }
 }

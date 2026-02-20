@@ -123,12 +123,18 @@ const GPU_BATCH_POLICY_ENV: &str = "MORPHOGEN_GPU_BATCH_POLICY";
 const GPU_BATCH_ADAPTIVE_THRESHOLD_ENV: &str = "MORPHOGEN_GPU_BATCH_ADAPTIVE_THRESHOLD";
 #[cfg(feature = "cuda")]
 const GPU_CUDA_GRAPH_ENV: &str = "MORPHOGEN_GPU_CUDA_GRAPH";
+#[cfg(feature = "cuda")]
+const GPU_BATCH_TILE_SIZE_ENV: &str = "MORPHOGEN_GPU_BATCH_TILE_SIZE";
 #[cfg(any(feature = "cuda", test))]
 const DEFAULT_GPU_STREAM_COUNT: usize = 1;
 #[cfg(any(feature = "cuda", test))]
 const MAX_GPU_STREAM_COUNT: usize = 8;
 #[cfg(any(feature = "cuda", test))]
 const DEFAULT_GPU_BATCH_ADAPTIVE_THRESHOLD: usize = 4;
+#[cfg(any(feature = "cuda", test))]
+const DEFAULT_GPU_BATCH_TILE_SIZE: usize = 16;
+#[cfg(any(feature = "cuda", test))]
+const MAX_GPU_BATCH_TILE_SIZE: usize = 16;
 
 #[derive(Deserialize)]
 pub struct BatchQueryRequest {
@@ -484,6 +490,13 @@ fn parse_gpu_batch_adaptive_threshold(raw: Option<&str>) -> usize {
 }
 
 #[cfg(any(feature = "cuda", test))]
+fn parse_gpu_batch_tile_size(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_GPU_BATCH_TILE_SIZE)
+        .clamp(1, MAX_GPU_BATCH_TILE_SIZE)
+}
+
+#[cfg(any(feature = "cuda", test))]
 fn choose_gpu_batch_dispatch(
     total_queries: usize,
     stream_count: usize,
@@ -699,6 +712,12 @@ fn configured_gpu_batch_policy() -> GpuBatchPolicyConfig {
 fn configured_gpu_cuda_graph_enabled() -> bool {
     let raw = std::env::var(GPU_CUDA_GRAPH_ENV).ok();
     parse_gpu_cuda_graph_enabled(raw.as_deref())
+}
+
+#[cfg(feature = "cuda")]
+fn configured_gpu_batch_tile_size() -> usize {
+    let raw = std::env::var(GPU_BATCH_TILE_SIZE_ENV).ok();
+    parse_gpu_batch_tile_size(raw.as_deref())
 }
 
 fn collect_gpu_page_refs(matrix: &morphogen_storage::ChunkedMatrix) -> Vec<&[u8]> {
@@ -1125,6 +1144,7 @@ pub async fn page_query_gpu_batch_handler(
             let stream_count = configured_gpu_stream_count();
             let policy_cfg = configured_gpu_batch_policy();
             let cuda_graph_enabled = configured_gpu_cuda_graph_enabled();
+            let tile_size = configured_gpu_batch_tile_size();
             let dispatch = choose_gpu_batch_dispatch(n, stream_count, policy_cfg);
             #[cfg(feature = "metrics")]
             counter!("gpu_batch_dispatch_mode_total", "mode" => dispatch.mode_label()).increment(1);
@@ -1145,9 +1165,10 @@ pub async fn page_query_gpu_batch_handler(
                     },
                     |keys| {
                         unsafe {
-                            scanner.scan_batch_optimized_with_graph(
+                            scanner.scan_batch_optimized_tiled_with_graph(
                                 matrix,
                                 keys,
+                                tile_size,
                                 cuda_graph_enabled,
                             )
                         }
@@ -1155,9 +1176,10 @@ pub async fn page_query_gpu_batch_handler(
                     },
                     |key_batch| {
                         unsafe {
-                            scanner.scan_batch_optimized_with_graph(
+                            scanner.scan_batch_optimized_tiled_with_graph(
                                 matrix,
                                 key_batch,
+                                tile_size,
                                 cuda_graph_enabled,
                             )
                         }
@@ -1950,6 +1972,15 @@ mod tests {
             MAX_BATCH_SIZE
         );
         assert_eq!(parse_gpu_batch_adaptive_threshold(Some("bad")), 4);
+    }
+
+    #[test]
+    fn parse_gpu_batch_tile_size_defaults_and_clamps() {
+        assert_eq!(parse_gpu_batch_tile_size(None), 16);
+        assert_eq!(parse_gpu_batch_tile_size(Some("0")), 1);
+        assert_eq!(parse_gpu_batch_tile_size(Some("4")), 4);
+        assert_eq!(parse_gpu_batch_tile_size(Some("999")), 16);
+        assert_eq!(parse_gpu_batch_tile_size(Some("bad")), 16);
     }
 
     #[test]

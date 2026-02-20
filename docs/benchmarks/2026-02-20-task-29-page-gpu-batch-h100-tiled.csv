@@ -1,0 +1,10 @@
+gpu_info=NVIDIA H100 80GB HBM3, 81559 MiB
+matrix=file:/data/mainnet_compact.bin,batch_policy:latency,tile_size:4,batch_sizes:4,8,16,32,iterations:2,warmup:1,gpu_streams:1,concurrency:1
+gpu_page_batch_bench mode=cuda pages=16817159 domain_bits=25 iterations=2 warmup=1 gpu_streams=1 concurrency=1 gpu_cuda_graph=false gpu_batch_tile_size=4
+gpu_page_batch_bench_backend=cuda
+gpu_page_batch_bench_matrix_source=file:/data/mainnet_compact.bin
+q,single_ms_per_batch,batch_ms_per_batch,batch_vs_single_speedup,single_qps,batch_qps,checksum_single,checksum_batch
+4,121.41,543.33,0.22,32.95,7.36,12618408,12618408
+8,242.81,1087.62,0.22,32.95,7.36,25087860,25087860
+16,485.70,2169.55,0.22,32.94,7.37,50136714,50136714
+32,971.50,4356.32,0.22,32.94,7.35,100390050,100390050
