@@ -360,15 +360,32 @@ fn scan_batch_results_from_snapshot<K: morphogen_dpf::DpfKey>(
     entries: &[morphogen_core::DeltaEntry],
     row_size_bytes: usize,
 ) -> Result<Vec<BatchQueryResult>, StatusCode> {
-    let mut results = Vec::with_capacity(all_keys.len());
-    for keys in all_keys {
-        let mut payloads = crate::scan::scan_main_matrix(matrix, keys, row_size_bytes);
-        apply_delta_entries_to_payloads(&mut payloads, keys, entries)?;
-        results.push(BatchQueryResult {
-            payloads: payloads.to_vec(),
-        });
+    #[cfg(feature = "fused-batch-scan")]
+    {
+        let mut payload_sets =
+            crate::scan::scan_main_matrix_multi(matrix, all_keys, row_size_bytes);
+        let mut results = Vec::with_capacity(all_keys.len());
+        for (keys, payloads) in all_keys.iter().zip(payload_sets.iter_mut()) {
+            apply_delta_entries_to_payloads(payloads, keys, entries)?;
+            results.push(BatchQueryResult {
+                payloads: payloads.to_vec(),
+            });
+        }
+        return Ok(results);
     }
-    Ok(results)
+
+    #[cfg(not(feature = "fused-batch-scan"))]
+    {
+        let mut results = Vec::with_capacity(all_keys.len());
+        for keys in all_keys {
+            let mut payloads = crate::scan::scan_main_matrix(matrix, keys, row_size_bytes);
+            apply_delta_entries_to_payloads(&mut payloads, keys, entries)?;
+            results.push(BatchQueryResult {
+                payloads: payloads.to_vec(),
+            });
+        }
+        Ok(results)
+    }
 }
 
 fn parse_gpu_query_keys(

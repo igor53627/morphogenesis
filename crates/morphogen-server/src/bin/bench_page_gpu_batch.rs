@@ -204,6 +204,10 @@ fn parse_config(args: Vec<String>) -> BenchConfig {
     let chunk_size_bytes =
         parse_arg(&args, "--chunk-size-bytes").unwrap_or(DEFAULT_CHUNK_SIZE_BYTES);
     assert!(chunk_size_bytes > 0, "--chunk-size-bytes must be > 0");
+    assert!(
+        chunk_size_bytes % PAGE_SIZE_BYTES == 0,
+        "--chunk-size-bytes must be a multiple of PAGE_SIZE_BYTES ({PAGE_SIZE_BYTES})"
+    );
     let matrix_file = parse_arg_string(&args, "--matrix-file");
     let batch_sizes_raw =
         parse_arg_string(&args, "--batch-sizes").unwrap_or_else(|| DEFAULT_BATCH_SIZES.to_string());
@@ -649,5 +653,16 @@ mod tests {
             Some("/data/mainnet_compact.bin")
         );
         assert_eq!(cfg.chunk_size_bytes, 67_108_864);
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple of PAGE_SIZE_BYTES")]
+    fn parse_config_rejects_unaligned_chunk_size() {
+        let args = vec![
+            "bench_page_gpu_batch".to_string(),
+            "--chunk-size-bytes".to_string(),
+            "5000".to_string(),
+        ];
+        let _ = parse_config(args);
     }
 }

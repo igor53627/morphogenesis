@@ -104,7 +104,7 @@ pub fn scan_main_matrix<K: DpfKey>(
 /// Portable fused scan for multiple queries in a single matrix pass.
 ///
 /// Each query still has 3 keys, but the matrix is traversed only once.
-#[cfg(any(feature = "network", test))]
+#[cfg(any(all(feature = "network", feature = "fused-batch-scan"), test))]
 pub fn scan_main_matrix_multi<K: DpfKey>(
     matrix: &ChunkedMatrix,
     all_keys: &[[K; 3]],
@@ -123,7 +123,7 @@ pub fn scan_main_matrix_multi<K: DpfKey>(
     scan_main_matrix_multi_portable(matrix, all_keys, num_rows, row_size_bytes)
 }
 
-#[cfg(any(feature = "network", test))]
+#[cfg(any(all(feature = "network", feature = "fused-batch-scan"), test))]
 fn scan_main_matrix_multi_portable<K: DpfKey>(
     matrix: &ChunkedMatrix,
     all_keys: &[[K; 3]],

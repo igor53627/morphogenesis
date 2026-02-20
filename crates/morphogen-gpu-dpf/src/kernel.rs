@@ -549,28 +549,49 @@ impl GpuScanner {
             return launch_direct();
         }
 
-        launch_direct()?;
+        if launch_direct().is_err() {
+            let mut stale_graph = MaybeUninit::uninit();
+            if sys::lib()
+                .cuStreamEndCapture(stream, stale_graph.as_mut_ptr())
+                .result()
+                .is_ok()
+            {
+                let graph = stale_graph.assume_init();
+                if !graph.is_null() {
+                    let _ = sys::lib().cuGraphDestroy(graph).result();
+                }
+            }
+            return launch_direct();
+        }
 
         let mut graph_handle = MaybeUninit::uninit();
-        sys::lib()
+        if sys::lib()
             .cuStreamEndCapture(stream, graph_handle.as_mut_ptr())
-            .result()?;
+            .result()
+            .is_err()
+        {
+            return launch_direct();
+        }
         let graph = graph_handle.assume_init();
+        if graph.is_null() {
+            return launch_direct();
+        }
 
         let mut exec_handle = MaybeUninit::uninit();
-        if let Err(err) = sys::lib()
+        if sys::lib()
             .cuGraphInstantiateWithFlags(exec_handle.as_mut_ptr(), graph, 0)
             .result()
+            .is_err()
         {
             let _ = sys::lib().cuGraphDestroy(graph).result();
-            return Err(err);
+            return launch_direct();
         }
         let exec = exec_handle.assume_init();
 
-        if let Err(err) = sys::lib().cuGraphUpload(exec, stream).result() {
+        if sys::lib().cuGraphUpload(exec, stream).result().is_err() {
             let _ = sys::lib().cuGraphExecDestroy(exec).result();
             let _ = sys::lib().cuGraphDestroy(graph).result();
-            return Err(err);
+            return launch_direct();
         }
 
         *graph_cache = Some(CudaGraphCache {
@@ -581,7 +602,14 @@ impl GpuScanner {
         });
 
         let cache = graph_cache.as_ref().expect("graph cache must be populated");
-        sys::lib().cuGraphLaunch(cache.exec, stream).result()?;
+        if sys::lib()
+            .cuGraphLaunch(cache.exec, stream)
+            .result()
+            .is_err()
+        {
+            *graph_cache = None;
+            return launch_direct();
+        }
 
         Ok(())
     }
