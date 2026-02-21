@@ -1001,9 +1001,11 @@ pub async fn page_query_gpu_handler(
                 continue;
             }
 
-            let mut results = match with_gpu_matrix_ref(matrix_mutex.as_ref(), |matrix| {
-                unsafe { scanner.scan(matrix, [&keys[0], &keys[1], &keys[2]]) }
-                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+            let mut results = match tokio::task::block_in_place(|| {
+                with_gpu_matrix_ref(matrix_mutex.as_ref(), |matrix| {
+                    unsafe { scanner.scan(matrix, [&keys[0], &keys[1], &keys[2]]) }
+                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                })
             })? {
                 Some(result) => result,
                 None => {
@@ -1148,44 +1150,46 @@ pub async fn page_query_gpu_batch_handler(
             let dispatch = choose_gpu_batch_dispatch(n, stream_count, policy_cfg);
             #[cfg(feature = "metrics")]
             counter!("gpu_batch_dispatch_mode_total", "mode" => dispatch.mode_label()).increment(1);
-            let gpu_results = match with_gpu_matrix_ref(matrix_mutex.as_ref(), |matrix| {
-                run_gpu_scan_branches_with(
-                    &all_keys,
-                    dispatch,
-                    |keys, count| {
-                        unsafe {
-                            scanner.scan_batch_single_query_multistream_optimized_with_graph(
-                                matrix,
-                                keys,
-                                count,
-                                cuda_graph_enabled,
-                            )
-                        }
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-                    },
-                    |keys| {
-                        unsafe {
-                            scanner.scan_batch_optimized_tiled_with_graph(
-                                matrix,
-                                keys,
-                                tile_size,
-                                cuda_graph_enabled,
-                            )
-                        }
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-                    },
-                    |key_batch| {
-                        unsafe {
-                            scanner.scan_batch_optimized_tiled_with_graph(
-                                matrix,
-                                key_batch,
-                                tile_size,
-                                cuda_graph_enabled,
-                            )
-                        }
-                        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
-                    },
-                )
+            let gpu_results = match tokio::task::block_in_place(|| {
+                with_gpu_matrix_ref(matrix_mutex.as_ref(), |matrix| {
+                    run_gpu_scan_branches_with(
+                        &all_keys,
+                        dispatch,
+                        |keys, count| {
+                            unsafe {
+                                scanner.scan_batch_single_query_multistream_optimized_with_graph(
+                                    matrix,
+                                    keys,
+                                    count,
+                                    cuda_graph_enabled,
+                                )
+                            }
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                        },
+                        |keys| {
+                            unsafe {
+                                scanner.scan_batch_optimized_tiled_with_graph(
+                                    matrix,
+                                    keys,
+                                    tile_size,
+                                    cuda_graph_enabled,
+                                )
+                            }
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                        },
+                        |key_batch| {
+                            unsafe {
+                                scanner.scan_batch_optimized_tiled_with_graph(
+                                    matrix,
+                                    key_batch,
+                                    tile_size,
+                                    cuda_graph_enabled,
+                                )
+                            }
+                            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
+                        },
+                    )
+                })
             })? {
                 Some(results) => results,
                 None => {
