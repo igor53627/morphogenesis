@@ -19,13 +19,15 @@ use rayon::prelude::*;
 use crate::storage::GpuPageMatrix;
 #[cfg(feature = "cuda")]
 use cudarc::driver::{
-    sys::CUfunction_attribute, CudaDevice, CudaFunction, CudaSlice, DriverError, LaunchAsync,
-    LaunchConfig,
+    sys::{self, CUfunction_attribute},
+    CudaDevice, CudaFunction, CudaSlice, DevicePtr, DriverError, LaunchAsync, LaunchConfig,
 };
 #[cfg(feature = "cuda")]
 use std::collections::HashMap;
 #[cfg(feature = "cuda")]
-use std::sync::Arc;
+use std::mem::MaybeUninit;
+#[cfg(feature = "cuda")]
+use std::sync::{Arc, Mutex};
 
 /// Size of each page in bytes.
 pub const PAGE_SIZE_BYTES: usize = 4096;
@@ -39,6 +41,46 @@ pub const THREADS_PER_BLOCK: usize = 256;
 
 /// Maximum domain bits supported by the GPU kernel.
 pub const MAX_DOMAIN_BITS: usize = 25;
+
+#[cfg(any(feature = "cuda", test))]
+const MAX_KERNEL_BATCH_SIZE: usize = 16;
+#[cfg(feature = "cuda")]
+const KEYS_PER_QUERY: usize = 3;
+#[cfg(feature = "cuda")]
+const VERIF_BYTES_PER_KEY: usize = 16;
+
+#[cfg(any(feature = "cuda", test))]
+fn clamp_tiled_launch_limit(tile_size: usize) -> usize {
+    tile_size.clamp(1, MAX_KERNEL_BATCH_SIZE)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn select_tiled_launch_batch_size(remaining_queries: usize, tile_size: usize) -> usize {
+    let capped_remaining = remaining_queries.min(clamp_tiled_launch_limit(tile_size));
+    if capped_remaining >= 16 {
+        16
+    } else if capped_remaining >= 8 {
+        8
+    } else if capped_remaining >= 4 {
+        4
+    } else if capped_remaining >= 2 {
+        2
+    } else {
+        1
+    }
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn plan_tiled_launch_batch_sizes(total_queries: usize, tile_size: usize) -> Vec<usize> {
+    let mut remaining = total_queries;
+    let mut plan = Vec::new();
+    while remaining > 0 {
+        let launch = select_tiled_launch_batch_size(remaining, tile_size);
+        plan.push(launch);
+        remaining -= launch;
+    }
+    plan
+}
 
 /// CUDA-compatible DPF key structure.
 /// Matches the struct in fused_kernel.cu.
@@ -101,6 +143,90 @@ pub struct GpuScanner {
     kernels_optimized_v2: HashMap<usize, CudaFunction>,
     /// Optimized kernels v3 - hybrid approach (query grouping)
     kernels_optimized_v3: HashMap<usize, CudaFunction>,
+    /// Reusable batch buffers to avoid per-request CUDA allocations.
+    batch_workspace: Mutex<Option<BatchWorkspace>>,
+}
+
+#[cfg(feature = "cuda")]
+struct BatchWorkspace {
+    capacity_queries: usize,
+    out_accumulators: CudaSlice<u8>,
+    out_verifiers: CudaSlice<u8>,
+    key_buffer: CudaSlice<u8>,
+    host_results: Vec<u8>,
+    host_verifs: Vec<u8>,
+    graph_cache: Option<CudaGraphCache>,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CudaGraphSignature {
+    kernel_kind: u8,
+    batch_size: usize,
+    num_pages: usize,
+    shared_mem_bytes: u32,
+    db_ptr: u64,
+    key_ptr: u64,
+    out_ptr: u64,
+    verif_ptr: u64,
+}
+
+#[cfg(feature = "cuda")]
+struct CudaGraphCache {
+    device: Arc<CudaDevice>,
+    signature: CudaGraphSignature,
+    graph: sys::CUgraph,
+    exec: sys::CUgraphExec,
+}
+
+#[cfg(feature = "cuda")]
+unsafe impl Send for CudaGraphCache {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for CudaGraphCache {}
+
+#[cfg(feature = "cuda")]
+impl Drop for CudaGraphCache {
+    fn drop(&mut self) {
+        let _ = self.device.bind_to_thread();
+        if !self.exec.is_null() {
+            // Best-effort cleanup; cache eviction should not panic request path.
+            let _ = unsafe { sys::lib().cuGraphExecDestroy(self.exec).result() };
+        }
+        if !self.graph.is_null() {
+            let _ = unsafe { sys::lib().cuGraphDestroy(self.graph).result() };
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl BatchWorkspace {
+    fn new(device: Arc<CudaDevice>, capacity_queries: usize) -> Result<Self, DriverError> {
+        let capacity_queries = capacity_queries.max(1);
+        let output_len = capacity_queries * KEYS_PER_QUERY * PAGE_SIZE_BYTES;
+        let verif_len = capacity_queries * KEYS_PER_QUERY * VERIF_BYTES_PER_KEY;
+        let max_key_bytes =
+            MAX_KERNEL_BATCH_SIZE * KEYS_PER_QUERY * std::mem::size_of::<DpfKeyGpu>();
+        Ok(Self {
+            capacity_queries,
+            out_accumulators: device.alloc_zeros::<u8>(output_len)?,
+            out_verifiers: device.alloc_zeros::<u8>(verif_len)?,
+            key_buffer: device.alloc_zeros::<u8>(max_key_bytes)?,
+            host_results: vec![0u8; output_len],
+            host_verifs: vec![0u8; verif_len],
+            graph_cache: None,
+        })
+    }
+
+    fn ensure_host_lengths(&mut self, required_queries: usize) {
+        let output_len = required_queries * KEYS_PER_QUERY * PAGE_SIZE_BYTES;
+        let verif_len = required_queries * KEYS_PER_QUERY * VERIF_BYTES_PER_KEY;
+        if self.host_results.len() != output_len {
+            self.host_results.resize(output_len, 0);
+        }
+        if self.host_verifs.len() != verif_len {
+            self.host_verifs.resize(verif_len, 0);
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -303,7 +429,222 @@ impl GpuScanner {
             kernels_optimized,
             kernels_optimized_v2,
             kernels_optimized_v3,
+            batch_workspace: Mutex::new(None),
         })
+    }
+
+    fn ensure_batch_workspace<'a>(
+        &self,
+        slot: &'a mut Option<BatchWorkspace>,
+        min_queries: usize,
+    ) -> Result<&'a mut BatchWorkspace, DriverError> {
+        let needs_realloc = slot
+            .as_ref()
+            .map(|workspace| workspace.capacity_queries < min_queries)
+            .unwrap_or(true);
+        if needs_realloc {
+            *slot = Some(BatchWorkspace::new(self.device.clone(), min_queries)?);
+        }
+        Ok(slot.as_mut().expect("batch workspace must be initialized"))
+    }
+
+    fn select_kernel_for_batch(
+        &self,
+        batch_size: usize,
+        transposed: bool,
+        optimized: bool,
+        optimized_v2: bool,
+        optimized_v3: bool,
+    ) -> (&CudaFunction, u8, u32) {
+        let (func, kernel_kind, use_opt_v1, use_opt_v2, use_opt_v3) =
+            if optimized_v3 && !self.kernels_optimized_v3.is_empty() {
+                (
+                    self.kernels_optimized_v3
+                        .get(&batch_size)
+                        .expect("Optimized v3 kernel not found"),
+                    4u8,
+                    false,
+                    false,
+                    true,
+                )
+            } else if optimized_v2 && !self.kernels_optimized_v2.is_empty() {
+                (
+                    self.kernels_optimized_v2
+                        .get(&batch_size)
+                        .expect("Optimized v2 kernel not found"),
+                    3u8,
+                    false,
+                    true,
+                    false,
+                )
+            } else if optimized && !self.kernels_optimized.is_empty() {
+                (
+                    self.kernels_optimized
+                        .get(&batch_size)
+                        .expect("Optimized kernel not found"),
+                    2u8,
+                    true,
+                    false,
+                    false,
+                )
+            } else if transposed {
+                (
+                    self.kernels_transposed
+                        .get(&batch_size)
+                        .expect("Kernel not found"),
+                    1u8,
+                    false,
+                    false,
+                    false,
+                )
+            } else {
+                (
+                    self.kernels.get(&batch_size).expect("Kernel not found"),
+                    0u8,
+                    false,
+                    false,
+                    false,
+                )
+            };
+
+        let accum_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
+        let verif_bytes_sh = batch_size * 3 * 16;
+        let seed_bytes = batch_size * 3 * 32;
+        let mask_bytes = if use_opt_v1 || use_opt_v2 || use_opt_v3 {
+            0
+        } else {
+            THREADS_PER_BLOCK * batch_size * 3 * 16
+        };
+        let shared_mem_bytes = if use_opt_v2 || use_opt_v3 {
+            seed_bytes
+        } else {
+            accum_bytes + verif_bytes_sh + seed_bytes + mask_bytes
+        };
+
+        (func, kernel_kind, shared_mem_bytes as u32)
+    }
+
+    fn graph_eligible_batch_size(total_queries: usize) -> bool {
+        matches!(total_queries, 1 | 2 | 4 | 8 | 16)
+    }
+
+    unsafe fn launch_single_batch_with_cuda_graph(
+        &self,
+        graph_cache: &mut Option<CudaGraphCache>,
+        signature: CudaGraphSignature,
+        func: &CudaFunction,
+        cfg: LaunchConfig,
+        db_pages: &CudaSlice<u8>,
+        keys_slice: &mut cudarc::driver::CudaViewMut<u8>,
+        out_slice: &mut cudarc::driver::CudaViewMut<u8>,
+        verif_slice: &mut cudarc::driver::CudaViewMut<u8>,
+        num_pages: i32,
+        batch_size: i32,
+    ) -> Result<(), DriverError> {
+        self.device.bind_to_thread()?;
+        let stream = *self.device.cu_stream();
+        let mut launch_direct = || {
+            let params = (
+                db_pages,
+                &mut *keys_slice,
+                &mut *out_slice,
+                &mut *verif_slice,
+                num_pages,
+                batch_size,
+            );
+            func.clone().launch(cfg, params)
+        };
+
+        if let Some(cache) = graph_cache.as_ref() {
+            if cache.signature == signature {
+                if sys::lib()
+                    .cuGraphLaunch(cache.exec, stream)
+                    .result()
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                *graph_cache = None;
+                return launch_direct();
+            }
+        }
+
+        *graph_cache = None;
+
+        if sys::lib()
+            .cuStreamBeginCapture_v2(
+                stream,
+                sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_GLOBAL,
+            )
+            .result()
+            .is_err()
+        {
+            return launch_direct();
+        }
+
+        if launch_direct().is_err() {
+            let mut stale_graph = MaybeUninit::uninit();
+            if sys::lib()
+                .cuStreamEndCapture(stream, stale_graph.as_mut_ptr())
+                .result()
+                .is_ok()
+            {
+                let graph = stale_graph.assume_init();
+                if !graph.is_null() {
+                    let _ = sys::lib().cuGraphDestroy(graph).result();
+                }
+            }
+            return launch_direct();
+        }
+
+        let mut graph_handle = MaybeUninit::uninit();
+        if sys::lib()
+            .cuStreamEndCapture(stream, graph_handle.as_mut_ptr())
+            .result()
+            .is_err()
+        {
+            return launch_direct();
+        }
+        let graph = graph_handle.assume_init();
+        if graph.is_null() {
+            return launch_direct();
+        }
+
+        let mut exec_handle = MaybeUninit::uninit();
+        if sys::lib()
+            .cuGraphInstantiateWithFlags(exec_handle.as_mut_ptr(), graph, 0)
+            .result()
+            .is_err()
+        {
+            let _ = sys::lib().cuGraphDestroy(graph).result();
+            return launch_direct();
+        }
+        let exec = exec_handle.assume_init();
+
+        if sys::lib().cuGraphUpload(exec, stream).result().is_err() {
+            let _ = sys::lib().cuGraphExecDestroy(exec).result();
+            let _ = sys::lib().cuGraphDestroy(graph).result();
+            return launch_direct();
+        }
+
+        *graph_cache = Some(CudaGraphCache {
+            device: self.device.clone(),
+            signature,
+            graph,
+            exec,
+        });
+
+        let cache = graph_cache.as_ref().expect("graph cache must be populated");
+        if sys::lib()
+            .cuGraphLaunch(cache.exec, stream)
+            .result()
+            .is_err()
+        {
+            *graph_cache = None;
+            return launch_direct();
+        }
+
+        Ok(())
     }
 
     /// Execute a fused PIR scan on the GPU for a batch of queries.
@@ -315,7 +656,16 @@ impl GpuScanner {
         db: &GpuPageMatrix,
         queries: &[[ChaChaKey; 3]],
     ) -> Result<Vec<PirResult>, DriverError> {
-        self.scan_batch_opts(db, queries, false, false, false, false)
+        self.scan_batch_opts(
+            db,
+            queries,
+            false,
+            false,
+            false,
+            false,
+            false,
+            MAX_KERNEL_BATCH_SIZE,
+        )
     }
 
     /// Execute a fused PIR scan with options (e.g. transposed layout).
@@ -335,6 +685,8 @@ impl GpuScanner {
         optimized: bool,
         optimized_v2: bool,
         optimized_v3: bool,
+        use_cuda_graph: bool,
+        max_tile_size: usize,
     ) -> Result<Vec<PirResult>, DriverError> {
         if queries.is_empty() {
             return Ok(Vec::new());
@@ -343,142 +695,180 @@ impl GpuScanner {
         let num_pages = db.num_pages();
         let db_pages = db.as_slice();
         let total_queries = queries.len();
-        let start = std::time::Instant::now();
+        let total_start = std::time::Instant::now();
+        let total_output_bytes = total_queries * KEYS_PER_QUERY * PAGE_SIZE_BYTES;
+        let total_verif_bytes = total_queries * KEYS_PER_QUERY * VERIF_BYTES_PER_KEY;
 
-        // Flatten all keys first?
-        // No, we process in chunks. We allocate output for ALL queries at once to minimize host overhead?
-        // Or allocate per chunk?
-        // Allocating one big output buffer is better.
-        let total_output_bytes = total_queries * 3 * PAGE_SIZE_BYTES;
-        let mut out_accumulators = self.device.alloc_zeros::<u8>(total_output_bytes)?;
+        let mut workspace_guard = self
+            .batch_workspace
+            .lock()
+            .expect("batch workspace lock poisoned");
+        let workspace = self.ensure_batch_workspace(&mut workspace_guard, total_queries)?;
+        workspace.ensure_host_lengths(total_queries);
 
-        let total_verif_bytes = total_queries * 3 * 16;
-        let mut out_verifiers = self.device.alloc_zeros::<u8>(total_verif_bytes)?;
-
-        let mut processed = 0;
-        while processed < total_queries {
-            let remaining = total_queries - processed;
-
-            // Greedily pick largest batch size
-            let batch_size = if remaining >= 16 {
-                16
-            } else if remaining >= 8 {
-                8
-            } else if remaining >= 4 {
-                4
-            } else if remaining >= 2 {
-                2
-            } else {
-                1
-            };
-
-            // Prepare keys for this batch
-            let mut gpu_keys = Vec::with_capacity(batch_size * 3);
-            for i in 0..batch_size {
-                let q = &queries[processed + i];
+        let mut gpu_keys = Vec::with_capacity(MAX_KERNEL_BATCH_SIZE * KEYS_PER_QUERY);
+        let mut h2d_ns = 0u64;
+        let clear_start = std::time::Instant::now();
+        {
+            let mut out_view = workspace.out_accumulators.slice_mut(..total_output_bytes);
+            self.device.memset_zeros(&mut out_view)?;
+        }
+        {
+            let mut verif_view = workspace.out_verifiers.slice_mut(..total_verif_bytes);
+            self.device.memset_zeros(&mut verif_view)?;
+        }
+        h2d_ns = h2d_ns.saturating_add(clear_start.elapsed().as_nanos() as u64);
+        let kernel_start = std::time::Instant::now();
+        let launch_tile_size = clamp_tiled_launch_limit(max_tile_size);
+        if use_cuda_graph
+            && total_queries <= launch_tile_size
+            && Self::graph_eligible_batch_size(total_queries)
+        {
+            let batch_size = total_queries;
+            gpu_keys.clear();
+            for q in queries {
                 gpu_keys.push(DpfKeyGpu::from_chacha_key(&q[0]));
                 gpu_keys.push(DpfKeyGpu::from_chacha_key(&q[1]));
                 gpu_keys.push(DpfKeyGpu::from_chacha_key(&q[2]));
             }
-            let keys_slice: CudaSlice<u8> = self
-                .device
-                .htod_sync_copy(bytemuck::cast_slice(&gpu_keys))?;
-
-            // Get slice of output buffer for this batch
-            let out_offset = processed * 3 * PAGE_SIZE_BYTES;
-            let out_len = batch_size * 3 * PAGE_SIZE_BYTES;
-            let mut out_slice = out_accumulators.slice_mut(out_offset..out_offset + out_len);
-
-            let verif_offset = processed * 3 * 16;
-            let verif_len = batch_size * 3 * 16;
-            let mut verif_slice = out_verifiers.slice_mut(verif_offset..verif_offset + verif_len);
-
-            // Launch kernel
-            let func = if optimized_v3 && !self.kernels_optimized_v3.is_empty() {
-                // Use optimized v3 kernel (hybrid query grouping)
-                self.kernels_optimized_v3
-                    .get(&batch_size)
-                    .expect("Optimized v3 kernel not found")
-            } else if optimized_v2 && !self.kernels_optimized_v2.is_empty() {
-                // Use optimized v2 kernel (minimal shared memory)
-                self.kernels_optimized_v2
-                    .get(&batch_size)
-                    .expect("Optimized v2 kernel not found")
-            } else if optimized && !self.kernels_optimized.is_empty() {
-                // Use optimized v1 kernel
-                self.kernels_optimized
-                    .get(&batch_size)
-                    .expect("Optimized kernel not found")
-            } else if transposed {
-                self.kernels_transposed
-                    .get(&batch_size)
-                    .expect("Kernel not found")
-            } else {
-                self.kernels.get(&batch_size).expect("Kernel not found")
-            };
-
-            // Shared memory calculation
-            let accum_bytes = batch_size * 3 * PAGE_SIZE_BYTES;
-            let verif_bytes_sh = batch_size * 3 * 16;
-            let seed_bytes = batch_size * 3 * 32;
-            // Optimized v2/v3 kernels use minimal shared memory (just seeds)
-            // Optimized v1 kernels don't use mask buffer
-            let mask_bytes = if (optimized || optimized_v2 || optimized_v3)
-                && ((!optimized || !self.kernels_optimized.is_empty())
-                    || (!optimized_v2 || !self.kernels_optimized_v2.is_empty())
-                    || (!optimized_v3 || !self.kernels_optimized_v3.is_empty()))
-            {
-                0
-            } else {
-                THREADS_PER_BLOCK * batch_size * 3 * 16
-            };
-            let shared_mem_bytes = if (optimized_v2 && !self.kernels_optimized_v2.is_empty())
-                || (optimized_v3 && !self.kernels_optimized_v3.is_empty())
-            {
-                // v2/v3: only seed storage in shared memory
-                seed_bytes
-            } else {
-                accum_bytes + verif_bytes_sh + seed_bytes + mask_bytes
-            };
-
+            let key_bytes = bytemuck::cast_slice(gpu_keys.as_slice());
+            let (func, kernel_kind, shared_mem_bytes) = self.select_kernel_for_batch(
+                batch_size,
+                transposed,
+                optimized,
+                optimized_v2,
+                optimized_v3,
+            );
             let cfg = LaunchConfig {
                 grid_dim: (((num_pages + SUBTREE_SIZE - 1) / SUBTREE_SIZE) as u32, 1, 1),
                 block_dim: (THREADS_PER_BLOCK as u32, 1, 1),
-                shared_mem_bytes: shared_mem_bytes as u32,
+                shared_mem_bytes,
+            };
+            let signature = CudaGraphSignature {
+                kernel_kind,
+                batch_size,
+                num_pages,
+                shared_mem_bytes,
+                db_ptr: *db_pages.device_ptr(),
+                key_ptr: *workspace.key_buffer.device_ptr(),
+                out_ptr: *workspace.out_accumulators.device_ptr(),
+                verif_ptr: *workspace.out_verifiers.device_ptr(),
             };
 
-            let params = (
+            let mut keys_slice = workspace.key_buffer.slice_mut(..key_bytes.len());
+            let h2d_start = std::time::Instant::now();
+            self.device
+                .htod_sync_copy_into(key_bytes, &mut keys_slice)?;
+            h2d_ns = h2d_ns.saturating_add(h2d_start.elapsed().as_nanos() as u64);
+            let mut out_slice = workspace.out_accumulators.slice_mut(..total_output_bytes);
+            let mut verif_slice = workspace.out_verifiers.slice_mut(..total_verif_bytes);
+
+            self.launch_single_batch_with_cuda_graph(
+                &mut workspace.graph_cache,
+                signature,
+                func,
+                cfg,
                 db_pages,
-                &keys_slice,
+                &mut keys_slice,
                 &mut out_slice,
                 &mut verif_slice,
                 num_pages as i32,
                 batch_size as i32,
-            );
-            func.clone().launch(cfg, params)?;
+            )?;
+        } else {
+            let mut processed = 0usize;
+            for batch_size in plan_tiled_launch_batch_sizes(total_queries, launch_tile_size) {
+                // Prepare keys for this batch
+                gpu_keys.clear();
+                for i in 0..batch_size {
+                    let q = &queries[processed + i];
+                    gpu_keys.push(DpfKeyGpu::from_chacha_key(&q[0]));
+                    gpu_keys.push(DpfKeyGpu::from_chacha_key(&q[1]));
+                    gpu_keys.push(DpfKeyGpu::from_chacha_key(&q[2]));
+                }
+                let key_bytes = bytemuck::cast_slice(gpu_keys.as_slice());
+                let mut keys_slice = workspace.key_buffer.slice_mut(..key_bytes.len());
+                let h2d_start = std::time::Instant::now();
+                self.device
+                    .htod_sync_copy_into(key_bytes, &mut keys_slice)?;
+                h2d_ns = h2d_ns.saturating_add(h2d_start.elapsed().as_nanos() as u64);
 
-            processed += batch_size;
+                // Get slice of output buffer for this batch
+                let out_offset = processed * 3 * PAGE_SIZE_BYTES;
+                let out_len = batch_size * 3 * PAGE_SIZE_BYTES;
+                let mut out_slice = workspace
+                    .out_accumulators
+                    .slice_mut(out_offset..out_offset + out_len);
+
+                let verif_offset = processed * 3 * 16;
+                let verif_len = batch_size * 3 * 16;
+                let mut verif_slice = workspace
+                    .out_verifiers
+                    .slice_mut(verif_offset..verif_offset + verif_len);
+
+                let (func, _kernel_kind, shared_mem_bytes) = self.select_kernel_for_batch(
+                    batch_size,
+                    transposed,
+                    optimized,
+                    optimized_v2,
+                    optimized_v3,
+                );
+                let cfg = LaunchConfig {
+                    grid_dim: (((num_pages + SUBTREE_SIZE - 1) / SUBTREE_SIZE) as u32, 1, 1),
+                    block_dim: (THREADS_PER_BLOCK as u32, 1, 1),
+                    shared_mem_bytes,
+                };
+                let params = (
+                    db_pages,
+                    &mut keys_slice,
+                    &mut out_slice,
+                    &mut verif_slice,
+                    num_pages as i32,
+                    batch_size as i32,
+                );
+                func.clone().launch(cfg, params)?;
+
+                processed += batch_size;
+            }
         }
 
-        // 4. Copy results back
-        let flat_results = self.device.sync_reclaim(out_accumulators)?;
-        let flat_verifs = self.device.sync_reclaim(out_verifiers)?;
+        self.device.synchronize()?;
+        let kernel_ns = kernel_start.elapsed().as_nanos() as u64;
 
-        let total_ns = start.elapsed().as_nanos() as u64;
-        let avg_ns = total_ns / total_queries as u64;
+        let d2h_start = std::time::Instant::now();
+        {
+            let out_view = workspace.out_accumulators.slice(..total_output_bytes);
+            self.device
+                .dtoh_sync_copy_into(&out_view, workspace.host_results.as_mut_slice())?;
+        }
+        {
+            let verif_view = workspace.out_verifiers.slice(..total_verif_bytes);
+            self.device
+                .dtoh_sync_copy_into(&verif_view, workspace.host_verifs.as_mut_slice())?;
+        }
+        let d2h_ns = d2h_start.elapsed().as_nanos() as u64;
+
+        let total_ns = total_start.elapsed().as_nanos() as u64;
+        let query_divisor = total_queries as u64;
+        let avg_h2d_ns = h2d_ns / query_divisor;
+        let avg_kernel_ns = kernel_ns / query_divisor;
+        let avg_d2h_ns = d2h_ns / query_divisor;
+        let avg_total_ns = total_ns / query_divisor;
 
         // 5. Unflatten results
         let mut results = Vec::with_capacity(total_queries);
         for i in 0..total_queries {
             let base = i * 3 * PAGE_SIZE_BYTES;
-            let p0 = flat_results[base..base + PAGE_SIZE_BYTES].to_vec();
-            let p1 = flat_results[base + PAGE_SIZE_BYTES..base + 2 * PAGE_SIZE_BYTES].to_vec();
-            let p2 = flat_results[base + 2 * PAGE_SIZE_BYTES..base + 3 * PAGE_SIZE_BYTES].to_vec();
+            let p0 = workspace.host_results[base..base + PAGE_SIZE_BYTES].to_vec();
+            let p1 =
+                workspace.host_results[base + PAGE_SIZE_BYTES..base + 2 * PAGE_SIZE_BYTES].to_vec();
+            let p2 = workspace.host_results[base + 2 * PAGE_SIZE_BYTES..base + 3 * PAGE_SIZE_BYTES]
+                .to_vec();
 
             let v_base = i * 3 * 16;
-            let v0 = flat_verifs[v_base..v_base + 16].to_vec();
-            let v1 = flat_verifs[v_base + 16..v_base + 32].to_vec();
-            let v2 = flat_verifs[v_base + 32..v_base + 48].to_vec();
+            let v0 = workspace.host_verifs[v_base..v_base + 16].to_vec();
+            let v1 = workspace.host_verifs[v_base + 16..v_base + 32].to_vec();
+            let v2 = workspace.host_verifs[v_base + 32..v_base + 48].to_vec();
 
             results.push(PirResult {
                 page0: p0,
@@ -488,9 +878,12 @@ impl GpuScanner {
                 verif1: v1,
                 verif2: v2,
                 timing: KernelTiming {
-                    dpf_eval_ns: 0,
+                    dpf_eval_ns: avg_kernel_ns,
                     xor_accumulate_ns: 0,
-                    total_ns: avg_ns,
+                    h2d_ns: avg_h2d_ns,
+                    kernel_ns: avg_kernel_ns,
+                    d2h_ns: avg_d2h_ns,
+                    total_ns: avg_total_ns,
                 },
             });
         }
@@ -518,6 +911,22 @@ impl GpuScanner {
         queries: &[[ChaChaKey; 3]],
         stream_count: usize,
     ) -> Result<Vec<PirResult>, DriverError> {
+        self.scan_batch_single_query_multistream_optimized_with_graph(
+            db,
+            queries,
+            stream_count,
+            false,
+        )
+    }
+
+    /// Multistream optimized scan with optional CUDA Graph replay on single-stream fallback.
+    pub unsafe fn scan_batch_single_query_multistream_optimized_with_graph(
+        &self,
+        db: &GpuPageMatrix,
+        queries: &[[ChaChaKey; 3]],
+        stream_count: usize,
+        use_cuda_graph: bool,
+    ) -> Result<Vec<PirResult>, DriverError> {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
@@ -525,14 +934,15 @@ impl GpuScanner {
         let total_queries = queries.len();
         let stream_count = stream_count.max(1).min(total_queries);
         if stream_count <= 1 {
-            return self.scan_batch_optimized(db, queries);
+            return self.scan_batch_optimized_with_graph(db, queries, use_cuda_graph);
         }
 
         let num_pages = db.num_pages();
         let db_pages = db.as_slice();
-        let start = std::time::Instant::now();
+        let total_start = std::time::Instant::now();
 
         // Prepare all per-query buffers on default stream first, then fork streams.
+        let h2d_start = std::time::Instant::now();
         let mut key_slices: Vec<CudaSlice<u8>> = Vec::with_capacity(total_queries);
         let mut out_accumulators: Vec<CudaSlice<u8>> = Vec::with_capacity(total_queries);
         let mut out_verifiers: Vec<CudaSlice<u8>> = Vec::with_capacity(total_queries);
@@ -549,6 +959,7 @@ impl GpuScanner {
             out_accumulators.push(self.device.alloc_zeros::<u8>(3 * PAGE_SIZE_BYTES)?);
             out_verifiers.push(self.device.alloc_zeros::<u8>(3 * 16)?);
         }
+        let h2d_ns = h2d_start.elapsed().as_nanos() as u64;
 
         let streams = (0..stream_count)
             .map(|_| self.device.fork_default_stream())
@@ -577,6 +988,7 @@ impl GpuScanner {
             shared_mem_bytes: shared_mem_bytes as u32,
         };
 
+        let kernel_start = std::time::Instant::now();
         for idx in 0..total_queries {
             let stream = &streams[idx % stream_count];
             let mut out_slice = out_accumulators[idx].slice_mut(..);
@@ -597,9 +1009,9 @@ impl GpuScanner {
             self.device.wait_for(stream)?;
         }
         drop(streams);
+        let kernel_ns = kernel_start.elapsed().as_nanos() as u64;
 
-        let total_ns = start.elapsed().as_nanos() as u64;
-        let avg_ns = total_ns / total_queries as u64;
+        let d2h_start = std::time::Instant::now();
 
         let mut results = Vec::with_capacity(total_queries);
         for (out_acc, out_verif) in out_accumulators.into_iter().zip(out_verifiers.into_iter()) {
@@ -622,11 +1034,31 @@ impl GpuScanner {
                 verif1: v1,
                 verif2: v2,
                 timing: KernelTiming {
-                    dpf_eval_ns: 0,
+                    dpf_eval_ns: kernel_ns / total_queries as u64,
                     xor_accumulate_ns: 0,
-                    total_ns: avg_ns,
+                    h2d_ns: h2d_ns / total_queries as u64,
+                    kernel_ns: kernel_ns / total_queries as u64,
+                    d2h_ns: 0,
+                    total_ns: 0,
                 },
             });
+        }
+
+        let d2h_ns = d2h_start.elapsed().as_nanos() as u64;
+        let total_ns = total_start.elapsed().as_nanos() as u64;
+        let avg_h2d_ns = h2d_ns / total_queries as u64;
+        let avg_kernel_ns = kernel_ns / total_queries as u64;
+        let avg_d2h_ns = d2h_ns / total_queries as u64;
+        let avg_total_ns = total_ns / total_queries as u64;
+        for result in &mut results {
+            result.timing = KernelTiming {
+                dpf_eval_ns: avg_kernel_ns,
+                xor_accumulate_ns: 0,
+                h2d_ns: avg_h2d_ns,
+                kernel_ns: avg_kernel_ns,
+                d2h_ns: avg_d2h_ns,
+                total_ns: avg_total_ns,
+            };
         }
 
         Ok(results)
@@ -643,7 +1075,58 @@ impl GpuScanner {
         db: &GpuPageMatrix,
         queries: &[[ChaChaKey; 3]],
     ) -> Result<Vec<PirResult>, DriverError> {
-        self.scan_batch_opts(db, queries, false, true, false, false)
+        self.scan_batch_optimized_with_graph(db, queries, false)
+    }
+
+    /// Execute a fused PIR scan using optimized kernels v1 with optional CUDA Graph replay.
+    pub unsafe fn scan_batch_optimized_with_graph(
+        &self,
+        db: &GpuPageMatrix,
+        queries: &[[ChaChaKey; 3]],
+        use_cuda_graph: bool,
+    ) -> Result<Vec<PirResult>, DriverError> {
+        self.scan_batch_opts(
+            db,
+            queries,
+            false,
+            true,
+            false,
+            false,
+            use_cuda_graph,
+            MAX_KERNEL_BATCH_SIZE,
+        )
+    }
+
+    /// Execute fused optimized scan while capping each kernel launch to `tile_size`.
+    ///
+    /// For example, with `queries.len()=16` and `tile_size=4`, this issues four batch-4 launches.
+    pub unsafe fn scan_batch_optimized_tiled(
+        &self,
+        db: &GpuPageMatrix,
+        queries: &[[ChaChaKey; 3]],
+        tile_size: usize,
+    ) -> Result<Vec<PirResult>, DriverError> {
+        self.scan_batch_optimized_tiled_with_graph(db, queries, tile_size, false)
+    }
+
+    /// Tiled optimized scan with optional CUDA Graph replay when the whole request is one tile.
+    pub unsafe fn scan_batch_optimized_tiled_with_graph(
+        &self,
+        db: &GpuPageMatrix,
+        queries: &[[ChaChaKey; 3]],
+        tile_size: usize,
+        use_cuda_graph: bool,
+    ) -> Result<Vec<PirResult>, DriverError> {
+        self.scan_batch_opts(
+            db,
+            queries,
+            false,
+            true,
+            false,
+            false,
+            use_cuda_graph,
+            tile_size,
+        )
     }
 
     /// Execute a fused PIR scan using optimized kernels v2 (minimal shared memory).
@@ -658,7 +1141,16 @@ impl GpuScanner {
         db: &GpuPageMatrix,
         queries: &[[ChaChaKey; 3]],
     ) -> Result<Vec<PirResult>, DriverError> {
-        self.scan_batch_opts(db, queries, false, false, true, false)
+        self.scan_batch_opts(
+            db,
+            queries,
+            false,
+            false,
+            true,
+            false,
+            false,
+            MAX_KERNEL_BATCH_SIZE,
+        )
     }
 
     /// Execute a fused PIR scan using optimized kernels v3 (hybrid query grouping).
@@ -673,15 +1165,33 @@ impl GpuScanner {
         db: &GpuPageMatrix,
         queries: &[[ChaChaKey; 3]],
     ) -> Result<Vec<PirResult>, DriverError> {
-        self.scan_batch_opts(db, queries, false, false, false, true)
+        self.scan_batch_opts(
+            db,
+            queries,
+            false,
+            false,
+            false,
+            true,
+            false,
+            MAX_KERNEL_BATCH_SIZE,
+        )
     }
 }
 
 /// Timing breakdown for fused kernel execution.
 #[derive(Debug, Clone, Default)]
 pub struct KernelTiming {
+    /// Legacy field retained for compatibility.
     pub dpf_eval_ns: u64,
+    /// Legacy field retained for compatibility.
     pub xor_accumulate_ns: u64,
+    /// Host-to-device transfer time (average per query).
+    pub h2d_ns: u64,
+    /// Kernel execution time (average per query).
+    pub kernel_ns: u64,
+    /// Device-to-host transfer time (average per query).
+    pub d2h_ns: u64,
+    /// End-to-end elapsed time (average per query).
     pub total_ns: u64,
 }
 
@@ -820,6 +1330,9 @@ pub fn eval_fused_3dpf_cpu(
         timing: KernelTiming {
             dpf_eval_ns: 0, // Not easily measured in parallel
             xor_accumulate_ns: 0,
+            h2d_ns: 0,
+            kernel_ns: 0,
+            d2h_ns: 0,
             total_ns,
         },
     })
@@ -855,6 +1368,17 @@ mod tests {
                 page
             })
             .collect()
+    }
+
+    #[test]
+    fn tiled_launch_batch_sizes_respect_requested_tile_limit() {
+        assert_eq!(plan_tiled_launch_batch_sizes(17, 4), vec![4, 4, 4, 4, 1]);
+        assert_eq!(plan_tiled_launch_batch_sizes(6, 3), vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn tiled_launch_batch_sizes_default_to_supported_minimum_when_zero() {
+        assert_eq!(plan_tiled_launch_batch_sizes(5, 0), vec![1, 1, 1, 1, 1]);
     }
 
     #[test]
@@ -1024,5 +1548,72 @@ mod tests {
             );
         }
         println!("GPU fused scan verified successfully!");
+    }
+
+    #[cfg(all(test, feature = "cuda"))]
+    #[test]
+    fn gpu_tiled_batch_matches_default_optimized_outputs() {
+        let scanner = GpuScanner::new(0).expect("Failed to create GpuScanner");
+        let device = scanner.device.clone();
+        let params = crate::dpf::ChaChaParams::new(8).unwrap();
+
+        let num_pages = 256;
+        let pages_data = make_test_pages(num_pages);
+        let mut pages_flat = Vec::with_capacity(num_pages * PAGE_SIZE_BYTES);
+        for p in &pages_data {
+            pages_flat.extend_from_slice(p);
+        }
+        let db = GpuPageMatrix::new(device, &pages_flat).expect("Failed to create GpuPageMatrix");
+
+        let mut queries = Vec::with_capacity(32);
+        for i in 0..32usize {
+            let t0 = i % num_pages;
+            let t1 = (i * 7 + 13) % num_pages;
+            let t2 = (i * 11 + 29) % num_pages;
+            let (k0, _) = crate::dpf::generate_chacha_dpf_keys(&params, t0).unwrap();
+            let (k1, _) = crate::dpf::generate_chacha_dpf_keys(&params, t1).unwrap();
+            let (k2, _) = crate::dpf::generate_chacha_dpf_keys(&params, t2).unwrap();
+            queries.push([k0, k1, k2]);
+        }
+
+        for &q in &[1usize, 2, 4, 8, 16, 32] {
+            let query_slice = &queries[..q];
+            let baseline =
+                unsafe { scanner.scan_batch_optimized(&db, query_slice) }.expect("baseline failed");
+            let tiled = unsafe { scanner.scan_batch_optimized_tiled(&db, query_slice, 4) }
+                .expect("tiled failed");
+
+            assert_eq!(
+                baseline.len(),
+                tiled.len(),
+                "result length mismatch for q={q}"
+            );
+            for (idx, (left, right)) in baseline.iter().zip(tiled.iter()).enumerate() {
+                assert_eq!(
+                    left.page0, right.page0,
+                    "page0 mismatch for q={q}, idx={idx}"
+                );
+                assert_eq!(
+                    left.page1, right.page1,
+                    "page1 mismatch for q={q}, idx={idx}"
+                );
+                assert_eq!(
+                    left.page2, right.page2,
+                    "page2 mismatch for q={q}, idx={idx}"
+                );
+                assert_eq!(
+                    left.verif0, right.verif0,
+                    "verif0 mismatch for q={q}, idx={idx}"
+                );
+                assert_eq!(
+                    left.verif1, right.verif1,
+                    "verif1 mismatch for q={q}, idx={idx}"
+                );
+                assert_eq!(
+                    left.verif2, right.verif2,
+                    "verif2 mismatch for q={q}, idx={idx}"
+                );
+            }
+        }
     }
 }

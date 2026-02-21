@@ -7,6 +7,10 @@ fn main() {
 #[cfg(feature = "network")]
 use std::env;
 #[cfg(feature = "network")]
+use std::fs::File;
+#[cfg(feature = "network")]
+use std::io::{BufReader, Read};
+#[cfg(feature = "network")]
 use std::sync::Arc;
 #[cfg(feature = "network")]
 use std::time::Instant;
@@ -22,6 +26,8 @@ use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
 #[cfg(feature = "network")]
 use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
 #[cfg(feature = "network")]
+use morphogen_gpu_dpf::kernel::MAX_DOMAIN_BITS;
+#[cfg(feature = "network")]
 use morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
 #[cfg(feature = "network")]
 use morphogen_server::network::api::{
@@ -29,7 +35,7 @@ use morphogen_server::network::api::{
     EpochMetadata, GpuPageQueryRequest, MAX_BATCH_SIZE,
 };
 #[cfg(feature = "network")]
-use morphogen_storage::ChunkedMatrix;
+use morphogen_storage::{AlignedMatrix, ChunkedMatrix};
 #[cfg(all(feature = "network", feature = "cuda"))]
 use std::sync::Mutex;
 #[cfg(feature = "network")]
@@ -48,6 +54,14 @@ const DEFAULT_BATCH_SIZES: &str = "1,2,4,8,16,32";
 #[cfg(feature = "network")]
 const DEFAULT_GPU_STREAMS: usize = 1;
 #[cfg(feature = "network")]
+const DEFAULT_CONCURRENCY: usize = 1;
+#[cfg(feature = "network")]
+const DEFAULT_GPU_CUDA_GRAPH: bool = false;
+#[cfg(feature = "network")]
+const DEFAULT_GPU_BATCH_TILE_SIZE: usize = 16;
+#[cfg(feature = "network")]
+const MAX_GPU_BATCH_TILE_SIZE: usize = 16;
+#[cfg(feature = "network")]
 const DEFAULT_ROW_SIZE_BYTES: usize = 256;
 #[cfg(feature = "network")]
 const DEFAULT_CHUNK_SIZE_BYTES: usize = 1024 * 1024;
@@ -61,46 +75,98 @@ struct BenchConfig {
     warmup_iterations: usize,
     batch_sizes: Vec<usize>,
     gpu_streams: usize,
+    concurrency: usize,
+    gpu_cuda_graph: bool,
+    gpu_batch_tile_size: usize,
+    chunk_size_bytes: usize,
+    matrix_file: Option<String>,
 }
 
 #[cfg(feature = "network")]
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+struct LoadedBenchState {
+    state: Arc<AppState>,
+    num_pages: usize,
+    domain_bits: usize,
+    matrix_source: String,
+}
+
+#[cfg(feature = "network")]
+fn main() {
     let cfg = parse_config(env::args().collect());
+    configure_gpu_env(&cfg);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    runtime.block_on(async_main(cfg));
+}
+
+#[cfg(feature = "network")]
+fn configure_gpu_env(cfg: &BenchConfig) {
     env::set_var("MORPHOGEN_GPU_STREAMS", cfg.gpu_streams.to_string());
-    let state = build_state(cfg.num_pages);
-    let params = ChaChaParams::new(cfg.domain_bits).expect("invalid domain bits");
-    let mode = bench_mode(state.as_ref());
+    env::set_var(
+        "MORPHOGEN_GPU_CUDA_GRAPH",
+        if cfg.gpu_cuda_graph { "1" } else { "0" },
+    );
+    env::set_var(
+        "MORPHOGEN_GPU_BATCH_TILE_SIZE",
+        cfg.gpu_batch_tile_size.to_string(),
+    );
+}
+
+#[cfg(feature = "network")]
+async fn async_main(cfg: BenchConfig) {
+    let loaded = build_state(&cfg);
+    let params = ChaChaParams::new(loaded.domain_bits).expect("invalid domain bits");
+    let mode = bench_mode(loaded.state.as_ref());
 
     println!(
-        "gpu_page_batch_bench mode={} pages={} domain_bits={} iterations={} warmup={} gpu_streams={}",
+        "gpu_page_batch_bench mode={} pages={} domain_bits={} iterations={} warmup={} gpu_streams={} concurrency={} gpu_cuda_graph={} gpu_batch_tile_size={}",
         mode,
-        cfg.num_pages,
-        cfg.domain_bits,
+        loaded.num_pages,
+        loaded.domain_bits,
         cfg.iterations,
         cfg.warmup_iterations,
-        cfg.gpu_streams
+        cfg.gpu_streams,
+        cfg.concurrency,
+        cfg.gpu_cuda_graph,
+        cfg.gpu_batch_tile_size
     );
     println!("gpu_page_batch_bench_backend={mode}");
+    println!(
+        "gpu_page_batch_bench_matrix_source={}",
+        loaded.matrix_source
+    );
     println!(
         "q,single_ms_per_batch,batch_ms_per_batch,batch_vs_single_speedup,single_qps,batch_qps,checksum_single,checksum_batch"
     );
 
     for &q in &cfg.batch_sizes {
-        let key_sets = build_key_sets(&params, cfg.num_pages, q);
+        let key_sets = build_key_sets(&params, loaded.num_pages, q);
 
         for _ in 0..cfg.warmup_iterations {
-            let _ = run_single_loop_once(state.clone(), &key_sets).await;
-            let _ = run_batch_once(state.clone(), &key_sets).await;
+            let _ = run_single_loop_concurrent_once(
+                loaded.state.clone(),
+                key_sets.clone(),
+                cfg.concurrency,
+            )
+            .await;
+            let _ =
+                run_batch_concurrent_once(loaded.state.clone(), key_sets.clone(), cfg.concurrency)
+                    .await;
         }
 
         let single_start = Instant::now();
         let mut single_checksum = 0u64;
         for _ in 0..cfg.iterations {
             single_checksum = single_checksum.wrapping_add(
-                run_single_loop_once(state.clone(), &key_sets)
-                    .await
-                    .expect("single loop failed"),
+                run_single_loop_concurrent_once(
+                    loaded.state.clone(),
+                    key_sets.clone(),
+                    cfg.concurrency,
+                )
+                .await
+                .expect("single loop failed"),
             );
         }
         let single_elapsed = single_start.elapsed();
@@ -109,18 +175,24 @@ async fn main() {
         let mut batch_checksum = 0u64;
         for _ in 0..cfg.iterations {
             batch_checksum = batch_checksum.wrapping_add(
-                run_batch_once(state.clone(), &key_sets)
+                run_batch_concurrent_once(loaded.state.clone(), key_sets.clone(), cfg.concurrency)
                     .await
                     .expect("batch endpoint failed"),
             );
         }
         let batch_elapsed = batch_start.elapsed();
 
+        assert_eq!(
+            single_checksum, batch_checksum,
+            "checksum mismatch for q={q}; batch and single paths must return identical results"
+        );
+
         let single_ms_per_batch = single_elapsed.as_secs_f64() * 1000.0 / cfg.iterations as f64;
         let batch_ms_per_batch = batch_elapsed.as_secs_f64() * 1000.0 / cfg.iterations as f64;
         let speedup = single_ms_per_batch / batch_ms_per_batch.max(1e-9);
-        let single_qps = (q * cfg.iterations) as f64 / single_elapsed.as_secs_f64().max(1e-9);
-        let batch_qps = (q * cfg.iterations) as f64 / batch_elapsed.as_secs_f64().max(1e-9);
+        let total_queries = q * cfg.iterations * cfg.concurrency;
+        let single_qps = total_queries as f64 / single_elapsed.as_secs_f64().max(1e-9);
+        let batch_qps = total_queries as f64 / batch_elapsed.as_secs_f64().max(1e-9);
 
         println!(
             "{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{}",
@@ -148,6 +220,20 @@ fn parse_config(args: Vec<String>) -> BenchConfig {
     let warmup_iterations = parse_arg(&args, "--warmup-iterations").unwrap_or(DEFAULT_WARMUP);
     let gpu_streams = parse_arg(&args, "--gpu-streams").unwrap_or(DEFAULT_GPU_STREAMS);
     assert!(gpu_streams > 0, "--gpu-streams must be > 0");
+    let concurrency = parse_arg(&args, "--concurrency").unwrap_or(DEFAULT_CONCURRENCY);
+    assert!(concurrency > 0, "--concurrency must be > 0");
+    let gpu_cuda_graph =
+        parse_arg_bool(&args, "--gpu-cuda-graph").unwrap_or(DEFAULT_GPU_CUDA_GRAPH);
+    let gpu_batch_tile_size_raw = parse_arg_string(&args, "--gpu-batch-tile-size");
+    let gpu_batch_tile_size = parse_gpu_batch_tile_size(gpu_batch_tile_size_raw.as_deref());
+    let chunk_size_bytes =
+        parse_arg(&args, "--chunk-size-bytes").unwrap_or(DEFAULT_CHUNK_SIZE_BYTES);
+    assert!(chunk_size_bytes > 0, "--chunk-size-bytes must be > 0");
+    assert!(
+        chunk_size_bytes % PAGE_SIZE_BYTES == 0,
+        "--chunk-size-bytes must be a multiple of PAGE_SIZE_BYTES ({PAGE_SIZE_BYTES})"
+    );
+    let matrix_file = parse_arg_string(&args, "--matrix-file");
     let batch_sizes_raw =
         parse_arg_string(&args, "--batch-sizes").unwrap_or_else(|| DEFAULT_BATCH_SIZES.to_string());
     let batch_sizes = parse_batch_sizes(&batch_sizes_raw).expect("invalid --batch-sizes");
@@ -159,6 +245,11 @@ fn parse_config(args: Vec<String>) -> BenchConfig {
         warmup_iterations,
         batch_sizes,
         gpu_streams,
+        concurrency,
+        gpu_cuda_graph,
+        gpu_batch_tile_size,
+        chunk_size_bytes,
+        matrix_file,
     }
 }
 
@@ -190,6 +281,13 @@ fn parse_batch_sizes(value: &str) -> Result<Vec<usize>, String> {
 }
 
 #[cfg(feature = "network")]
+fn parse_gpu_batch_tile_size(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_GPU_BATCH_TILE_SIZE)
+        .clamp(1, MAX_GPU_BATCH_TILE_SIZE)
+}
+
+#[cfg(feature = "network")]
 fn parse_arg<T: std::str::FromStr>(args: &[String], name: &str) -> Option<T> {
     args.iter()
         .position(|arg| arg == name)
@@ -206,9 +304,82 @@ fn parse_arg_string(args: &[String], name: &str) -> Option<String> {
 }
 
 #[cfg(feature = "network")]
-fn build_state(num_pages: usize) -> Arc<AppState> {
+fn parse_arg_bool(args: &[String], name: &str) -> Option<bool> {
+    parse_arg_string(args, name).map(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+#[cfg(feature = "network")]
+fn domain_bits_for_pages(num_pages: usize) -> usize {
+    assert!(num_pages > 0, "num_pages must be > 0");
+    let bits = usize::BITS as usize - (num_pages - 1).leading_zeros() as usize;
+    bits.max(1)
+}
+
+#[cfg(feature = "network")]
+fn load_matrix_from_file(path: &str, chunk_size_bytes: usize) -> (Arc<ChunkedMatrix>, usize) {
+    let file =
+        File::open(path).unwrap_or_else(|e| panic!("failed to open --matrix-file {path}: {e}"));
+    let file_len = file
+        .metadata()
+        .unwrap_or_else(|e| panic!("failed to stat --matrix-file {path}: {e}"))
+        .len() as usize;
+    assert!(file_len > 0, "--matrix-file must be non-empty");
+
+    let padding = if file_len.is_multiple_of(PAGE_SIZE_BYTES) {
+        0
+    } else {
+        PAGE_SIZE_BYTES - (file_len % PAGE_SIZE_BYTES)
+    };
+    let padded_total_size = file_len + padding;
+    let num_pages = padded_total_size / PAGE_SIZE_BYTES;
+
+    let mut reader = BufReader::new(file);
+    let mut chunks = Vec::new();
+    let mut chunk_sizes = Vec::new();
+    let mut copied = 0usize;
+    let mut remaining = padded_total_size;
+    while remaining > 0 {
+        let size = remaining.min(chunk_size_bytes);
+        let mut chunk = AlignedMatrix::new(size);
+        let chunk_slice = chunk.as_mut_slice();
+
+        let to_read = (file_len - copied).min(size);
+        if to_read > 0 {
+            reader
+                .read_exact(&mut chunk_slice[..to_read])
+                .unwrap_or_else(|e| panic!("failed reading --matrix-file {path}: {e}"));
+        }
+        if to_read < size {
+            chunk_slice[to_read..].fill(0);
+        }
+
+        copied += to_read;
+        remaining -= size;
+        chunk_sizes.push(size);
+        chunks.push(Arc::new(chunk));
+    }
+    assert_eq!(copied, file_len, "short read from --matrix-file");
+
+    (
+        Arc::new(ChunkedMatrix::from_chunks(
+            chunks,
+            chunk_sizes,
+            chunk_size_bytes,
+            padded_total_size,
+        )),
+        num_pages,
+    )
+}
+
+#[cfg(feature = "network")]
+fn build_synthetic_matrix(num_pages: usize, chunk_size_bytes: usize) -> Arc<ChunkedMatrix> {
     let total_size = num_pages * PAGE_SIZE_BYTES;
-    let mut matrix = ChunkedMatrix::new(total_size, DEFAULT_CHUNK_SIZE_BYTES);
+    let mut matrix = ChunkedMatrix::new(total_size, chunk_size_bytes);
 
     // Fill pages with deterministic bytes so checksum is stable.
     let mut page = vec![0u8; PAGE_SIZE_BYTES];
@@ -216,7 +387,44 @@ fn build_state(num_pages: usize) -> Arc<AppState> {
         page.fill((page_idx & 0xFF) as u8);
         matrix.write_row(page_idx, PAGE_SIZE_BYTES, &page);
     }
-    let matrix = Arc::new(matrix);
+    Arc::new(matrix)
+}
+
+#[cfg(feature = "network")]
+fn build_state(cfg: &BenchConfig) -> LoadedBenchState {
+    let (matrix, num_pages, matrix_source) = match cfg.matrix_file.as_deref() {
+        Some(path) => {
+            let (loaded, pages) = load_matrix_from_file(path, cfg.chunk_size_bytes);
+            (loaded, pages, format!("file:{path}"))
+        }
+        None => (
+            build_synthetic_matrix(cfg.num_pages, cfg.chunk_size_bytes),
+            cfg.num_pages,
+            "synthetic".to_string(),
+        ),
+    };
+
+    let detected_domain_bits = domain_bits_for_pages(num_pages);
+    let domain_bits = if cfg.matrix_file.is_some() {
+        detected_domain_bits
+    } else {
+        assert!(
+            cfg.domain_bits >= detected_domain_bits,
+            "synthetic --domain-bits {} is too small for --num-pages {} (requires at least {})",
+            cfg.domain_bits,
+            num_pages,
+            detected_domain_bits
+        );
+        cfg.domain_bits
+    };
+    assert!(
+        domain_bits <= MAX_DOMAIN_BITS,
+        "domain_bits {} exceeds kernel MAX_DOMAIN_BITS {}",
+        domain_bits,
+        MAX_DOMAIN_BITS
+    );
+    let rows_per_page = PAGE_SIZE_BYTES / DEFAULT_ROW_SIZE_BYTES;
+    let num_rows = num_pages * rows_per_page;
 
     let snapshot = EpochSnapshot {
         epoch_id: 1,
@@ -227,7 +435,7 @@ fn build_state(num_pages: usize) -> Arc<AppState> {
 
     let metadata = EpochMetadata {
         epoch_id: 1,
-        num_rows: num_pages * 16,
+        num_rows,
         seeds: [0x1234, 0x5678, 0x9ABC],
         block_number: 1,
         state_root: [0xAB; 32],
@@ -261,20 +469,25 @@ fn build_state(num_pages: usize) -> Arc<AppState> {
         }
     };
 
-    Arc::new(AppState {
-        global,
-        row_size_bytes: DEFAULT_ROW_SIZE_BYTES,
-        num_rows: num_pages * 16,
-        seeds: [0x1234, 0x5678, 0x9ABC],
-        block_number: 1,
-        state_root: [0xAB; 32],
-        epoch_rx: rx,
-        page_config: None,
-        #[cfg(feature = "cuda")]
-        gpu_scanner,
-        #[cfg(feature = "cuda")]
-        gpu_matrix,
-    })
+    LoadedBenchState {
+        state: Arc::new(AppState {
+            global,
+            row_size_bytes: DEFAULT_ROW_SIZE_BYTES,
+            num_rows,
+            seeds: [0x1234, 0x5678, 0x9ABC],
+            block_number: 1,
+            state_root: [0xAB; 32],
+            epoch_rx: rx,
+            page_config: None,
+            #[cfg(feature = "cuda")]
+            gpu_scanner,
+            #[cfg(feature = "cuda")]
+            gpu_matrix,
+        }),
+        num_pages,
+        domain_bits,
+        matrix_source,
+    }
 }
 
 #[cfg(all(feature = "network", feature = "cuda"))]
@@ -292,15 +505,18 @@ fn bench_mode(_state: &AppState) -> &'static str {
 }
 
 #[cfg(feature = "network")]
-fn build_key_sets(params: &ChaChaParams, num_pages: usize, q: usize) -> Vec<Vec<Vec<u8>>> {
-    (0..q)
-        .map(|i| {
-            let target = (i * 97) % num_pages;
-            let (k0, _) = generate_chacha_dpf_keys(params, target).expect("key generation failed");
-            let key = k0.to_bytes().to_vec();
-            vec![key.clone(), key.clone(), key]
-        })
-        .collect()
+fn build_key_sets(params: &ChaChaParams, num_pages: usize, q: usize) -> Arc<Vec<Vec<Vec<u8>>>> {
+    Arc::new(
+        (0..q)
+            .map(|i| {
+                let target = (i * 97) % num_pages;
+                let (k0, _) =
+                    generate_chacha_dpf_keys(params, target).expect("key generation failed");
+                let key = k0.to_bytes().to_vec();
+                vec![key.clone(), key.clone(), key]
+            })
+            .collect(),
+    )
 }
 
 #[cfg(feature = "network")]
@@ -319,6 +535,41 @@ async fn run_single_loop_once(
         checksum = checksum.wrapping_add(checksum_pages(&response.pages));
     }
     Ok(checksum)
+}
+
+#[cfg(feature = "network")]
+async fn join_worker_checksums(
+    workers: Vec<tokio::task::JoinHandle<Result<u64, StatusCode>>>,
+) -> Result<u64, StatusCode> {
+    let mut checksum = 0u64;
+    for worker in workers {
+        let value = worker
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
+        checksum = checksum.wrapping_add(value);
+    }
+    Ok(checksum)
+}
+
+#[cfg(feature = "network")]
+async fn run_single_loop_concurrent_once(
+    state: Arc<AppState>,
+    key_sets: Arc<Vec<Vec<Vec<u8>>>>,
+    concurrency: usize,
+) -> Result<u64, StatusCode> {
+    if concurrency == 1 {
+        return run_single_loop_once(state, key_sets.as_ref()).await;
+    }
+
+    let mut workers = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let state_cloned = state.clone();
+        let keys_cloned = key_sets.clone();
+        workers.push(tokio::spawn(async move {
+            run_single_loop_once(state_cloned, keys_cloned.as_ref()).await
+        }));
+    }
+    join_worker_checksums(workers).await
 }
 
 #[cfg(feature = "network")]
@@ -341,6 +592,27 @@ async fn run_batch_once(
         .map(|result| checksum_pages(&result.pages))
         .fold(0u64, |acc, v| acc.wrapping_add(v));
     Ok(checksum)
+}
+
+#[cfg(feature = "network")]
+async fn run_batch_concurrent_once(
+    state: Arc<AppState>,
+    key_sets: Arc<Vec<Vec<Vec<u8>>>>,
+    concurrency: usize,
+) -> Result<u64, StatusCode> {
+    if concurrency == 1 {
+        return run_batch_once(state, key_sets.as_ref()).await;
+    }
+
+    let mut workers = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let state_cloned = state.clone();
+        let keys_cloned = key_sets.clone();
+        workers.push(tokio::spawn(async move {
+            run_batch_once(state_cloned, keys_cloned.as_ref()).await
+        }));
+    }
+    join_worker_checksums(workers).await
 }
 
 #[cfg(feature = "network")]
@@ -382,5 +654,107 @@ mod tests {
         ];
         let cfg = parse_config(args);
         assert_eq!(cfg.gpu_streams, 4);
+    }
+
+    #[test]
+    fn parse_config_reads_gpu_cuda_graph_flag() {
+        let args = vec![
+            "bench_page_gpu_batch".to_string(),
+            "--gpu-cuda-graph".to_string(),
+            "true".to_string(),
+        ];
+        let cfg = parse_config(args);
+        assert!(cfg.gpu_cuda_graph);
+    }
+
+    #[test]
+    fn parse_config_reads_gpu_batch_tile_size() {
+        let args = vec![
+            "bench_page_gpu_batch".to_string(),
+            "--gpu-batch-tile-size".to_string(),
+            "4".to_string(),
+        ];
+        let cfg = parse_config(args);
+        assert_eq!(cfg.gpu_batch_tile_size, 4);
+    }
+
+    #[test]
+    fn parse_config_clamps_gpu_batch_tile_size_to_upper_bound() {
+        let args = vec![
+            "bench_page_gpu_batch".to_string(),
+            "--gpu-batch-tile-size".to_string(),
+            "64".to_string(),
+        ];
+        let cfg = parse_config(args);
+        assert_eq!(cfg.gpu_batch_tile_size, 16);
+    }
+
+    #[test]
+    fn parse_config_clamps_gpu_batch_tile_size_zero_to_one() {
+        let args = vec![
+            "bench_page_gpu_batch".to_string(),
+            "--gpu-batch-tile-size".to_string(),
+            "0".to_string(),
+        ];
+        let cfg = parse_config(args);
+        assert_eq!(cfg.gpu_batch_tile_size, 1);
+    }
+
+    #[test]
+    fn parse_config_reads_concurrency() {
+        let args = vec![
+            "bench_page_gpu_batch".to_string(),
+            "--concurrency".to_string(),
+            "8".to_string(),
+        ];
+        let cfg = parse_config(args);
+        assert_eq!(cfg.concurrency, 8);
+    }
+
+    #[test]
+    fn parse_config_reads_matrix_file_and_chunk_size() {
+        let args = vec![
+            "bench_page_gpu_batch".to_string(),
+            "--matrix-file".to_string(),
+            "/data/mainnet_compact.bin".to_string(),
+            "--chunk-size-bytes".to_string(),
+            "67108864".to_string(),
+        ];
+        let cfg = parse_config(args);
+        assert_eq!(
+            cfg.matrix_file.as_deref(),
+            Some("/data/mainnet_compact.bin")
+        );
+        assert_eq!(cfg.chunk_size_bytes, 67_108_864);
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple of PAGE_SIZE_BYTES")]
+    fn parse_config_rejects_unaligned_chunk_size() {
+        let args = vec![
+            "bench_page_gpu_batch".to_string(),
+            "--chunk-size-bytes".to_string(),
+            "5000".to_string(),
+        ];
+        let _ = parse_config(args);
+    }
+
+    #[test]
+    #[should_panic(expected = "too small for --num-pages")]
+    fn build_state_rejects_synthetic_domain_bits_below_required() {
+        let cfg = BenchConfig {
+            num_pages: 300,
+            domain_bits: 8,
+            iterations: 1,
+            warmup_iterations: 0,
+            batch_sizes: vec![1],
+            gpu_streams: 1,
+            concurrency: 1,
+            gpu_cuda_graph: false,
+            gpu_batch_tile_size: DEFAULT_GPU_BATCH_TILE_SIZE,
+            chunk_size_bytes: PAGE_SIZE_BYTES,
+            matrix_file: None,
+        };
+        let _ = build_state(&cfg);
     }
 }

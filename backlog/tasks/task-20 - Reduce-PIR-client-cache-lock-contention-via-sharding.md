@@ -1,9 +1,10 @@
 ---
 id: TASK-20
 title: Reduce PIR client cache lock contention via sharding
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-02-18 19:52'
+updated_date: '2026-02-18 21:28'
 labels:
   - performance
   - rpc
