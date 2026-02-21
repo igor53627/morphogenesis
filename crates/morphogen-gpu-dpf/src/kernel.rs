@@ -27,6 +27,8 @@ use std::collections::HashMap;
 #[cfg(feature = "cuda")]
 use std::mem::MaybeUninit;
 #[cfg(feature = "cuda")]
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(feature = "cuda")]
 use std::sync::{Arc, Mutex};
 
 /// Size of each page in bytes.
@@ -44,10 +46,30 @@ pub const MAX_DOMAIN_BITS: usize = 25;
 
 #[cfg(any(feature = "cuda", test))]
 const MAX_KERNEL_BATCH_SIZE: usize = 16;
+#[cfg(any(feature = "cuda", test))]
+const DEFAULT_WORKSPACE_POOL_SIZE: usize = 4;
+#[cfg(any(feature = "cuda", test))]
+const MAX_WORKSPACE_POOL_SIZE: usize = 8;
+#[cfg(feature = "cuda")]
+const GPU_WORKSPACE_POOL_SIZE_ENV: &str = "MORPHOGEN_GPU_WORKSPACE_POOL_SIZE";
 #[cfg(feature = "cuda")]
 const KEYS_PER_QUERY: usize = 3;
 #[cfg(feature = "cuda")]
 const VERIF_BYTES_PER_KEY: usize = 16;
+
+#[cfg(any(feature = "cuda", test))]
+fn parse_workspace_pool_size(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .map(|v| v.min(MAX_WORKSPACE_POOL_SIZE))
+        .unwrap_or(DEFAULT_WORKSPACE_POOL_SIZE)
+}
+
+#[cfg(any(feature = "cuda", test))]
+fn select_workspace_pool_slot(ticket: usize, pool_size: usize) -> usize {
+    debug_assert!(pool_size > 0);
+    ticket % pool_size
+}
 
 #[cfg(any(feature = "cuda", test))]
 fn clamp_tiled_launch_limit(tile_size: usize) -> usize {
@@ -143,8 +165,9 @@ pub struct GpuScanner {
     kernels_optimized_v2: HashMap<usize, CudaFunction>,
     /// Optimized kernels v3 - hybrid approach (query grouping)
     kernels_optimized_v3: HashMap<usize, CudaFunction>,
-    /// Reusable batch buffers to avoid per-request CUDA allocations.
-    batch_workspace: Mutex<Option<BatchWorkspace>>,
+    /// Reusable batch buffers allocated per pool slot to reduce lock contention.
+    batch_workspace_pool: Vec<Mutex<Option<BatchWorkspace>>>,
+    next_workspace_slot: AtomicUsize,
 }
 
 #[cfg(feature = "cuda")]
@@ -422,6 +445,13 @@ impl GpuScanner {
             }
         }
 
+        let workspace_pool_size =
+            parse_workspace_pool_size(std::env::var(GPU_WORKSPACE_POOL_SIZE_ENV).ok().as_deref());
+        let mut batch_workspace_pool = Vec::with_capacity(workspace_pool_size);
+        for _ in 0..workspace_pool_size {
+            batch_workspace_pool.push(Mutex::new(None));
+        }
+
         Ok(Self {
             device,
             kernels,
@@ -429,7 +459,8 @@ impl GpuScanner {
             kernels_optimized,
             kernels_optimized_v2,
             kernels_optimized_v3,
-            batch_workspace: Mutex::new(None),
+            batch_workspace_pool,
+            next_workspace_slot: AtomicUsize::new(0),
         })
     }
 
@@ -699,10 +730,11 @@ impl GpuScanner {
         let total_output_bytes = total_queries * KEYS_PER_QUERY * PAGE_SIZE_BYTES;
         let total_verif_bytes = total_queries * KEYS_PER_QUERY * VERIF_BYTES_PER_KEY;
 
-        let mut workspace_guard = self
-            .batch_workspace
+        let ticket = self.next_workspace_slot.fetch_add(1, Ordering::Relaxed);
+        let slot_idx = select_workspace_pool_slot(ticket, self.batch_workspace_pool.len());
+        let mut workspace_guard = self.batch_workspace_pool[slot_idx]
             .lock()
-            .expect("batch workspace lock poisoned");
+            .expect("batch workspace pool slot lock poisoned");
         let workspace = self.ensure_batch_workspace(&mut workspace_guard, total_queries)?;
         workspace.ensure_host_lengths(total_queries);
 
@@ -1379,6 +1411,33 @@ mod tests {
     #[test]
     fn tiled_launch_batch_sizes_default_to_supported_minimum_when_zero() {
         assert_eq!(plan_tiled_launch_batch_sizes(5, 0), vec![1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn workspace_pool_size_defaults_and_clamps() {
+        assert_eq!(parse_workspace_pool_size(None), DEFAULT_WORKSPACE_POOL_SIZE);
+        assert_eq!(
+            parse_workspace_pool_size(Some("0")),
+            DEFAULT_WORKSPACE_POOL_SIZE
+        );
+        assert_eq!(
+            parse_workspace_pool_size(Some("999")),
+            MAX_WORKSPACE_POOL_SIZE
+        );
+        assert_eq!(
+            parse_workspace_pool_size(Some("bad")),
+            DEFAULT_WORKSPACE_POOL_SIZE
+        );
+        assert_eq!(parse_workspace_pool_size(Some("6")), 6);
+    }
+
+    #[test]
+    fn workspace_pool_slot_wraps_with_modulo() {
+        assert_eq!(select_workspace_pool_slot(0, 4), 0);
+        assert_eq!(select_workspace_pool_slot(1, 4), 1);
+        assert_eq!(select_workspace_pool_slot(3, 4), 3);
+        assert_eq!(select_workspace_pool_slot(4, 4), 0);
+        assert_eq!(select_workspace_pool_slot(9, 4), 1);
     }
 
     #[test]

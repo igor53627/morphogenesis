@@ -5,7 +5,10 @@ use crate::{
 use anyhow::{anyhow, Result};
 use rand::thread_rng;
 use serde::Deserialize;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -18,6 +21,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRIES: u32 = 2;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const DEFAULT_CACHE_CAPACITY: usize = 4096;
+const DEFAULT_CACHE_SHARDS: usize = 32;
 /// Maximum queries per batch request, matching server's MAX_BATCH_SIZE.
 const MAX_BATCH_SIZE: usize = 32;
 
@@ -50,44 +54,131 @@ struct RawEpochResponse {
 }
 
 /// Cache for PIR query results, invalidated on epoch rotation.
-struct PirCache {
+struct PirCacheShard {
     epoch_id: u64,
     entries: HashMap<Vec<u8>, [Vec<u8>; QUERIES_PER_REQUEST]>,
-    capacity: usize,
+}
+
+impl PirCacheShard {
+    fn new(epoch_id: u64) -> Self {
+        Self {
+            epoch_id,
+            entries: HashMap::new(),
+        }
+    }
+}
+
+/// Sharded cache to reduce contention under concurrent query load.
+struct PirCache {
+    epoch_id: AtomicU64,
+    shards: Vec<Mutex<PirCacheShard>>,
+    shard_mask: usize,
+    capacity_per_shard: usize,
 }
 
 impl PirCache {
     fn new(capacity: usize) -> Self {
+        Self::with_shards(capacity, DEFAULT_CACHE_SHARDS)
+    }
+
+    fn with_shards(capacity: usize, shard_count: usize) -> Self {
+        assert!(capacity > 0, "cache capacity must be > 0");
+        assert!(shard_count > 0, "cache shard count must be > 0");
+
+        let shard_count = shard_count.next_power_of_two();
+        let capacity_per_shard = capacity.div_ceil(shard_count).max(1);
+        let mut shards = Vec::with_capacity(shard_count);
+        for _ in 0..shard_count {
+            shards.push(Mutex::new(PirCacheShard::new(0)));
+        }
+
         Self {
-            epoch_id: 0,
-            entries: HashMap::new(),
-            capacity,
+            epoch_id: AtomicU64::new(0),
+            shards,
+            shard_mask: shard_count - 1,
+            capacity_per_shard,
         }
     }
 
-    fn get(&self, epoch_id: u64, key: &[u8]) -> Option<&[Vec<u8>; QUERIES_PER_REQUEST]> {
-        if self.epoch_id != epoch_id {
+    fn shard_index(&self, key: &[u8]) -> usize {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        (hasher.finish() as usize) & self.shard_mask
+    }
+
+    fn advance_epoch_if_needed(&self, epoch_id: u64) -> u64 {
+        let mut current = self.epoch_id.load(Ordering::Acquire);
+        while current < epoch_id {
+            match self.epoch_id.compare_exchange(
+                current,
+                epoch_id,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return current,
+                Err(observed) => current = observed,
+            }
+        }
+        current
+    }
+
+    fn sync_shard_epoch(&self, shard: &mut PirCacheShard, shard_idx: usize, epoch_id: u64) {
+        if shard.epoch_id != epoch_id {
+            debug!(
+                shard = shard_idx,
+                old_epoch = shard.epoch_id,
+                new_epoch = epoch_id,
+                evicted = shard.entries.len(),
+                "Cache shard invalidated on epoch rotation"
+            );
+            shard.entries.clear();
+            shard.epoch_id = epoch_id;
+        }
+    }
+
+    async fn get(&self, epoch_id: u64, key: &[u8]) -> Option<[Vec<u8>; QUERIES_PER_REQUEST]> {
+        if self.epoch_id.load(Ordering::Acquire) != epoch_id {
             return None;
         }
-        self.entries.get(key)
+
+        let shard_idx = self.shard_index(key);
+        let mut shard = self.shards[shard_idx].lock().await;
+        self.sync_shard_epoch(&mut shard, shard_idx, epoch_id);
+        shard.entries.get(key).cloned()
     }
 
-    fn put(&mut self, epoch_id: u64, key: Vec<u8>, payloads: [Vec<u8>; QUERIES_PER_REQUEST]) {
-        if self.epoch_id != epoch_id {
+    async fn put(&self, epoch_id: u64, key: Vec<u8>, payloads: [Vec<u8>; QUERIES_PER_REQUEST]) {
+        let current_epoch = self.advance_epoch_if_needed(epoch_id);
+        if current_epoch > epoch_id {
             debug!(
-                old_epoch = self.epoch_id,
-                new_epoch = epoch_id,
-                evicted = self.entries.len(),
-                "Cache invalidated on epoch rotation"
+                stale_epoch = epoch_id,
+                current_epoch, "Skipping cache insert for stale epoch"
             );
-            self.entries.clear();
-            self.epoch_id = epoch_id;
+            return;
         }
-        if self.entries.len() >= self.capacity {
-            debug!(capacity = self.capacity, "Cache full, clearing");
-            self.entries.clear();
+
+        let shard_idx = self.shard_index(&key);
+        let mut shard = self.shards[shard_idx].lock().await;
+        self.sync_shard_epoch(&mut shard, shard_idx, epoch_id);
+
+        if shard.entries.len() >= self.capacity_per_shard {
+            debug!(
+                shard = shard_idx,
+                capacity_per_shard = self.capacity_per_shard,
+                "Cache shard full, clearing"
+            );
+            shard.entries.clear();
         }
-        self.entries.insert(key, payloads);
+        shard.entries.insert(key, payloads);
+    }
+
+    #[cfg(test)]
+    async fn total_entries(&self) -> usize {
+        let mut total = 0;
+        for shard in &self.shards {
+            total += shard.lock().await.entries.len();
+        }
+        total
     }
 }
 
@@ -140,7 +231,7 @@ pub struct PirClient {
     server_b_url: String,
     http_client: reqwest::Client,
     metadata: RwLock<Option<Arc<EpochMetadata>>>,
-    cache: Mutex<PirCache>,
+    cache: PirCache,
 }
 
 /// Determines whether a reqwest error is transient and worth retrying.
@@ -176,7 +267,7 @@ impl PirClient {
             server_b_url,
             http_client,
             metadata: RwLock::new(None),
-            cache: Mutex::new(PirCache::new(DEFAULT_CACHE_CAPACITY)),
+            cache: PirCache::new(DEFAULT_CACHE_CAPACITY),
         }
     }
 
@@ -367,12 +458,9 @@ impl PirClient {
         let metadata = self.get_metadata().await?;
 
         // Check cache first
-        {
-            let cache = self.cache.lock().await;
-            if let Some(cached) = cache.get(metadata.epoch_id, key) {
-                debug!("PIR cache hit");
-                return Ok(cached.clone());
-            }
+        if let Some(cached) = self.cache.get(metadata.epoch_id, key).await {
+            debug!("PIR cache hit");
+            return Ok(cached);
         }
 
         for attempt in 0..=MAX_RETRIES {
@@ -392,8 +480,9 @@ impl PirClient {
             match self.execute_pir_query(key, &current_metadata).await {
                 Ok((response_epoch, payloads)) => {
                     // Cache under the response epoch (validated to match metadata)
-                    let mut cache = self.cache.lock().await;
-                    cache.put(response_epoch, key.to_vec(), payloads.clone());
+                    self.cache
+                        .put(response_epoch, key.to_vec(), payloads.clone())
+                        .await;
                     return Ok(payloads);
                 }
                 Err(e) => {
@@ -617,16 +706,13 @@ impl PirClient {
             let mut miss_indices: Vec<usize> = Vec::new();
             let mut miss_keys: Vec<Vec<u8>> = Vec::new();
 
-            {
-                let cache = self.cache.lock().await;
-                for (i, key) in keys.iter().enumerate() {
-                    if let Some(cached) = cache.get(current_metadata.epoch_id, key) {
-                        debug!("PIR batch cache hit for key {}", i);
-                        results[i] = Some(cached.clone());
-                    } else {
-                        miss_indices.push(i);
-                        miss_keys.push(key.clone());
-                    }
+            for (i, key) in keys.iter().enumerate() {
+                if let Some(cached) = self.cache.get(current_metadata.epoch_id, key).await {
+                    debug!("PIR batch cache hit for key {}", i);
+                    results[i] = Some(cached);
+                } else {
+                    miss_indices.push(i);
+                    miss_keys.push(key.clone());
                 }
             }
 
@@ -642,9 +728,10 @@ impl PirClient {
             for chunk in miss_keys.chunks(MAX_BATCH_SIZE) {
                 match self.execute_batch_pir_query(chunk, &current_metadata).await {
                     Ok((response_epoch, batch_results)) => {
-                        let mut cache = self.cache.lock().await;
                         for (j, key) in chunk.iter().enumerate() {
-                            cache.put(response_epoch, key.clone(), batch_results[j].clone());
+                            self.cache
+                                .put(response_epoch, key.clone(), batch_results[j].clone())
+                                .await;
                         }
                         all_batch_results.extend(batch_results);
                     }
@@ -847,6 +934,7 @@ impl PirClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn storage_key_hashes_to_8_bytes() {
@@ -878,43 +966,77 @@ mod tests {
         std::array::from_fn(|i| vec![i as u8 + 1])
     }
 
-    #[test]
-    fn cache_invalidates_on_epoch_change() {
-        let mut cache = PirCache::new(100);
+    struct SingleLockPirCache {
+        epoch_id: u64,
+        entries: HashMap<Vec<u8>, [Vec<u8>; QUERIES_PER_REQUEST]>,
+        capacity: usize,
+    }
+
+    impl SingleLockPirCache {
+        fn new(capacity: usize) -> Self {
+            Self {
+                epoch_id: 0,
+                entries: HashMap::new(),
+                capacity,
+            }
+        }
+
+        fn get(&self, epoch_id: u64, key: &[u8]) -> Option<[Vec<u8>; QUERIES_PER_REQUEST]> {
+            if self.epoch_id != epoch_id {
+                return None;
+            }
+            self.entries.get(key).cloned()
+        }
+
+        fn put(&mut self, epoch_id: u64, key: Vec<u8>, payloads: [Vec<u8>; QUERIES_PER_REQUEST]) {
+            if self.epoch_id != epoch_id {
+                self.entries.clear();
+                self.epoch_id = epoch_id;
+            }
+            if self.entries.len() >= self.capacity {
+                self.entries.clear();
+            }
+            self.entries.insert(key, payloads);
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_invalidates_on_epoch_change() {
+        let cache = PirCache::with_shards(100, 1);
         let key = vec![0x11; 20];
         let payloads = make_payloads();
 
-        cache.put(1, key.clone(), payloads.clone());
-        assert!(cache.get(1, &key).is_some());
+        cache.put(1, key.clone(), payloads.clone()).await;
+        assert!(cache.get(1, &key).await.is_some());
 
         // Same epoch, different key
-        assert!(cache.get(1, &[0x22; 20]).is_none());
+        assert!(cache.get(1, &[0x22; 20]).await.is_none());
 
         // Different epoch: get returns None
-        assert!(cache.get(2, &key).is_none());
+        assert!(cache.get(2, &key).await.is_none());
 
         // put with new epoch clears old entries
-        cache.put(2, vec![0xAA], make_payloads());
-        assert!(cache.get(2, &[0xAA]).is_some());
+        cache.put(2, vec![0xAA], make_payloads()).await;
+        assert!(cache.get(2, &[0xAA]).await.is_some());
         assert!(
-            cache.get(2, &key).is_none(),
+            cache.get(2, &key).await.is_none(),
             "old key should be cleared after epoch rotation"
         );
     }
 
-    #[test]
-    fn cache_evicts_when_full() {
-        let mut cache = PirCache::new(2);
+    #[tokio::test]
+    async fn cache_evicts_when_full() {
+        let cache = PirCache::with_shards(2, 1);
         let payloads = make_payloads();
 
-        cache.put(1, vec![0x01], payloads.clone());
-        cache.put(1, vec![0x02], payloads.clone());
-        assert_eq!(cache.entries.len(), 2);
+        cache.put(1, vec![0x01], payloads.clone()).await;
+        cache.put(1, vec![0x02], payloads.clone()).await;
+        assert_eq!(cache.total_entries().await, 2);
 
         // Third insert triggers clear
-        cache.put(1, vec![0x03], payloads.clone());
-        assert_eq!(cache.entries.len(), 1);
-        assert!(cache.get(1, &[0x03]).is_some());
+        cache.put(1, vec![0x03], payloads.clone()).await;
+        assert_eq!(cache.total_entries().await, 1);
+        assert!(cache.get(1, &[0x03]).await.is_some());
     }
 
     #[test]
@@ -945,10 +1067,10 @@ mod tests {
         let key1 = vec![0x11; 20];
         let payloads1 = make_payloads();
 
-        {
-            let mut cache = client.cache.lock().await;
-            cache.put(epoch_id, key1.clone(), payloads1.clone());
-        }
+        client
+            .cache
+            .put(epoch_id, key1.clone(), payloads1.clone())
+            .await;
 
         // Set metadata so cache can match
         {
@@ -963,10 +1085,7 @@ mod tests {
         }
 
         // Verify cache hit works
-        {
-            let cache = client.cache.lock().await;
-            assert!(cache.get(epoch_id, &key1).is_some());
-        }
+        assert!(client.cache.get(epoch_id, &key1).await.is_some());
     }
 
     #[tokio::test]
@@ -992,5 +1111,268 @@ mod tests {
         let result = client.execute_batch_pir_query_with_retry(&keys).await;
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sharded_cache_supports_concurrent_put_get() {
+        let cache = Arc::new(PirCache::with_shards(256, 16));
+        let epoch_id = 9u64;
+        let mut workers = Vec::new();
+
+        for i in 0..128u8 {
+            let cache_cloned = cache.clone();
+            workers.push(tokio::spawn(async move {
+                let key = vec![i; 20];
+                let payloads = make_payloads();
+                cache_cloned
+                    .put(epoch_id, key.clone(), payloads.clone())
+                    .await;
+                let hit = cache_cloned.get(epoch_id, &key).await;
+                assert_eq!(hit, Some(payloads));
+            }));
+        }
+
+        for worker in workers {
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn single_query_uses_cache_concurrently() {
+        let client = Arc::new(PirClient::new(
+            "http://localhost:1".to_string(),
+            "http://localhost:2".to_string(),
+        ));
+
+        let epoch_id = 17;
+        let key = vec![0x7B; 20];
+        let payloads = make_payloads();
+
+        client
+            .cache
+            .put(epoch_id, key.clone(), payloads.clone())
+            .await;
+        {
+            let mut lock = client.metadata.write().await;
+            *lock = Some(Arc::new(EpochMetadata {
+                epoch_id,
+                num_rows: 1000,
+                seeds: [1, 2, 3],
+                block_number: 100,
+                state_root: [0u8; 32],
+            }));
+        }
+
+        let mut workers = Vec::new();
+        for _ in 0..32 {
+            let client_cloned = client.clone();
+            let key_cloned = key.clone();
+            let expected = payloads.clone();
+            workers.push(tokio::spawn(async move {
+                let got = client_cloned
+                    .execute_pir_query_with_retry(&key_cloned)
+                    .await
+                    .unwrap();
+                assert_eq!(got, expected);
+            }));
+        }
+
+        for worker in workers {
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_query_uses_cache_concurrently() {
+        let client = Arc::new(PirClient::new(
+            "http://localhost:1".to_string(),
+            "http://localhost:2".to_string(),
+        ));
+        let epoch_id = 23;
+        let keys: Vec<Vec<u8>> = (0..32u8).map(|i| vec![i; 20]).collect();
+        let payloads = make_payloads();
+
+        for key in &keys {
+            client
+                .cache
+                .put(epoch_id, key.clone(), payloads.clone())
+                .await;
+        }
+        {
+            let mut lock = client.metadata.write().await;
+            *lock = Some(Arc::new(EpochMetadata {
+                epoch_id,
+                num_rows: 1000,
+                seeds: [1, 2, 3],
+                block_number: 100,
+                state_root: [0u8; 32],
+            }));
+        }
+
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let client_cloned = client.clone();
+            let keys_cloned = keys.clone();
+            let expected = payloads.clone();
+            workers.push(tokio::spawn(async move {
+                let got = client_cloned
+                    .execute_batch_pir_query_with_retry(&keys_cloned)
+                    .await
+                    .unwrap();
+                assert_eq!(got.len(), keys_cloned.len());
+                assert!(got.into_iter().all(|row| row == expected));
+            }));
+        }
+
+        for worker in workers {
+            worker.await.unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore]
+    async fn benchmark_cache_contention_sharded_vs_single_mutex() {
+        let key_count = 1024usize;
+        let workers = 64usize;
+        let iterations_per_worker = 4_000usize;
+        let total_ops = workers * iterations_per_worker;
+        let epoch_id = 11u64;
+        let keys: Arc<Vec<Vec<u8>>> = Arc::new(
+            (0..key_count)
+                .map(|i| {
+                    let mut key = vec![0u8; 20];
+                    key[..8].copy_from_slice(&(i as u64).to_le_bytes());
+                    key
+                })
+                .collect(),
+        );
+        let payloads = make_payloads();
+
+        let single_cache = Arc::new(Mutex::new(SingleLockPirCache::new(4096)));
+        {
+            let mut cache = single_cache.lock().await;
+            for key in keys.iter() {
+                cache.put(epoch_id, key.clone(), payloads.clone());
+            }
+        }
+
+        let sharded_cache = Arc::new(PirCache::with_shards(4096, 32));
+        for key in keys.iter() {
+            sharded_cache
+                .put(epoch_id, key.clone(), payloads.clone())
+                .await;
+        }
+
+        let start_single_read = Instant::now();
+        let mut single_read_workers = Vec::new();
+        for w in 0..workers {
+            let cache = single_cache.clone();
+            let keys = keys.clone();
+            single_read_workers.push(tokio::spawn(async move {
+                for i in 0..iterations_per_worker {
+                    let idx = ((w * iterations_per_worker) + i) % keys.len();
+                    let key = &keys[idx];
+                    let guard = cache.lock().await;
+                    let hit = guard.get(epoch_id, key);
+                    drop(guard);
+                    assert!(hit.is_some());
+                }
+            }));
+        }
+        for worker in single_read_workers {
+            worker.await.unwrap();
+        }
+        let single_read_elapsed = start_single_read.elapsed();
+
+        let start_sharded_read = Instant::now();
+        let mut sharded_read_workers = Vec::new();
+        for w in 0..workers {
+            let cache = sharded_cache.clone();
+            let keys = keys.clone();
+            sharded_read_workers.push(tokio::spawn(async move {
+                for i in 0..iterations_per_worker {
+                    let idx = ((w * iterations_per_worker) + i) % keys.len();
+                    let key = &keys[idx];
+                    let hit = cache.get(epoch_id, key).await;
+                    assert!(hit.is_some());
+                }
+            }));
+        }
+        for worker in sharded_read_workers {
+            worker.await.unwrap();
+        }
+        let sharded_read_elapsed = start_sharded_read.elapsed();
+
+        let start_single_mixed = Instant::now();
+        let mut single_mixed_workers = Vec::new();
+        for w in 0..workers {
+            let cache = single_cache.clone();
+            let keys = keys.clone();
+            let payloads = payloads.clone();
+            single_mixed_workers.push(tokio::spawn(async move {
+                for i in 0..iterations_per_worker {
+                    let idx = ((w * iterations_per_worker) + i) % keys.len();
+                    let key = keys[idx].clone();
+                    if i % 8 == 0 {
+                        let mut guard = cache.lock().await;
+                        guard.put(epoch_id, key, payloads.clone());
+                    } else {
+                        let guard = cache.lock().await;
+                        let _ = guard.get(epoch_id, &key);
+                    }
+                }
+            }));
+        }
+        for worker in single_mixed_workers {
+            worker.await.unwrap();
+        }
+        let single_mixed_elapsed = start_single_mixed.elapsed();
+
+        let start_sharded_mixed = Instant::now();
+        let mut sharded_mixed_workers = Vec::new();
+        for w in 0..workers {
+            let cache = sharded_cache.clone();
+            let keys = keys.clone();
+            let payloads = payloads.clone();
+            sharded_mixed_workers.push(tokio::spawn(async move {
+                for i in 0..iterations_per_worker {
+                    let idx = ((w * iterations_per_worker) + i) % keys.len();
+                    let key = keys[idx].clone();
+                    if i % 8 == 0 {
+                        cache.put(epoch_id, key, payloads.clone()).await;
+                    } else {
+                        let _ = cache.get(epoch_id, &key).await;
+                    }
+                }
+            }));
+        }
+        for worker in sharded_mixed_workers {
+            worker.await.unwrap();
+        }
+        let sharded_mixed_elapsed = start_sharded_mixed.elapsed();
+
+        let single_read_ops_per_sec = total_ops as f64 / single_read_elapsed.as_secs_f64();
+        let sharded_read_ops_per_sec = total_ops as f64 / sharded_read_elapsed.as_secs_f64();
+        let single_mixed_ops_per_sec = total_ops as f64 / single_mixed_elapsed.as_secs_f64();
+        let sharded_mixed_ops_per_sec = total_ops as f64 / sharded_mixed_elapsed.as_secs_f64();
+
+        println!(
+            "cache_bench_read total_ops={} single_mutex_ms={:.2} sharded_ms={:.2} speedup={:.2}x single_ops_s={:.0} sharded_ops_s={:.0}",
+            total_ops,
+            single_read_elapsed.as_secs_f64() * 1000.0,
+            sharded_read_elapsed.as_secs_f64() * 1000.0,
+            sharded_read_ops_per_sec / single_read_ops_per_sec.max(1.0),
+            single_read_ops_per_sec,
+            sharded_read_ops_per_sec
+        );
+        println!(
+            "cache_bench_mixed total_ops={} single_mutex_ms={:.2} sharded_ms={:.2} speedup={:.2}x single_ops_s={:.0} sharded_ops_s={:.0}",
+            total_ops,
+            single_mixed_elapsed.as_secs_f64() * 1000.0,
+            sharded_mixed_elapsed.as_secs_f64() * 1000.0,
+            sharded_mixed_ops_per_sec / single_mixed_ops_per_sec.max(1.0),
+            single_mixed_ops_per_sec,
+            sharded_mixed_ops_per_sec
+        );
     }
 }
