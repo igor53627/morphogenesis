@@ -91,9 +91,18 @@ struct LoadedBenchState {
 }
 
 #[cfg(feature = "network")]
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
+fn main() {
     let cfg = parse_config(env::args().collect());
+    configure_gpu_env(&cfg);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    runtime.block_on(async_main(cfg));
+}
+
+#[cfg(feature = "network")]
+fn configure_gpu_env(cfg: &BenchConfig) {
     env::set_var("MORPHOGEN_GPU_STREAMS", cfg.gpu_streams.to_string());
     env::set_var(
         "MORPHOGEN_GPU_CUDA_GRAPH",
@@ -103,6 +112,10 @@ async fn main() {
         "MORPHOGEN_GPU_BATCH_TILE_SIZE",
         cfg.gpu_batch_tile_size.to_string(),
     );
+}
+
+#[cfg(feature = "network")]
+async fn async_main(cfg: BenchConfig) {
     let loaded = build_state(&cfg);
     let params = ChaChaParams::new(loaded.domain_bits).expect("invalid domain bits");
     let mode = bench_mode(loaded.state.as_ref());
@@ -395,6 +408,13 @@ fn build_state(cfg: &BenchConfig) -> LoadedBenchState {
     let domain_bits = if cfg.matrix_file.is_some() {
         detected_domain_bits
     } else {
+        assert!(
+            cfg.domain_bits >= detected_domain_bits,
+            "synthetic --domain-bits {} is too small for --num-pages {} (requires at least {})",
+            cfg.domain_bits,
+            num_pages,
+            detected_domain_bits
+        );
         cfg.domain_bits
     };
     assert!(
@@ -717,5 +737,24 @@ mod tests {
             "5000".to_string(),
         ];
         let _ = parse_config(args);
+    }
+
+    #[test]
+    #[should_panic(expected = "too small for --num-pages")]
+    fn build_state_rejects_synthetic_domain_bits_below_required() {
+        let cfg = BenchConfig {
+            num_pages: 300,
+            domain_bits: 8,
+            iterations: 1,
+            warmup_iterations: 0,
+            batch_sizes: vec![1],
+            gpu_streams: 1,
+            concurrency: 1,
+            gpu_cuda_graph: false,
+            gpu_batch_tile_size: DEFAULT_GPU_BATCH_TILE_SIZE,
+            chunk_size_bytes: PAGE_SIZE_BYTES,
+            matrix_file: None,
+        };
+        let _ = build_state(&cfg);
     }
 }

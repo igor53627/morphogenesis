@@ -4,7 +4,7 @@ title: Compare batching prototypes on H100 and select rollout strategy
 status: Done
 assignee: []
 created_date: '2026-02-19 12:05'
-updated_date: '2026-02-20 20:50'
+updated_date: '2026-02-21 09:33'
 labels:
   - performance
   - cuda
@@ -47,4 +47,6 @@ Compare baseline, adaptive micro-batch, multi-stream dispatch, CUDA Graph replay
 Artifact: `docs/benchmarks/2026-02-20-task-30-page-gpu-batch-h100-matrix.csv` (Modal app `ap-uWcW0hl1gC1o2kC3Yb0blq`). Correctness parity held for all rows (`checksum_match=1`).
 
 Decision report: `docs/plans/2026-02-20-task-30-batching-rollout-strategy.md`. Recommendation is GO for `multi_stream_4` rollout (`MORPHOGEN_GPU_STREAMS=4` + latency policy), NO-GO for full-batch/cuda-graph/tiled as standalone rollout, with adaptive/throughput policy as explicit fallback.
+
+2026-02-21: Addressed PR #11 review feedback in bench binary: moved GPU env-var setup to synchronous pre-runtime path (avoids env mutation after Tokio worker threads start) and added synthetic-domain validation to fail fast when --domain-bits is below required bits for --num-pages; added unit regression test.
 <!-- SECTION:NOTES:END -->
