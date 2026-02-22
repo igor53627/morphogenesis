@@ -113,6 +113,7 @@ const PASSTHROUGH_METHODS: &[&str] = &[
     // NOTE: eth_getTransactionByHash and eth_getTransactionReceipt are now
     // served from local block cache (private) with upstream fallback
     // NOTE: eth_estimateGas is now private via local EVM execution
+    // NOTE: eth_createAccessList is now private via local EVM execution
     "eth_getBlockByNumber",
     "eth_getBlockByHash",
     "eth_feeHistory",
@@ -594,6 +595,91 @@ async fn main() -> Result<()> {
         .instrument(request_span)
     })?;
 
+    // Register eth_createAccessList (Private via local EVM execution)
+    module.register_async_method("eth_createAccessList", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_createAccessList", &extensions);
+        async move {
+            // Accept 1-3 params: (call_obj, [block_tag], [state_overrides])
+            let raw: Vec<Value> = params.parse()?;
+            if raw.is_empty() || raw.len() > 3 {
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    format!("expected 1-3 params, got {}", raw.len()),
+                    None::<()>,
+                ));
+            }
+
+            // If state overrides (3rd param) are present, we can't handle them locally.
+            // Proxy to upstream if fallback is enabled, otherwise reject explicitly.
+            let has_overrides =
+                raw.len() == 3 && !raw[2].is_null() && raw[2] != serde_json::json!({});
+            if has_overrides {
+                if state.args.fallback_to_upstream {
+                    warn!(
+                        "eth_createAccessList with state overrides, proxying to upstream (privacy degraded)"
+                    );
+                    return proxy_to_upstream(
+                        &state.args.upstream,
+                        &state.http_client,
+                        "eth_createAccessList",
+                        Value::Array(raw),
+                    )
+                    .await;
+                }
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    "state overrides not supported for local eth_createAccessList",
+                    None::<()>,
+                ));
+            }
+
+            let call_params = &raw[0];
+            let block = raw
+                .get(1)
+                .cloned()
+                .unwrap_or(Value::String("latest".into()));
+
+            info!("Private eth_createAccessList via local EVM");
+
+            match evm::execute_eth_create_access_list(
+                Arc::clone(&state.pir_client),
+                Arc::clone(&state.code_resolver),
+                state.http_client.clone(),
+                state.args.upstream.clone(),
+                call_params,
+                &block,
+            )
+            .await
+            {
+                Ok(result) => Ok::<Value, ErrorObjectOwned>(result),
+                Err(evm::EthCallError::InvalidParams(msg)) => {
+                    Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
+                }
+                Err(evm::EthCallError::Internal(e)) => {
+                    error!("Private eth_createAccessList failed: {}", e);
+                    if state.args.fallback_to_upstream {
+                        warn!(
+                            "Falling back to upstream for eth_createAccessList (privacy degraded)"
+                        );
+                        return proxy_to_upstream(
+                            &state.args.upstream,
+                            &state.http_client,
+                            "eth_createAccessList",
+                            Value::Array(raw),
+                        )
+                        .await;
+                    }
+                    Err(ErrorObjectOwned::owned(
+                        -32000,
+                        format!("eth_createAccessList failed: {}", e),
+                        None::<()>,
+                    ))
+                }
+            }
+        }
+        .instrument(request_span)
+    })?;
+
     // Register eth_getTransactionByHash (Private via block cache, upstream fallback)
     module.register_async_method("eth_getTransactionByHash", |params, state, extensions| {
         let request_span = telemetry::rpc_server_span("eth_getTransactionByHash", &extensions);
@@ -1031,6 +1117,7 @@ mod tests {
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_getStorageAt"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_call"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_estimateGas"));
+        assert!(!PASSTHROUGH_METHODS.contains(&"eth_createAccessList"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_getTransactionByHash"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_getTransactionReceipt"));
         assert!(!PASSTHROUGH_METHODS.contains(&"eth_getLogs"));

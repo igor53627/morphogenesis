@@ -7,9 +7,11 @@ use revm::{
     primitives::{Address, B256, KECCAK_EMPTY, U256},
     state::AccountInfo,
 };
-use std::sync::Arc;
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Error type for PIR-backed database operations.
 #[derive(Debug)]
@@ -24,6 +26,55 @@ impl std::fmt::Display for PirDbError {
 impl std::error::Error for PirDbError {}
 impl DBErrorMarker for PirDbError {}
 
+/// Tracks account/storage touches during EVM execution to build an EIP-2930 access list.
+#[derive(Debug, Default)]
+pub struct AccessListCollector {
+    entries: BTreeMap<[u8; 20], BTreeSet<[u8; 32]>>,
+}
+
+impl AccessListCollector {
+    /// Record account access (without storage touch).
+    pub fn record_account(&mut self, address: [u8; 20]) {
+        self.entries.entry(address).or_default();
+    }
+
+    /// Record storage access for a given account/slot pair.
+    pub fn record_storage(&mut self, address: [u8; 20], slot: [u8; 32]) {
+        self.entries.entry(address).or_default().insert(slot);
+    }
+
+    /// Remove an account only when no storage keys are recorded for it.
+    pub fn remove_account_if_empty(&mut self, address: &[u8; 20]) {
+        let should_remove = self
+            .entries
+            .get(address)
+            .is_some_and(std::collections::BTreeSet::is_empty);
+        if should_remove {
+            self.entries.remove(address);
+        }
+    }
+
+    /// Serialize collected entries into Ethereum JSON-RPC access list shape.
+    pub fn to_rpc_entries(&self) -> Value {
+        Value::Array(
+            self.entries
+                .iter()
+                .map(|(address, slots)| {
+                    json!({
+                        "address": format!("0x{}", hex::encode(address)),
+                        "storageKeys": slots
+                            .iter()
+                            .map(|slot| Value::String(format!("0x{}", hex::encode(slot))))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect(),
+        )
+    }
+}
+
+pub type SharedAccessListCollector = Arc<Mutex<AccessListCollector>>;
+
 /// A revm Database implementation backed by PIR queries for private state access.
 /// Account data, code, and storage are fetched via PIR (private information retrieval)
 /// so the server never learns which accounts/slots are being accessed.
@@ -34,6 +85,7 @@ pub struct PirDatabase {
     upstream_client: reqwest::Client,
     upstream_url: String,
     handle: Handle,
+    access_list_collector: Option<SharedAccessListCollector>,
 }
 
 impl PirDatabase {
@@ -50,6 +102,55 @@ impl PirDatabase {
             upstream_client,
             upstream_url,
             handle,
+            access_list_collector: None,
+        }
+    }
+
+    pub fn new_with_access_list_collector(
+        pir_client: Arc<PirClient>,
+        code_resolver: Arc<CodeResolver>,
+        upstream_client: reqwest::Client,
+        upstream_url: String,
+        handle: Handle,
+        access_list_collector: SharedAccessListCollector,
+    ) -> Self {
+        Self {
+            pir_client,
+            code_resolver,
+            upstream_client,
+            upstream_url,
+            handle,
+            access_list_collector: Some(access_list_collector),
+        }
+    }
+
+    fn record_account_access(&self, address: [u8; 20]) {
+        if let Some(collector) = &self.access_list_collector {
+            let mut guard = match collector.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    warn!(
+                        "AccessListCollector mutex poisoned in record_account_access; recovering"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            guard.record_account(address);
+        }
+    }
+
+    fn record_storage_access(&self, address: [u8; 20], slot: [u8; 32]) {
+        if let Some(collector) = &self.access_list_collector {
+            let mut guard = match collector.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    warn!(
+                        "AccessListCollector mutex poisoned in record_storage_access; recovering"
+                    );
+                    poisoned.into_inner()
+                }
+            };
+            guard.record_storage(address, slot);
         }
     }
 }
@@ -59,6 +160,7 @@ impl Database for PirDatabase {
 
     fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         let addr_bytes: [u8; 20] = address.into_array();
+        self.record_account_access(addr_bytes);
 
         let account = self
             .handle
@@ -122,6 +224,7 @@ impl Database for PirDatabase {
     fn storage(&mut self, address: Address, index: U256) -> Result<U256, Self::Error> {
         let addr_bytes: [u8; 20] = address.into_array();
         let slot_bytes: [u8; 32] = index.to_be_bytes();
+        self.record_storage_access(addr_bytes, slot_bytes);
 
         let storage = self
             .handle
@@ -210,5 +313,57 @@ impl Database for PirDatabase {
 
             Ok(B256::from(hash))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AccessListCollector;
+    use serde_json::json;
+
+    #[test]
+    fn access_list_collector_deduplicates_and_sorts_entries() {
+        let mut collector = AccessListCollector::default();
+        let addr_a = [0x11_u8; 20];
+        let addr_b = [0x22_u8; 20];
+        let slot_1 = [0x01_u8; 32];
+        let slot_2 = [0x02_u8; 32];
+
+        collector.record_account(addr_b);
+        collector.record_storage(addr_a, slot_2);
+        collector.record_storage(addr_a, slot_1);
+        collector.record_storage(addr_a, slot_1);
+
+        assert_eq!(
+            collector.to_rpc_entries(),
+            json!([
+                {
+                    "address": format!("0x{}", hex::encode(addr_a)),
+                    "storageKeys": [
+                        format!("0x{}", hex::encode(slot_1)),
+                        format!("0x{}", hex::encode(slot_2))
+                    ]
+                },
+                {
+                    "address": format!("0x{}", hex::encode(addr_b)),
+                    "storageKeys": []
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn access_list_collector_records_account_without_storage() {
+        let mut collector = AccessListCollector::default();
+        let addr = [0xab_u8; 20];
+        collector.record_account(addr);
+
+        assert_eq!(
+            collector.to_rpc_entries(),
+            json!([{
+                "address": format!("0x{}", hex::encode(addr)),
+                "storageKeys": []
+            }])
+        );
     }
 }
