@@ -4,7 +4,7 @@ title: Harden morphogen-server production binary for real deployments
 status: Done
 assignee: []
 created_date: '2026-02-22 10:42'
-updated_date: '2026-02-22 12:59'
+updated_date: '2026-02-22 13:01'
 labels:
   - production
   - server
@@ -54,4 +54,8 @@ Verification (follow-up): cargo test -p morphogen-server --features network --bi
 2026-02-22: Addressed second roborev pass for TASK-33 by moving shutdown waiter installation ahead of merge-worker spawn, adding bounded ctrl-c retry/backoff behavior, and adding parser/flag conflict tests (plus CLI override coverage).
 
 Verification (second follow-up): cargo test -p morphogen-server --features network --bin server; cargo test -p morphogen-server --features network; cargo clippy --package morphogen-server --features network --bin server -- -D warnings
+
+2026-02-22: Addressed third roborev follow-up by removing permanent ctrl-c listener disable path, keeping bounded exponential retry/backoff, and adding direct retry-policy unit tests.
+
+Verification (third follow-up): cargo test -p morphogen-server --features network --bin server; cargo test -p morphogen-server --features network; cargo clippy --package morphogen-server --features network --bin server -- -D warnings
 <!-- SECTION:NOTES:END -->

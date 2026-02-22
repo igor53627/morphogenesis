@@ -36,7 +36,6 @@ const DEFAULT_MATRIX_SEED: u64 = 42;
 const DEFAULT_PAGE_DOMAIN_BITS: usize = 25;
 const DEFAULT_PAGE_ROWS_PER_PAGE: usize = 1;
 const DEFAULT_SEEDS: [u64; 3] = [0x1234, 0x5678, 0x9ABC];
-const CTRL_C_MAX_RETRIES: u32 = 8;
 const CTRL_C_INITIAL_RETRY_DELAY_MS: u64 = 250;
 const CTRL_C_MAX_RETRY_DELAY_MS: u64 = 5_000;
 
@@ -844,6 +843,14 @@ fn parse_env_bool(key: &str) -> Result<Option<bool>, StartupError> {
     Ok(Some(value))
 }
 
+fn should_log_ctrl_c_failure(failures: u32) -> bool {
+    failures <= 3 || failures.is_multiple_of(10)
+}
+
+fn next_ctrl_c_retry_delay_ms(current_delay_ms: u64) -> u64 {
+    (current_delay_ms * 2).min(CTRL_C_MAX_RETRY_DELAY_MS)
+}
+
 #[cfg(unix)]
 struct ShutdownWaiters {
     ctrl_c: ShutdownFuture,
@@ -864,7 +871,7 @@ async fn wait_for_ctrl_c_signal() {
             Ok(()) => break,
             Err(err) => {
                 failures = failures.saturating_add(1);
-                if failures <= 3 || failures.is_multiple_of(10) {
+                if should_log_ctrl_c_failure(failures) {
                     tracing::error!(
                         failures,
                         "ctrl+c signal stream failed: {}",
@@ -872,28 +879,8 @@ async fn wait_for_ctrl_c_signal() {
                     );
                 }
 
-                if failures >= CTRL_C_MAX_RETRIES {
-                    #[cfg(unix)]
-                    {
-                        tracing::error!(
-                            failures,
-                            "ctrl+c listener disabled after repeated failures; waiting on SIGTERM"
-                        );
-                        std::future::pending::<()>().await;
-                    }
-
-                    #[cfg(not(unix))]
-                    {
-                        tracing::error!(
-                            failures,
-                            "ctrl+c listener failed repeatedly; forcing shutdown"
-                        );
-                        break;
-                    }
-                }
-
                 tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
-                retry_delay_ms = (retry_delay_ms * 2).min(CTRL_C_MAX_RETRY_DELAY_MS);
+                retry_delay_ms = next_ctrl_c_retry_delay_ms(retry_delay_ms);
             }
         }
     }
@@ -1247,6 +1234,33 @@ mod runtime_config_tests {
         assert!(err.to_string().contains("divisible by row_size_bytes"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn ctrl_c_failure_logging_policy_matches_expected_thresholds() {
+        assert!(should_log_ctrl_c_failure(1));
+        assert!(should_log_ctrl_c_failure(2));
+        assert!(should_log_ctrl_c_failure(3));
+        assert!(!should_log_ctrl_c_failure(4));
+        assert!(should_log_ctrl_c_failure(10));
+        assert!(should_log_ctrl_c_failure(20));
+        assert!(!should_log_ctrl_c_failure(21));
+    }
+
+    #[test]
+    fn ctrl_c_retry_delay_backoff_is_capped() {
+        assert_eq!(
+            next_ctrl_c_retry_delay_ms(CTRL_C_INITIAL_RETRY_DELAY_MS),
+            CTRL_C_INITIAL_RETRY_DELAY_MS * 2
+        );
+        assert_eq!(
+            next_ctrl_c_retry_delay_ms(CTRL_C_MAX_RETRY_DELAY_MS),
+            CTRL_C_MAX_RETRY_DELAY_MS
+        );
+        assert_eq!(
+            next_ctrl_c_retry_delay_ms(CTRL_C_MAX_RETRY_DELAY_MS / 2),
+            CTRL_C_MAX_RETRY_DELAY_MS
+        );
     }
 
     #[cfg(unix)]
