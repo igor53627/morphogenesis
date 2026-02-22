@@ -1,8 +1,9 @@
 //! Production server binary.
 
+use clap::Parser;
 use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
 use morphogen_server::{
-    epoch::EpochManager,
+    epoch::{self, EpochManager},
     network::{
         create_router_with_concurrency, telemetry, AppState, EpochMetadata, PagePirConfig,
         MAX_CONCURRENT_SCANS,
@@ -10,101 +11,998 @@ use morphogen_server::{
     Environment, ServerConfig,
 };
 use morphogen_storage::ChunkedMatrix;
+use serde::Deserialize;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::fs::File;
+use std::io::{BufReader, Read};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::watch;
+
+#[cfg(feature = "cuda")]
+use morphogen_gpu_dpf::kernel::GpuScanner;
+#[cfg(feature = "cuda")]
+use morphogen_gpu_dpf::storage::GpuPageMatrix;
+#[cfg(feature = "cuda")]
+use std::sync::Mutex;
+
+const DEFAULT_BIND_ADDR: &str = "0.0.0.0:3000";
+const DEFAULT_MERGE_INTERVAL_MS: u64 = 1_000;
+const DEFAULT_MATRIX_SEED: u64 = 42;
+const DEFAULT_PAGE_DOMAIN_BITS: usize = 25;
+const DEFAULT_PAGE_ROWS_PER_PAGE: usize = 1;
+const DEFAULT_SEEDS: [u64; 3] = [0x1234, 0x5678, 0x9ABC];
 
 /// Type alias for stub GPU scanner (non-CUDA builds).
 type StubGpuScanner = Option<Arc<()>>;
-
 /// Type alias for stub GPU matrix (non-CUDA builds).
 type StubGpuMatrix = Option<Arc<std::sync::Mutex<Option<()>>>>;
 
+#[derive(Debug, Clone)]
+struct StartupError {
+    message: String,
+}
+
+impl StartupError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl Display for StartupError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl Error for StartupError {}
+
+#[derive(Parser, Debug, Clone)]
+#[command(author, version, about = "Morphogenesis PIR server")]
+struct CliArgs {
+    /// Optional JSON config file path.
+    #[arg(long)]
+    config: Option<PathBuf>,
+
+    /// Bind address, for example 0.0.0.0:3000.
+    #[arg(long)]
+    bind_addr: Option<String>,
+
+    /// Environment profile: dev, test, or prod.
+    #[arg(long)]
+    environment: Option<String>,
+
+    /// Row size in bytes.
+    #[arg(long)]
+    row_size_bytes: Option<usize>,
+
+    /// Chunk size in bytes.
+    #[arg(long)]
+    chunk_size_bytes: Option<usize>,
+
+    /// Synthetic matrix size in bytes.
+    #[arg(long)]
+    matrix_size_bytes: Option<usize>,
+
+    /// Path to a matrix file to load at startup.
+    #[arg(long)]
+    matrix_file: Option<PathBuf>,
+
+    /// Seed used for synthetic matrix generation.
+    #[arg(long)]
+    matrix_seed: Option<u64>,
+
+    /// Allow synthetic matrix generation when no matrix file is provided.
+    #[arg(long)]
+    allow_synthetic_matrix: Option<bool>,
+
+    /// Merge worker interval in milliseconds.
+    #[arg(long)]
+    merge_interval_ms: Option<u64>,
+
+    /// Maximum concurrent scan requests.
+    #[arg(long)]
+    max_concurrent_scans: Option<usize>,
+
+    /// Comma-separated epoch seeds (three u64 values).
+    #[arg(long)]
+    seeds: Option<String>,
+
+    /// Initial block number reported by metadata endpoint.
+    #[arg(long)]
+    block_number: Option<u64>,
+
+    /// Initial state root (32-byte hex string).
+    #[arg(long)]
+    state_root: Option<String>,
+
+    /// Disable page PIR metadata and endpoints.
+    #[arg(long)]
+    disable_page_pir: Option<bool>,
+
+    /// Page PIR domain bits.
+    #[arg(long)]
+    page_domain_bits: Option<usize>,
+
+    /// Rows per page in page PIR metadata.
+    #[arg(long)]
+    page_rows_per_page: Option<usize>,
+
+    /// First 16-byte PRG key as hex.
+    #[arg(long)]
+    page_prg_key_0: Option<String>,
+
+    /// Second 16-byte PRG key as hex.
+    #[arg(long)]
+    page_prg_key_1: Option<String>,
+
+    /// CUDA device ordinal.
+    #[cfg(feature = "cuda")]
+    #[arg(long)]
+    gpu_device: Option<usize>,
+
+    /// If true, preload GPU matrix from CPU matrix at startup.
+    #[cfg(feature = "cuda")]
+    #[arg(long)]
+    gpu_preload: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct FileConfig {
+    bind_addr: Option<String>,
+    environment: Option<String>,
+    row_size_bytes: Option<usize>,
+    chunk_size_bytes: Option<usize>,
+    matrix_size_bytes: Option<usize>,
+    matrix_file: Option<PathBuf>,
+    matrix_seed: Option<u64>,
+    allow_synthetic_matrix: Option<bool>,
+    merge_interval_ms: Option<u64>,
+    max_concurrent_scans: Option<usize>,
+    seeds: Option<String>,
+    block_number: Option<u64>,
+    state_root: Option<String>,
+    disable_page_pir: Option<bool>,
+    page_domain_bits: Option<usize>,
+    page_rows_per_page: Option<usize>,
+    page_prg_key_0: Option<String>,
+    page_prg_key_1: Option<String>,
+    #[cfg(feature = "cuda")]
+    gpu_device: Option<usize>,
+    #[cfg(feature = "cuda")]
+    gpu_preload: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EnvConfig {
+    config: Option<PathBuf>,
+    bind_addr: Option<String>,
+    environment: Option<String>,
+    row_size_bytes: Option<usize>,
+    chunk_size_bytes: Option<usize>,
+    matrix_size_bytes: Option<usize>,
+    matrix_file: Option<PathBuf>,
+    matrix_seed: Option<u64>,
+    allow_synthetic_matrix: Option<bool>,
+    merge_interval_ms: Option<u64>,
+    max_concurrent_scans: Option<usize>,
+    seeds: Option<String>,
+    block_number: Option<u64>,
+    state_root: Option<String>,
+    disable_page_pir: Option<bool>,
+    page_domain_bits: Option<usize>,
+    page_rows_per_page: Option<usize>,
+    page_prg_key_0: Option<String>,
+    page_prg_key_1: Option<String>,
+    #[cfg(feature = "cuda")]
+    gpu_device: Option<usize>,
+    #[cfg(feature = "cuda")]
+    gpu_preload: Option<bool>,
+}
+
+impl EnvConfig {
+    fn from_process_env() -> Result<Self, StartupError> {
+        Ok(Self {
+            config: env_var("MORPHOGEN_SERVER_CONFIG").map(PathBuf::from),
+            bind_addr: env_var("MORPHOGEN_SERVER_BIND_ADDR"),
+            environment: env_var("MORPHOGEN_SERVER_ENV"),
+            row_size_bytes: parse_env_usize("MORPHOGEN_SERVER_ROW_SIZE_BYTES")?,
+            chunk_size_bytes: parse_env_usize("MORPHOGEN_SERVER_CHUNK_SIZE_BYTES")?,
+            matrix_size_bytes: parse_env_usize("MORPHOGEN_SERVER_MATRIX_SIZE_BYTES")?,
+            matrix_file: env_var("MORPHOGEN_SERVER_MATRIX_FILE").map(PathBuf::from),
+            matrix_seed: parse_env_u64("MORPHOGEN_SERVER_MATRIX_SEED")?,
+            allow_synthetic_matrix: parse_env_bool("MORPHOGEN_SERVER_ALLOW_SYNTHETIC_MATRIX")?,
+            merge_interval_ms: parse_env_u64("MORPHOGEN_SERVER_MERGE_INTERVAL_MS")?,
+            max_concurrent_scans: parse_env_usize("MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS")?,
+            seeds: env_var("MORPHOGEN_SERVER_SEEDS"),
+            block_number: parse_env_u64("MORPHOGEN_SERVER_BLOCK_NUMBER")?,
+            state_root: env_var("MORPHOGEN_SERVER_STATE_ROOT"),
+            disable_page_pir: parse_env_bool("MORPHOGEN_SERVER_DISABLE_PAGE_PIR")?,
+            page_domain_bits: parse_env_usize("MORPHOGEN_SERVER_PAGE_DOMAIN_BITS")?,
+            page_rows_per_page: parse_env_usize("MORPHOGEN_SERVER_PAGE_ROWS_PER_PAGE")?,
+            page_prg_key_0: env_var("MORPHOGEN_SERVER_PAGE_PRG_KEY_0"),
+            page_prg_key_1: env_var("MORPHOGEN_SERVER_PAGE_PRG_KEY_1"),
+            #[cfg(feature = "cuda")]
+            gpu_device: parse_env_usize("MORPHOGEN_SERVER_GPU_DEVICE")?,
+            #[cfg(feature = "cuda")]
+            gpu_preload: parse_env_bool("MORPHOGEN_SERVER_GPU_PRELOAD")?,
+        })
+    }
+
+    #[cfg(test)]
+    fn default_for_tests() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PagePirRuntimeConfig {
+    domain_bits: usize,
+    rows_per_page: usize,
+    prg_keys: [[u8; 16]; 2],
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeConfig {
+    bind_addr: SocketAddr,
+    environment: Environment,
+    row_size_bytes: usize,
+    chunk_size_bytes: usize,
+    matrix_size_bytes: Option<usize>,
+    matrix_file: Option<PathBuf>,
+    matrix_seed: u64,
+    merge_interval: Duration,
+    max_concurrent_scans: usize,
+    seeds: [u64; 3],
+    block_number: u64,
+    state_root: [u8; 32],
+    page_config: Option<PagePirRuntimeConfig>,
+    #[cfg(feature = "cuda")]
+    gpu_device: usize,
+    #[cfg(feature = "cuda")]
+    gpu_preload: bool,
+}
+
+impl RuntimeConfig {
+    fn resolve(
+        cli: CliArgs,
+        env: EnvConfig,
+        file: Option<FileConfig>,
+    ) -> Result<Self, StartupError> {
+        let file = file.unwrap_or_default();
+
+        let env_name = pick3(cli.environment, env.environment, file.environment)
+            .unwrap_or_else(|| "prod".to_string());
+        let environment = parse_environment(&env_name)?;
+        let defaults = ServerConfig::for_env(environment);
+
+        let bind_addr_raw = pick3(cli.bind_addr, env.bind_addr, file.bind_addr)
+            .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
+        let bind_addr = bind_addr_raw.parse::<SocketAddr>().map_err(|e| {
+            StartupError::new(format!("invalid bind_addr '{}': {}", bind_addr_raw, e))
+        })?;
+
+        let row_size_bytes = pick3(cli.row_size_bytes, env.row_size_bytes, file.row_size_bytes)
+            .unwrap_or(defaults.row_size_bytes);
+        let chunk_size_bytes = pick3(
+            cli.chunk_size_bytes,
+            env.chunk_size_bytes,
+            file.chunk_size_bytes,
+        )
+        .unwrap_or(defaults.chunk_size_bytes);
+
+        if row_size_bytes == 0 {
+            return Err(StartupError::new("row_size_bytes must be > 0"));
+        }
+        if chunk_size_bytes == 0 {
+            return Err(StartupError::new("chunk_size_bytes must be > 0"));
+        }
+        if !chunk_size_bytes.is_multiple_of(row_size_bytes) {
+            return Err(StartupError::new(format!(
+                "chunk_size_bytes ({}) must be divisible by row_size_bytes ({})",
+                chunk_size_bytes, row_size_bytes
+            )));
+        }
+
+        let matrix_file = pick3(cli.matrix_file, env.matrix_file, file.matrix_file);
+        let allow_synthetic_matrix = pick3(
+            cli.allow_synthetic_matrix,
+            env.allow_synthetic_matrix,
+            file.allow_synthetic_matrix,
+        )
+        .unwrap_or(false);
+
+        let mut matrix_size_bytes = pick3(
+            cli.matrix_size_bytes,
+            env.matrix_size_bytes,
+            file.matrix_size_bytes,
+        );
+
+        if matrix_file.is_some() && matrix_size_bytes.is_some() {
+            return Err(StartupError::new(
+                "matrix_size_bytes cannot be set when matrix_file is provided",
+            ));
+        }
+
+        if matrix_file.is_none() && !allow_synthetic_matrix {
+            return Err(StartupError::new(
+                "matrix_file is required unless allow_synthetic_matrix=true",
+            ));
+        }
+
+        if matrix_file.is_none() {
+            matrix_size_bytes = Some(matrix_size_bytes.unwrap_or(defaults.matrix_size_bytes));
+        }
+
+        let matrix_seed = pick3(cli.matrix_seed, env.matrix_seed, file.matrix_seed)
+            .unwrap_or(DEFAULT_MATRIX_SEED);
+
+        let merge_interval_ms = pick3(
+            cli.merge_interval_ms,
+            env.merge_interval_ms,
+            file.merge_interval_ms,
+        )
+        .unwrap_or(DEFAULT_MERGE_INTERVAL_MS);
+        if merge_interval_ms == 0 {
+            return Err(StartupError::new("merge_interval_ms must be > 0"));
+        }
+
+        let max_concurrent_scans = pick3(
+            cli.max_concurrent_scans,
+            env.max_concurrent_scans,
+            file.max_concurrent_scans,
+        )
+        .unwrap_or(MAX_CONCURRENT_SCANS);
+        if max_concurrent_scans == 0 {
+            return Err(StartupError::new("max_concurrent_scans must be > 0"));
+        }
+
+        let seeds = match pick3(cli.seeds, env.seeds, file.seeds) {
+            Some(raw) => parse_u64_triplet(&raw, "seeds")?,
+            None => DEFAULT_SEEDS,
+        };
+
+        let block_number =
+            pick3(cli.block_number, env.block_number, file.block_number).unwrap_or(0);
+
+        let state_root = match pick3(cli.state_root, env.state_root, file.state_root) {
+            Some(raw) => parse_fixed_hex::<32>(&raw, "state_root")?,
+            None => [0u8; 32],
+        };
+
+        let disable_page_pir = pick3(
+            cli.disable_page_pir,
+            env.disable_page_pir,
+            file.disable_page_pir,
+        )
+        .unwrap_or(false);
+
+        let page_config = if disable_page_pir {
+            None
+        } else {
+            let domain_bits = pick3(
+                cli.page_domain_bits,
+                env.page_domain_bits,
+                file.page_domain_bits,
+            )
+            .unwrap_or(DEFAULT_PAGE_DOMAIN_BITS);
+            let rows_per_page = pick3(
+                cli.page_rows_per_page,
+                env.page_rows_per_page,
+                file.page_rows_per_page,
+            )
+            .unwrap_or(DEFAULT_PAGE_ROWS_PER_PAGE);
+            if rows_per_page == 0 {
+                return Err(StartupError::new("page_rows_per_page must be > 0"));
+            }
+
+            let key0 = match pick3(cli.page_prg_key_0, env.page_prg_key_0, file.page_prg_key_0) {
+                Some(raw) => parse_fixed_hex::<16>(&raw, "page_prg_key_0")?,
+                None => [0u8; 16],
+            };
+            let key1 = match pick3(cli.page_prg_key_1, env.page_prg_key_1, file.page_prg_key_1) {
+                Some(raw) => parse_fixed_hex::<16>(&raw, "page_prg_key_1")?,
+                None => [0u8; 16],
+            };
+
+            Some(PagePirRuntimeConfig {
+                domain_bits,
+                rows_per_page,
+                prg_keys: [key0, key1],
+            })
+        };
+
+        #[cfg(feature = "cuda")]
+        let gpu_device = pick3(cli.gpu_device, env.gpu_device, file.gpu_device).unwrap_or(0);
+        #[cfg(feature = "cuda")]
+        let gpu_preload = pick3(cli.gpu_preload, env.gpu_preload, file.gpu_preload).unwrap_or(true);
+
+        Ok(Self {
+            bind_addr,
+            environment,
+            row_size_bytes,
+            chunk_size_bytes,
+            matrix_size_bytes,
+            matrix_file,
+            matrix_seed,
+            merge_interval: Duration::from_millis(merge_interval_ms),
+            max_concurrent_scans,
+            seeds,
+            block_number,
+            state_root,
+            page_config,
+            #[cfg(feature = "cuda")]
+            gpu_device,
+            #[cfg(feature = "cuda")]
+            gpu_preload,
+        })
+    }
+}
+
+impl CliArgs {
+    #[cfg(test)]
+    fn default_for_tests() -> Self {
+        Self {
+            config: None,
+            bind_addr: None,
+            environment: None,
+            row_size_bytes: None,
+            chunk_size_bytes: None,
+            matrix_size_bytes: None,
+            matrix_file: None,
+            matrix_seed: None,
+            allow_synthetic_matrix: None,
+            merge_interval_ms: None,
+            max_concurrent_scans: None,
+            seeds: None,
+            block_number: None,
+            state_root: None,
+            disable_page_pir: None,
+            page_domain_bits: None,
+            page_rows_per_page: None,
+            page_prg_key_0: None,
+            page_prg_key_1: None,
+            #[cfg(feature = "cuda")]
+            gpu_device: None,
+            #[cfg(feature = "cuda")]
+            gpu_preload: None,
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn init_gpu_resources(
+    runtime: &RuntimeConfig,
+    matrix: &ChunkedMatrix,
+) -> Result<
+    (
+        Option<Arc<GpuScanner>>,
+        Option<Arc<Mutex<Option<GpuPageMatrix>>>>,
+    ),
+    StartupError,
+> {
+    tracing::info!(
+        device = runtime.gpu_device,
+        preload = runtime.gpu_preload,
+        "initializing CUDA resources"
+    );
+
+    let scanner = Arc::new(
+        GpuScanner::new(runtime.gpu_device)
+            .map_err(|e| StartupError::new(format!("failed to initialize GPU scanner: {}", e)))?,
+    );
+
+    let gpu_matrix = if runtime.gpu_preload {
+        GpuPageMatrix::from_chunked_matrix(scanner.device.clone(), matrix).map_err(|e| {
+            StartupError::new(format!(
+                "failed to preload GPU matrix from CPU matrix: {}",
+                e
+            ))
+        })?
+    } else {
+        let num_pages = matrix.total_size_bytes() / runtime.row_size_bytes;
+        GpuPageMatrix::alloc_empty(scanner.device.clone(), num_pages)
+            .map_err(|e| StartupError::new(format!("failed to allocate empty GPU matrix: {}", e)))?
+    };
+
+    Ok((Some(scanner), Some(Arc::new(Mutex::new(Some(gpu_matrix))))))
+}
+
+fn load_file_config(path: &Path) -> Result<FileConfig, StartupError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        StartupError::new(format!(
+            "failed to read config file '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    serde_json::from_str::<FileConfig>(&raw).map_err(|e| {
+        StartupError::new(format!(
+            "failed to parse config file '{}' as JSON: {}",
+            path.display(),
+            e
+        ))
+    })
+}
+
+fn load_matrix_from_file(
+    path: &Path,
+    row_size_bytes: usize,
+    chunk_size_bytes: usize,
+) -> Result<ChunkedMatrix, StartupError> {
+    let file = File::open(path).map_err(|e| {
+        StartupError::new(format!(
+            "failed to open matrix file '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|e| {
+        StartupError::new(format!(
+            "failed to stat matrix file '{}': {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let total_size_bytes = usize::try_from(metadata.len()).map_err(|_| {
+        StartupError::new(format!(
+            "matrix file '{}' is too large for this platform",
+            path.display()
+        ))
+    })?;
+
+    if total_size_bytes == 0 {
+        return Err(StartupError::new(format!(
+            "matrix file '{}' is empty",
+            path.display()
+        )));
+    }
+
+    if !total_size_bytes.is_multiple_of(row_size_bytes) {
+        return Err(StartupError::new(format!(
+            "matrix file size ({}) must be divisible by row_size_bytes ({})",
+            total_size_bytes, row_size_bytes
+        )));
+    }
+
+    let mut matrix = ChunkedMatrix::new(total_size_bytes, chunk_size_bytes);
+    let mut reader = BufReader::new(file);
+    let mut row_buf = vec![0u8; row_size_bytes];
+    let num_rows = total_size_bytes / row_size_bytes;
+
+    for row_idx in 0..num_rows {
+        reader.read_exact(&mut row_buf).map_err(|e| {
+            StartupError::new(format!(
+                "failed reading row {} from matrix file '{}': {}",
+                row_idx,
+                path.display(),
+                e
+            ))
+        })?;
+        matrix.write_row(row_idx, row_size_bytes, &row_buf);
+    }
+
+    Ok(matrix)
+}
+
+fn build_matrix(runtime: &RuntimeConfig) -> Result<ChunkedMatrix, StartupError> {
+    if let Some(path) = runtime.matrix_file.as_ref() {
+        load_matrix_from_file(path, runtime.row_size_bytes, runtime.chunk_size_bytes)
+    } else {
+        let matrix_size_bytes = runtime.matrix_size_bytes.ok_or_else(|| {
+            StartupError::new("matrix_size_bytes is required for synthetic matrix")
+        })?;
+        let mut matrix = ChunkedMatrix::new(matrix_size_bytes, runtime.chunk_size_bytes);
+        matrix.fill_with_pattern(runtime.matrix_seed);
+        Ok(matrix)
+    }
+}
+
+fn validate_server_config(
+    runtime: &RuntimeConfig,
+    matrix_size_bytes: usize,
+) -> Result<(), StartupError> {
+    let config = ServerConfig {
+        environment: runtime.environment,
+        row_size_bytes: runtime.row_size_bytes,
+        chunk_size_bytes: runtime.chunk_size_bytes,
+        matrix_size_bytes,
+        bench_fill_seed: Some(runtime.matrix_seed),
+    };
+
+    config
+        .validate()
+        .map_err(|e| StartupError::new(format!("invalid runtime configuration: {}", e)))
+}
+
+fn build_page_config(
+    cfg: Option<PagePirRuntimeConfig>,
+    num_rows: usize,
+) -> Result<Option<PagePirConfig>, StartupError> {
+    let Some(cfg) = cfg else {
+        return Ok(None);
+    };
+
+    let num_pages = 1usize
+        .checked_shl(cfg.domain_bits as u32)
+        .ok_or_else(|| StartupError::new("page_domain_bits is too large"))?;
+    let row_capacity = num_pages
+        .checked_mul(cfg.rows_per_page)
+        .ok_or_else(|| StartupError::new("page_domain_bits * page_rows_per_page overflowed"))?;
+
+    if num_rows > row_capacity {
+        return Err(StartupError::new(format!(
+            "page config capacity ({}) is smaller than matrix rows ({})",
+            row_capacity, num_rows
+        )));
+    }
+
+    Ok(Some(PagePirConfig {
+        domain_bits: cfg.domain_bits,
+        rows_per_page: cfg.rows_per_page,
+        prg_keys: cfg.prg_keys,
+    }))
+}
+
+fn pick3<T>(cli: Option<T>, env: Option<T>, file: Option<T>) -> Option<T> {
+    cli.or(env).or(file)
+}
+
+fn parse_environment(raw: &str) -> Result<Environment, StartupError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "dev" => Ok(Environment::Dev),
+        "test" => Ok(Environment::Test),
+        "prod" | "production" => Ok(Environment::Prod),
+        _ => Err(StartupError::new(format!(
+            "invalid environment '{}', expected dev|test|prod",
+            raw
+        ))),
+    }
+}
+
+fn parse_u64_triplet(raw: &str, field: &str) -> Result<[u64; 3], StartupError> {
+    let parts: Vec<&str> = raw.split(',').map(|p| p.trim()).collect();
+    if parts.len() != 3 {
+        return Err(StartupError::new(format!(
+            "{} must contain exactly 3 comma-separated values",
+            field
+        )));
+    }
+
+    let mut out = [0u64; 3];
+    for (i, part) in parts.iter().enumerate() {
+        out[i] = parse_u64_value(part, field)?;
+    }
+    Ok(out)
+}
+
+fn parse_u64_value(raw: &str, field: &str) -> Result<u64, StartupError> {
+    if let Some(hex) = raw.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16)
+            .map_err(|e| StartupError::new(format!("invalid {} value '{}': {}", field, raw, e)))
+    } else {
+        raw.parse::<u64>()
+            .map_err(|e| StartupError::new(format!("invalid {} value '{}': {}", field, raw, e)))
+    }
+}
+
+fn parse_fixed_hex<const N: usize>(raw: &str, field: &str) -> Result<[u8; N], StartupError> {
+    let hex = raw.strip_prefix("0x").unwrap_or(raw);
+    if hex.len() != N * 2 {
+        return Err(StartupError::new(format!(
+            "{} must be {} bytes ({} hex chars), got {} hex chars",
+            field,
+            N,
+            N * 2,
+            hex.len()
+        )));
+    }
+
+    if !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(StartupError::new(format!(
+            "{} contains non-hex characters",
+            field
+        )));
+    }
+
+    let mut out = [0u8; N];
+    hex::decode_to_slice(hex, &mut out)
+        .map_err(|e| StartupError::new(format!("failed to decode {} as hex: {}", field, e)))?;
+    Ok(out)
+}
+
+fn env_var(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn parse_env_usize(key: &str) -> Result<Option<usize>, StartupError> {
+    let Some(raw) = env_var(key) else {
+        return Ok(None);
+    };
+    raw.parse::<usize>()
+        .map(Some)
+        .map_err(|e| StartupError::new(format!("invalid {} value '{}': {}", key, raw, e)))
+}
+
+fn parse_env_u64(key: &str) -> Result<Option<u64>, StartupError> {
+    let Some(raw) = env_var(key) else {
+        return Ok(None);
+    };
+    parse_u64_value(&raw, key).map(Some)
+}
+
+fn parse_env_bool(key: &str) -> Result<Option<bool>, StartupError> {
+    let Some(raw) = env_var(key) else {
+        return Ok(None);
+    };
+
+    let value = match raw.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => {
+            return Err(StartupError::new(format!(
+                "invalid {} value '{}': expected true/false",
+                key, raw
+            )));
+        }
+    };
+
+    Ok(Some(value))
+}
+
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::error!("failed to install ctrl+c handler: {}", err);
+        }
+    };
+
+    #[cfg(unix)]
+    {
+        let terminate = async {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(mut sigterm) => {
+                    let _ = sigterm.recv().await;
+                }
+                Err(err) => {
+                    tracing::error!("failed to install SIGTERM handler: {}", err);
+                }
+            }
+        };
+
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = terminate => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+    }
+
+    tracing::info!("shutdown signal received");
+}
+
 #[tokio::main]
 async fn main() {
-    // 1. Initialize Telemetry
+    if let Err(err) = run().await {
+        eprintln!("morphogen-server startup failed: {}", err);
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<(), StartupError> {
     telemetry::init_tracing();
     let metrics_handle = telemetry::init_metrics();
 
-    // 2. Configuration (Hardcoded for now, or env vars)
-    let config = ServerConfig {
-        environment: Environment::Prod,
-        matrix_size_bytes: 108 * 1024 * 1024 * 1024, // 108GB
-        chunk_size_bytes: 1024 * 1024 * 1024,        // 1GB
-        row_size_bytes: 4096,                        // Page size
-        bench_fill_seed: Some(42),
+    let cli = CliArgs::parse();
+    let env = EnvConfig::from_process_env()?;
+    let config_path = cli.config.clone().or_else(|| env.config.clone());
+
+    let file = match config_path {
+        Some(path) => Some(load_file_config(&path)?),
+        None => None,
     };
 
-    // 3. Initialize State
-    let matrix = Arc::new(ChunkedMatrix::new(
-        config.matrix_size_bytes,
-        config.chunk_size_bytes,
-    ));
-    // Fill if needed...
+    let runtime = RuntimeConfig::resolve(cli, env, file)?;
+
+    let matrix = Arc::new(build_matrix(&runtime)?);
+    validate_server_config(&runtime, matrix.total_size_bytes())?;
+
+    let num_rows = matrix.total_size_bytes() / runtime.row_size_bytes;
+    let page_config = build_page_config(runtime.page_config.clone(), num_rows)?;
+
+    #[cfg(feature = "cuda")]
+    let (gpu_scanner, gpu_matrix) = init_gpu_resources(&runtime, matrix.as_ref())?;
+
+    #[cfg(not(feature = "cuda"))]
+    let (_gpu_scanner, _gpu_matrix): (StubGpuScanner, StubGpuMatrix) = (None, None);
 
     let snapshot = EpochSnapshot {
         epoch_id: 0,
         matrix,
     };
-    let pending = Arc::new(DeltaBuffer::new_with_epoch(config.row_size_bytes, 0));
-    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending.clone()));
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(runtime.row_size_bytes, 0));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
 
     let (_epoch_tx, epoch_rx) = watch::channel(EpochMetadata {
         epoch_id: 0,
-        num_rows: (config.matrix_size_bytes / config.row_size_bytes),
-        seeds: [0x1234, 0x5678, 0x9ABC],
-        block_number: 0,
-        state_root: [0u8; 32],
+        num_rows,
+        seeds: runtime.seeds,
+        block_number: runtime.block_number,
+        state_root: runtime.state_root,
     });
-
-    // 4. GPU Setup
-    #[cfg(feature = "cuda")]
-    let (gpu_scanner, gpu_matrix) = {
-        use morphogen_gpu_dpf::kernel::GpuScanner;
-        use morphogen_gpu_dpf::storage::GpuPageMatrix;
-        use std::sync::Mutex;
-
-        tracing::info!("Initializing GPU...");
-        let scanner = Arc::new(GpuScanner::new(0).expect("Failed to init GPU scanner"));
-        // Allocate empty GPU matrix (lazy load or sync from CPU)
-        // For production, we'd load data. Here we alloc empty for demo.
-        let num_pages = config.matrix_size_bytes / 4096;
-        let matrix = GpuPageMatrix::alloc_empty(scanner.device.clone(), num_pages)
-            .expect("VRAM alloc failed");
-        (Some(scanner), Some(Arc::new(Mutex::new(Some(matrix)))))
-    };
-
-    #[cfg(not(feature = "cuda"))]
-    let (_gpu_scanner, _gpu_matrix): (StubGpuScanner, StubGpuMatrix) = (None, None);
 
     let state = Arc::new(AppState {
         global: global.clone(),
-        row_size_bytes: config.row_size_bytes,
-        num_rows: config.matrix_size_bytes / config.row_size_bytes,
-        seeds: [0x1234, 0x5678, 0x9ABC],
-        block_number: 0,
-        state_root: [0u8; 32],
+        row_size_bytes: runtime.row_size_bytes,
+        num_rows,
+        seeds: runtime.seeds,
+        block_number: runtime.block_number,
+        state_root: runtime.state_root,
         epoch_rx,
-        page_config: Some(PagePirConfig {
-            rows_per_page: 1, // Since row_size = page_size
-            domain_bits: 25,
-            prg_keys: [[0u8; 16], [0u8; 16]],
-        }),
+        page_config,
         #[cfg(feature = "cuda")]
         gpu_scanner,
         #[cfg(feature = "cuda")]
         gpu_matrix,
     });
 
-    // 5. Epoch Manager (Background worker)
-    let _epoch_manager = Arc::new(EpochManager::new(global, config.row_size_bytes).unwrap());
-    // Start merge worker... (omitted for brevity)
+    let epoch_manager = Arc::new(
+        EpochManager::new(global, runtime.row_size_bytes)
+            .map_err(|e| StartupError::new(format!("failed to initialize epoch manager: {}", e)))?,
+    );
 
-    // 6. Start Server
-    let app = create_router_with_concurrency(state, MAX_CONCURRENT_SCANS, Some(metrics_handle));
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let merge_worker = tokio::spawn(epoch::spawn_merge_worker(
+        epoch_manager,
+        runtime.merge_interval,
+        shutdown_rx,
+    ));
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    tracing::info!("Listening on {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let app =
+        create_router_with_concurrency(state, runtime.max_concurrent_scans, Some(metrics_handle));
+
+    let listener = tokio::net::TcpListener::bind(runtime.bind_addr)
+        .await
+        .map_err(|e| StartupError::new(format!("failed to bind {}: {}", runtime.bind_addr, e)))?;
+
+    tracing::info!(
+        bind_addr = %runtime.bind_addr,
+        max_concurrent_scans = runtime.max_concurrent_scans,
+        merge_interval_ms = runtime.merge_interval.as_millis(),
+        "morphogen-server listening"
+    );
+
+    let shutdown_tx_for_signal = shutdown_tx.clone();
+    let graceful_shutdown = async move {
+        wait_for_shutdown_signal().await;
+        let _ = shutdown_tx_for_signal.send(true);
+    };
+
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(graceful_shutdown)
+        .await;
+
+    let _ = shutdown_tx.send(true);
+    if let Err(err) = merge_worker.await {
+        return Err(StartupError::new(format!(
+            "merge worker join failed during shutdown: {}",
+            err
+        )));
+    }
+
+    serve_result.map_err(|e| StartupError::new(format!("server runtime failed: {}", e)))
+}
+
+#[cfg(test)]
+mod runtime_config_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn resolve_config_prefers_cli_then_env_then_file() {
+        let mut cli = CliArgs::default_for_tests();
+        cli.bind_addr = Some("127.0.0.1:4100".to_string());
+
+        let mut env = EnvConfig::default_for_tests();
+        env.bind_addr = Some("127.0.0.1:4200".to_string());
+
+        let file = FileConfig {
+            bind_addr: Some("127.0.0.1:4300".to_string()),
+            ..FileConfig::default()
+        };
+
+        cli.allow_synthetic_matrix = Some(true);
+        cli.matrix_size_bytes = Some(4096);
+
+        let resolved = RuntimeConfig::resolve(cli, env, Some(file)).expect("config should resolve");
+        assert_eq!(resolved.bind_addr, "127.0.0.1:4100".parse().unwrap());
+    }
+
+    #[test]
+    fn resolve_config_requires_matrix_source() {
+        let cli = CliArgs::default_for_tests();
+        let env = EnvConfig::default_for_tests();
+        let err = RuntimeConfig::resolve(cli, env, None)
+            .expect_err("should reject missing matrix source");
+        assert!(
+            err.to_string().contains("matrix_file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_config_parses_page_prg_keys() {
+        let mut cli = CliArgs::default_for_tests();
+        cli.allow_synthetic_matrix = Some(true);
+        cli.matrix_size_bytes = Some(4096);
+        cli.page_prg_key_0 = Some("00112233445566778899aabbccddeeff".to_string());
+        cli.page_prg_key_1 = Some("ffeeddccbbaa99887766554433221100".to_string());
+
+        let resolved = RuntimeConfig::resolve(cli, EnvConfig::default_for_tests(), None)
+            .expect("config should resolve");
+        let page_cfg = resolved.page_config.expect("page config should be enabled");
+
+        assert_eq!(
+            page_cfg.prg_keys[0],
+            [
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]
+        );
+        assert_eq!(
+            page_cfg.prg_keys[1],
+            [
+                0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa, 0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22,
+                0x11, 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_config_rejects_bad_prg_key_len() {
+        let mut cli = CliArgs::default_for_tests();
+        cli.allow_synthetic_matrix = Some(true);
+        cli.matrix_size_bytes = Some(4096);
+        cli.page_prg_key_0 = Some("1234".to_string());
+
+        let err = RuntimeConfig::resolve(cli, EnvConfig::default_for_tests(), None)
+            .expect_err("config should reject short key");
+        assert!(err.to_string().contains("page_prg_key_0"));
+    }
+
+    #[test]
+    fn load_matrix_from_file_rejects_unaligned_size() {
+        let path = unique_temp_path("morphogen_server_unaligned_matrix.bin");
+        fs::write(&path, [0u8; 3]).expect("write temp matrix file");
+
+        let err = match load_matrix_from_file(&path, 2, 2) {
+            Ok(_) => panic!("file size must be aligned"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("divisible by row_size_bytes"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}_{}", nanos, name))
+    }
 }
