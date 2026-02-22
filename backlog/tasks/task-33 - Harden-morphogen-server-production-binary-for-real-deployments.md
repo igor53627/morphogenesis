@@ -4,7 +4,7 @@ title: Harden morphogen-server production binary for real deployments
 status: Done
 assignee: []
 created_date: '2026-02-22 10:42'
-updated_date: '2026-02-22 10:54'
+updated_date: '2026-02-22 12:54'
 labels:
   - production
   - server
@@ -44,4 +44,10 @@ Production rollout needs deterministic config loading, validated startup, backgr
 2026-02-22: Added unit tests for runtime config precedence, matrix source validation, PRG key parsing/validation, and matrix-file alignment errors in crates/morphogen-server/src/bin/server.rs.
 
 Verification: cargo test -p morphogen-server --features network --bin server; cargo test -p morphogen-server --features network; cargo clippy --package morphogen-server --features network --bin server -- -D warnings
+
+2026-02-22: Addressed roborev follow-up findings after commit a68a55f4. Added explicit prod requirements for non-zero page PRG keys, replaced Option<bool> CLI toggles with explicit boolean flags/overrides, and hardened shutdown orchestration to avoid immediate shutdown on ctrl_c stream errors.
+
+2026-02-22: Added shutdown orchestration tests (ctrl_c/sigterm future paths) and config tests for prod key requirements and CLI enable/disable overrides.
+
+Verification (follow-up): cargo test -p morphogen-server --features network --bin server; cargo test -p morphogen-server --features network; cargo clippy --package morphogen-server --features network --bin server -- -D warnings
 <!-- SECTION:NOTES:END -->

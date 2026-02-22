@@ -1,6 +1,6 @@
 //! Production server binary.
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
 use morphogen_server::{
     epoch::{self, EpochManager},
@@ -18,6 +18,7 @@ use std::fs::File;
 use std::io::{BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -40,6 +41,7 @@ const DEFAULT_SEEDS: [u64; 3] = [0x1234, 0x5678, 0x9ABC];
 type StubGpuScanner = Option<Arc<()>>;
 /// Type alias for stub GPU matrix (non-CUDA builds).
 type StubGpuMatrix = Option<Arc<std::sync::Mutex<Option<()>>>>;
+type ShutdownFuture = Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
 #[derive(Debug, Clone)]
 struct StartupError {
@@ -98,8 +100,12 @@ struct CliArgs {
     matrix_seed: Option<u64>,
 
     /// Allow synthetic matrix generation when no matrix file is provided.
-    #[arg(long)]
-    allow_synthetic_matrix: Option<bool>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    allow_synthetic_matrix: bool,
+
+    /// Forbid synthetic matrix generation even if configured in file/env.
+    #[arg(long = "no-allow-synthetic-matrix", action = ArgAction::SetTrue, conflicts_with = "allow_synthetic_matrix")]
+    no_allow_synthetic_matrix: bool,
 
     /// Merge worker interval in milliseconds.
     #[arg(long)]
@@ -122,8 +128,12 @@ struct CliArgs {
     state_root: Option<String>,
 
     /// Disable page PIR metadata and endpoints.
-    #[arg(long)]
-    disable_page_pir: Option<bool>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    disable_page_pir: bool,
+
+    /// Force-enable page PIR metadata and endpoints.
+    #[arg(long, action = ArgAction::SetTrue, conflicts_with = "disable_page_pir")]
+    enable_page_pir: bool,
 
     /// Page PIR domain bits.
     #[arg(long)]
@@ -148,8 +158,13 @@ struct CliArgs {
 
     /// If true, preload GPU matrix from CPU matrix at startup.
     #[cfg(feature = "cuda")]
-    #[arg(long)]
-    gpu_preload: Option<bool>,
+    #[arg(long, action = ArgAction::SetTrue)]
+    gpu_preload: bool,
+
+    /// Disable GPU matrix preload even when enabled in file/env.
+    #[cfg(feature = "cuda")]
+    #[arg(long = "no-gpu-preload", action = ArgAction::SetTrue, conflicts_with = "gpu_preload")]
+    no_gpu_preload: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -276,6 +291,10 @@ impl RuntimeConfig {
         file: Option<FileConfig>,
     ) -> Result<Self, StartupError> {
         let file = file.unwrap_or_default();
+        let cli_allow_synthetic_matrix = cli.allow_synthetic_matrix_override();
+        let cli_disable_page_pir = cli.disable_page_pir_override();
+        #[cfg(feature = "cuda")]
+        let cli_gpu_preload = cli.gpu_preload_override();
 
         let env_name = pick3(cli.environment, env.environment, file.environment)
             .unwrap_or_else(|| "prod".to_string());
@@ -312,7 +331,7 @@ impl RuntimeConfig {
 
         let matrix_file = pick3(cli.matrix_file, env.matrix_file, file.matrix_file);
         let allow_synthetic_matrix = pick3(
-            cli.allow_synthetic_matrix,
+            cli_allow_synthetic_matrix,
             env.allow_synthetic_matrix,
             file.allow_synthetic_matrix,
         )
@@ -377,7 +396,7 @@ impl RuntimeConfig {
         };
 
         let disable_page_pir = pick3(
-            cli.disable_page_pir,
+            cli_disable_page_pir,
             env.disable_page_pir,
             file.disable_page_pir,
         )
@@ -402,14 +421,40 @@ impl RuntimeConfig {
                 return Err(StartupError::new("page_rows_per_page must be > 0"));
             }
 
-            let key0 = match pick3(cli.page_prg_key_0, env.page_prg_key_0, file.page_prg_key_0) {
-                Some(raw) => parse_fixed_hex::<16>(&raw, "page_prg_key_0")?,
-                None => [0u8; 16],
+            let key0_raw = pick3(cli.page_prg_key_0, env.page_prg_key_0, file.page_prg_key_0);
+            let key1_raw = pick3(cli.page_prg_key_1, env.page_prg_key_1, file.page_prg_key_1);
+
+            let key0 = if environment == Environment::Prod {
+                let raw = key0_raw.ok_or_else(|| {
+                    StartupError::new("page_prg_key_0 is required in prod when page PIR is enabled")
+                })?;
+                parse_fixed_hex::<16>(&raw, "page_prg_key_0")?
+            } else {
+                match key0_raw {
+                    Some(raw) => parse_fixed_hex::<16>(&raw, "page_prg_key_0")?,
+                    None => [0u8; 16],
+                }
             };
-            let key1 = match pick3(cli.page_prg_key_1, env.page_prg_key_1, file.page_prg_key_1) {
-                Some(raw) => parse_fixed_hex::<16>(&raw, "page_prg_key_1")?,
-                None => [0u8; 16],
+            let key1 = if environment == Environment::Prod {
+                let raw = key1_raw.ok_or_else(|| {
+                    StartupError::new("page_prg_key_1 is required in prod when page PIR is enabled")
+                })?;
+                parse_fixed_hex::<16>(&raw, "page_prg_key_1")?
+            } else {
+                match key1_raw {
+                    Some(raw) => parse_fixed_hex::<16>(&raw, "page_prg_key_1")?,
+                    None => [0u8; 16],
+                }
             };
+
+            if environment == Environment::Prod {
+                if key0.iter().all(|b| *b == 0) {
+                    return Err(StartupError::new("page_prg_key_0 must be non-zero in prod"));
+                }
+                if key1.iter().all(|b| *b == 0) {
+                    return Err(StartupError::new("page_prg_key_1 must be non-zero in prod"));
+                }
+            }
 
             Some(PagePirRuntimeConfig {
                 domain_bits,
@@ -421,7 +466,7 @@ impl RuntimeConfig {
         #[cfg(feature = "cuda")]
         let gpu_device = pick3(cli.gpu_device, env.gpu_device, file.gpu_device).unwrap_or(0);
         #[cfg(feature = "cuda")]
-        let gpu_preload = pick3(cli.gpu_preload, env.gpu_preload, file.gpu_preload).unwrap_or(true);
+        let gpu_preload = pick3(cli_gpu_preload, env.gpu_preload, file.gpu_preload).unwrap_or(true);
 
         Ok(Self {
             bind_addr,
@@ -446,6 +491,37 @@ impl RuntimeConfig {
 }
 
 impl CliArgs {
+    fn allow_synthetic_matrix_override(&self) -> Option<bool> {
+        if self.allow_synthetic_matrix {
+            Some(true)
+        } else if self.no_allow_synthetic_matrix {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn disable_page_pir_override(&self) -> Option<bool> {
+        if self.disable_page_pir {
+            Some(true)
+        } else if self.enable_page_pir {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn gpu_preload_override(&self) -> Option<bool> {
+        if self.gpu_preload {
+            Some(true)
+        } else if self.no_gpu_preload {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
     #[cfg(test)]
     fn default_for_tests() -> Self {
         Self {
@@ -457,13 +533,15 @@ impl CliArgs {
             matrix_size_bytes: None,
             matrix_file: None,
             matrix_seed: None,
-            allow_synthetic_matrix: None,
+            allow_synthetic_matrix: false,
+            no_allow_synthetic_matrix: false,
             merge_interval_ms: None,
             max_concurrent_scans: None,
             seeds: None,
             block_number: None,
             state_root: None,
-            disable_page_pir: None,
+            disable_page_pir: false,
+            enable_page_pir: false,
             page_domain_bits: None,
             page_rows_per_page: None,
             page_prg_key_0: None,
@@ -471,7 +549,9 @@ impl CliArgs {
             #[cfg(feature = "cuda")]
             gpu_device: None,
             #[cfg(feature = "cuda")]
-            gpu_preload: None,
+            gpu_preload: false,
+            #[cfg(feature = "cuda")]
+            no_gpu_preload: false,
         }
     }
 }
@@ -761,38 +841,88 @@ fn parse_env_bool(key: &str) -> Result<Option<bool>, StartupError> {
     Ok(Some(value))
 }
 
-async fn wait_for_shutdown_signal() {
-    let ctrl_c = async {
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::error!("failed to install ctrl+c handler: {}", err);
-        }
-    };
+#[cfg(unix)]
+struct ShutdownWaiters {
+    ctrl_c: ShutdownFuture,
+    sigterm: tokio::signal::unix::Signal,
+}
 
-    #[cfg(unix)]
-    {
-        let terminate = async {
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(mut sigterm) => {
-                    let _ = sigterm.recv().await;
-                }
-                Err(err) => {
-                    tracing::error!("failed to install SIGTERM handler: {}", err);
-                }
+#[cfg(not(unix))]
+struct ShutdownWaiters {
+    ctrl_c: ShutdownFuture,
+}
+
+async fn wait_for_ctrl_c_signal() {
+    loop {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => break,
+            Err(err) => {
+                tracing::error!("ctrl+c signal stream failed: {}", err);
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-        };
-
-        tokio::select! {
-            _ = ctrl_c => {}
-            _ = terminate => {}
         }
     }
+}
 
-    #[cfg(not(unix))]
-    {
-        ctrl_c.await;
+#[cfg(unix)]
+fn install_shutdown_waiters() -> Result<ShutdownWaiters, StartupError> {
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|err| StartupError::new(format!("failed to install SIGTERM handler: {}", err)))?;
+    Ok(ShutdownWaiters {
+        ctrl_c: Box::pin(wait_for_ctrl_c_signal()),
+        sigterm,
+    })
+}
+
+#[cfg(not(unix))]
+fn install_shutdown_waiters() -> Result<ShutdownWaiters, StartupError> {
+    Ok(ShutdownWaiters {
+        ctrl_c: Box::pin(wait_for_ctrl_c_signal()),
+    })
+}
+
+#[cfg(unix)]
+async fn drive_shutdown_from_futures<F1, F2>(
+    ctrl_c: F1,
+    sigterm: F2,
+    shutdown_tx: watch::Sender<bool>,
+) where
+    F1: std::future::Future<Output = ()>,
+    F2: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = sigterm => {}
     }
-
     tracing::info!("shutdown signal received");
+    let _ = shutdown_tx.send(true);
+}
+
+#[cfg(not(unix))]
+async fn drive_shutdown_from_futures<F1>(ctrl_c: F1, shutdown_tx: watch::Sender<bool>)
+where
+    F1: std::future::Future<Output = ()>,
+{
+    ctrl_c.await;
+    tracing::info!("shutdown signal received");
+    let _ = shutdown_tx.send(true);
+}
+
+#[cfg(unix)]
+async fn drive_shutdown_signal(mut waiters: ShutdownWaiters, shutdown_tx: watch::Sender<bool>) {
+    drive_shutdown_from_futures(
+        waiters.ctrl_c.as_mut(),
+        async move {
+            let _ = waiters.sigterm.recv().await;
+        },
+        shutdown_tx,
+    )
+    .await;
+}
+
+#[cfg(not(unix))]
+async fn drive_shutdown_signal(waiters: ShutdownWaiters, shutdown_tx: watch::Sender<bool>) {
+    drive_shutdown_from_futures(waiters.ctrl_c, shutdown_tx).await;
 }
 
 #[tokio::main]
@@ -886,10 +1016,10 @@ async fn run() -> Result<(), StartupError> {
         "morphogen-server listening"
     );
 
+    let shutdown_waiters = install_shutdown_waiters()?;
     let shutdown_tx_for_signal = shutdown_tx.clone();
     let graceful_shutdown = async move {
-        wait_for_shutdown_signal().await;
-        let _ = shutdown_tx_for_signal.send(true);
+        drive_shutdown_signal(shutdown_waiters, shutdown_tx_for_signal).await;
     };
 
     let serve_result = axum::serve(listener, app)
@@ -925,7 +1055,8 @@ mod runtime_config_tests {
             ..FileConfig::default()
         };
 
-        cli.allow_synthetic_matrix = Some(true);
+        cli.environment = Some("dev".to_string());
+        cli.allow_synthetic_matrix = true;
         cli.matrix_size_bytes = Some(4096);
 
         let resolved = RuntimeConfig::resolve(cli, env, Some(file)).expect("config should resolve");
@@ -947,7 +1078,7 @@ mod runtime_config_tests {
     #[test]
     fn resolve_config_parses_page_prg_keys() {
         let mut cli = CliArgs::default_for_tests();
-        cli.allow_synthetic_matrix = Some(true);
+        cli.allow_synthetic_matrix = true;
         cli.matrix_size_bytes = Some(4096);
         cli.page_prg_key_0 = Some("00112233445566778899aabbccddeeff".to_string());
         cli.page_prg_key_1 = Some("ffeeddccbbaa99887766554433221100".to_string());
@@ -975,13 +1106,61 @@ mod runtime_config_tests {
     #[test]
     fn resolve_config_rejects_bad_prg_key_len() {
         let mut cli = CliArgs::default_for_tests();
-        cli.allow_synthetic_matrix = Some(true);
+        cli.allow_synthetic_matrix = true;
         cli.matrix_size_bytes = Some(4096);
         cli.page_prg_key_0 = Some("1234".to_string());
 
         let err = RuntimeConfig::resolve(cli, EnvConfig::default_for_tests(), None)
             .expect_err("config should reject short key");
         assert!(err.to_string().contains("page_prg_key_0"));
+    }
+
+    #[test]
+    fn resolve_config_prod_requires_explicit_page_prg_keys() {
+        let mut cli = CliArgs::default_for_tests();
+        cli.environment = Some("prod".to_string());
+        cli.allow_synthetic_matrix = true;
+        cli.matrix_size_bytes = Some(4096);
+
+        let err = RuntimeConfig::resolve(cli, EnvConfig::default_for_tests(), None)
+            .expect_err("prod should require page PRG keys");
+        assert!(err.to_string().contains("page_prg_key_0"));
+    }
+
+    #[test]
+    fn resolve_config_prod_rejects_zero_page_prg_keys() {
+        let mut cli = CliArgs::default_for_tests();
+        cli.environment = Some("prod".to_string());
+        cli.allow_synthetic_matrix = true;
+        cli.matrix_size_bytes = Some(4096);
+        cli.page_prg_key_0 = Some("00000000000000000000000000000000".to_string());
+        cli.page_prg_key_1 = Some("00000000000000000000000000000000".to_string());
+
+        let err = RuntimeConfig::resolve(cli, EnvConfig::default_for_tests(), None)
+            .expect_err("prod should reject zero PRG keys");
+        assert!(err.to_string().contains("must be non-zero"));
+    }
+
+    #[test]
+    fn cli_flag_overrides_support_explicit_enable_and_disable() {
+        let mut cli = CliArgs::default_for_tests();
+        assert_eq!(cli.allow_synthetic_matrix_override(), None);
+        assert_eq!(cli.disable_page_pir_override(), None);
+
+        cli.allow_synthetic_matrix = true;
+        assert_eq!(cli.allow_synthetic_matrix_override(), Some(true));
+
+        cli = CliArgs::default_for_tests();
+        cli.no_allow_synthetic_matrix = true;
+        assert_eq!(cli.allow_synthetic_matrix_override(), Some(false));
+
+        cli = CliArgs::default_for_tests();
+        cli.disable_page_pir = true;
+        assert_eq!(cli.disable_page_pir_override(), Some(true));
+
+        cli = CliArgs::default_for_tests();
+        cli.enable_page_pir = true;
+        assert_eq!(cli.disable_page_pir_override(), Some(false));
     }
 
     #[test]
@@ -996,6 +1175,30 @@ mod runtime_config_tests {
         assert!(err.to_string().contains("divisible by row_size_bytes"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drive_shutdown_from_futures_sets_channel_on_ctrl_c() {
+        let (tx, rx) = watch::channel(false);
+        drive_shutdown_from_futures(async {}, std::future::pending::<()>(), tx).await;
+        assert!(*rx.borrow());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drive_shutdown_from_futures_sets_channel_on_sigterm() {
+        let (tx, rx) = watch::channel(false);
+        drive_shutdown_from_futures(std::future::pending::<()>(), async {}, tx).await;
+        assert!(*rx.borrow());
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn drive_shutdown_from_futures_sets_channel_on_ctrl_c() {
+        let (tx, rx) = watch::channel(false);
+        drive_shutdown_from_futures(async {}, tx).await;
+        assert!(*rx.borrow());
     }
 
     fn unique_temp_path(name: &str) -> PathBuf {
