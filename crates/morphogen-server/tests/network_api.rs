@@ -56,6 +56,9 @@ fn test_state() -> Arc<AppState> {
         epoch_tx: tx,
         snapshot_rotation_lock: Arc::new(Mutex::new(())),
         admin_snapshot_token: Some("test-admin-token".to_string()),
+        admin_mtls_subject_header: axum::http::HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: Vec::new(),
+        admin_mtls_trust_proxy_headers: false,
         admin_snapshot_allow_local_paths: true,
         admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
         admin_snapshot_max_bytes: 16 * 1024 * 1024,
@@ -242,6 +245,9 @@ mod epoch {
                 epoch_tx: tx,
                 snapshot_rotation_lock: Arc::new(Mutex::new(())),
                 admin_snapshot_token: Some("test-admin-token".to_string()),
+                admin_mtls_subject_header: axum::http::HeaderName::from_static("x-mtls-subject"),
+                admin_mtls_allowed_subjects: Vec::new(),
+                admin_mtls_trust_proxy_headers: false,
                 admin_snapshot_allow_local_paths: true,
                 admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
                 admin_snapshot_max_bytes: 16 * 1024 * 1024,
@@ -386,6 +392,202 @@ mod admin_snapshot {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+
+    #[tokio::test]
+    async fn snapshot_endpoint_accepts_bearer_token_header() {
+        let state = test_state();
+        let path = unique_temp_path("network_api_snapshot_bearer.bin");
+        fs::write(&path, vec![0xCEu8; state.row_size_bytes * 4]).expect("write snapshot fixture");
+
+        let body = serde_json::json!({
+            "r2_url": path.to_string_lossy(),
+        })
+        .to_string();
+
+        let app = create_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/snapshot")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer test-admin-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn snapshot_endpoint_accepts_lowercase_bearer_scheme() {
+        let state = test_state();
+        let path = unique_temp_path("network_api_snapshot_bearer_lowercase.bin");
+        fs::write(&path, vec![0xCEu8; state.row_size_bytes * 4]).expect("write snapshot fixture");
+
+        let body = serde_json::json!({
+            "r2_url": path.to_string_lossy(),
+        })
+        .to_string();
+
+        let app = create_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/snapshot")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "bearer test-admin-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn snapshot_endpoint_accepts_legacy_token_when_bearer_is_wrong() {
+        let state = test_state();
+        let path = unique_temp_path("network_api_snapshot_mixed_auth_headers.bin");
+        fs::write(&path, vec![0xCEu8; state.row_size_bytes * 4]).expect("write snapshot fixture");
+
+        let body = serde_json::json!({
+            "r2_url": path.to_string_lossy(),
+        })
+        .to_string();
+
+        let app = create_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/snapshot")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer wrong-token")
+                    .header("x-admin-token", "test-admin-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn snapshot_endpoint_accepts_mtls_subject_header() {
+        let state = {
+            let mut cfg = (*test_state()).clone();
+            cfg.admin_snapshot_token = None;
+            cfg.admin_mtls_subject_header = axum::http::HeaderName::from_static("x-mtls-subject");
+            cfg.admin_mtls_allowed_subjects =
+                vec!["spiffe://morphogenesis/control-plane".to_string()];
+            cfg.admin_mtls_trust_proxy_headers = true;
+            Arc::new(cfg)
+        };
+        let path = unique_temp_path("network_api_snapshot_mtls.bin");
+        fs::write(&path, vec![0xA5u8; state.row_size_bytes * 4]).expect("write snapshot fixture");
+
+        let body = serde_json::json!({
+            "r2_url": path.to_string_lossy(),
+        })
+        .to_string();
+
+        let app = create_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/snapshot")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-mtls-subject", "spiffe://morphogenesis/control-plane")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn snapshot_endpoint_rejects_when_no_admin_auth_configured() {
+        let state = {
+            let mut cfg = (*test_state()).clone();
+            cfg.admin_snapshot_token = None;
+            cfg.admin_mtls_allowed_subjects = Vec::new();
+            Arc::new(cfg)
+        };
+        let path = unique_temp_path("network_api_snapshot_no_auth.bin");
+        fs::write(&path, vec![0xD2u8; state.row_size_bytes * 4]).expect("write snapshot fixture");
+
+        let body = serde_json::json!({
+            "r2_url": path.to_string_lossy(),
+        })
+        .to_string();
+
+        let app = create_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/snapshot")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer any-token")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn snapshot_endpoint_rejects_unallowlisted_mtls_subject() {
+        let state = {
+            let mut cfg = (*test_state()).clone();
+            cfg.admin_snapshot_token = None;
+            cfg.admin_mtls_subject_header = axum::http::HeaderName::from_static("x-mtls-subject");
+            cfg.admin_mtls_allowed_subjects =
+                vec!["spiffe://morphogenesis/control-plane".to_string()];
+            cfg.admin_mtls_trust_proxy_headers = true;
+            Arc::new(cfg)
+        };
+        let path = unique_temp_path("network_api_snapshot_mtls_unallowlisted.bin");
+        fs::write(&path, vec![0xD2u8; state.row_size_bytes * 4]).expect("write snapshot fixture");
+
+        let body = serde_json::json!({
+            "r2_url": path.to_string_lossy(),
+        })
+        .to_string();
+
+        let app = create_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/admin/snapshot")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-mtls-subject", "spiffe://morphogenesis/untrusted")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let _ = fs::remove_file(&path);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
 
 mod query {
@@ -489,6 +691,9 @@ mod query {
             epoch_tx: tx,
             snapshot_rotation_lock: Arc::new(Mutex::new(())),
             admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: axum::http::HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
             admin_snapshot_allow_local_paths: true,
             admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
             admin_snapshot_max_bytes: 16 * 1024 * 1024,
@@ -563,6 +768,9 @@ mod websocket_epoch {
             epoch_tx: tx.clone(),
             snapshot_rotation_lock: Arc::new(Mutex::new(())),
             admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: axum::http::HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
             admin_snapshot_allow_local_paths: true,
             admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
             admin_snapshot_max_bytes: 16 * 1024 * 1024,
@@ -817,6 +1025,9 @@ mod page_query {
             epoch_tx: tx,
             snapshot_rotation_lock: Arc::new(Mutex::new(())),
             admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: axum::http::HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
             admin_snapshot_allow_local_paths: true,
             admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
             admin_snapshot_max_bytes: 16 * 1024 * 1024,
@@ -1001,6 +1212,9 @@ mod page_query {
             epoch_tx: tx,
             snapshot_rotation_lock: Arc::new(Mutex::new(())),
             admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: axum::http::HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
             admin_snapshot_allow_local_paths: true,
             admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
             admin_snapshot_max_bytes: 16 * 1024 * 1024,
@@ -1304,6 +1518,9 @@ mod gpu_query {
             epoch_tx: tx,
             snapshot_rotation_lock: Arc::new(Mutex::new(())),
             admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: axum::http::HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
             admin_snapshot_allow_local_paths: true,
             admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
             admin_snapshot_max_bytes: 16 * 1024 * 1024,

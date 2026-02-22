@@ -30,7 +30,7 @@ use morphogen_gpu_dpf::storage::GpuPageMatrix;
 #[cfg(feature = "cuda")]
 use std::sync::Mutex;
 
-const DEFAULT_BIND_ADDR: &str = "0.0.0.0:3000";
+const DEFAULT_BIND_ADDR: &str = "127.0.0.1:3000";
 const DEFAULT_MERGE_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_MATRIX_SEED: u64 = 42;
 const DEFAULT_PAGE_DOMAIN_BITS: usize = 25;
@@ -40,6 +40,7 @@ const CTRL_C_INITIAL_RETRY_DELAY_MS: u64 = 250;
 const CTRL_C_MAX_RETRY_DELAY_MS: u64 = 5_000;
 const CTRL_C_MAX_FAILURES_BEFORE_FORCED_SHUTDOWN: u32 = 12;
 const DEFAULT_ADMIN_SNAPSHOT_MAX_BYTES: u64 = 1_073_741_824;
+const DEFAULT_ADMIN_MTLS_SUBJECT_HEADER: &str = "x-mtls-subject";
 
 /// Type alias for stub GPU scanner (non-CUDA builds).
 type StubGpuScanner = Option<Arc<()>>;
@@ -75,7 +76,7 @@ struct CliArgs {
     #[arg(long)]
     config: Option<PathBuf>,
 
-    /// Bind address, for example 0.0.0.0:3000.
+    /// Bind address, for example 127.0.0.1:3000.
     #[arg(long)]
     bind_addr: Option<String>,
 
@@ -270,6 +271,7 @@ struct PagePirRuntimeConfig {
 #[derive(Debug, Clone)]
 struct RuntimeConfig {
     bind_addr: SocketAddr,
+    bind_addr_is_default: bool,
     environment: Environment,
     row_size_bytes: usize,
     chunk_size_bytes: usize,
@@ -305,8 +307,9 @@ impl RuntimeConfig {
         let environment = parse_environment(&env_name)?;
         let defaults = ServerConfig::for_env(environment);
 
-        let bind_addr_raw = pick3(cli.bind_addr, env.bind_addr, file.bind_addr)
-            .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
+        let bind_addr_raw = pick3(cli.bind_addr, env.bind_addr, file.bind_addr);
+        let bind_addr_is_default = bind_addr_raw.is_none();
+        let bind_addr_raw = bind_addr_raw.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
         let bind_addr = bind_addr_raw.parse::<SocketAddr>().map_err(|e| {
             StartupError::new(format!("invalid bind_addr '{}': {}", bind_addr_raw, e))
         })?;
@@ -474,6 +477,7 @@ impl RuntimeConfig {
 
         Ok(Self {
             bind_addr,
+            bind_addr_is_default,
             environment,
             row_size_bytes,
             chunk_size_bytes,
@@ -845,6 +849,30 @@ fn parse_env_bool(key: &str) -> Result<Option<bool>, StartupError> {
     Ok(Some(value))
 }
 
+fn validate_admin_mtls_proxy_trust(
+    allowed_subjects: &[String],
+    trust_proxy_headers: bool,
+) -> Result<(), StartupError> {
+    if !allowed_subjects.is_empty() && !trust_proxy_headers {
+        return Err(StartupError::new(
+            "MORPHOGEN_ADMIN_MTLS_ALLOWED_SUBJECTS requires MORPHOGEN_ADMIN_TRUST_PROXY_HEADERS=true",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_admin_mtls_subject_header(
+    raw: Option<String>,
+) -> Result<axum::http::HeaderName, StartupError> {
+    let raw = raw.unwrap_or_else(|| DEFAULT_ADMIN_MTLS_SUBJECT_HEADER.to_string());
+    axum::http::HeaderName::from_bytes(raw.as_bytes()).map_err(|_| {
+        StartupError::new(format!(
+            "invalid MORPHOGEN_ADMIN_MTLS_SUBJECT_HEADER '{}'",
+            raw
+        ))
+    })
+}
+
 fn should_log_ctrl_c_failure(failures: u32) -> bool {
     failures <= 3 || failures.is_multiple_of(10)
 }
@@ -1009,14 +1037,22 @@ async fn run() -> Result<(), StartupError> {
     };
 
     let runtime = RuntimeConfig::resolve(cli, env, file)?;
-    let admin_snapshot_token = env_var("MORPHOGEN_ADMIN_SNAPSHOT_TOKEN").and_then(|v| {
-        let trimmed = v.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    });
+    // env_var() trims and drops empty values, so alias fallback is safe.
+    let admin_snapshot_token = env_var("MORPHOGEN_ADMIN_BEARER_TOKEN")
+        .or_else(|| env_var("MORPHOGEN_ADMIN_SNAPSHOT_TOKEN"));
+    let admin_mtls_subject_header =
+        parse_admin_mtls_subject_header(env_var("MORPHOGEN_ADMIN_MTLS_SUBJECT_HEADER"))?;
+    let admin_mtls_allowed_subjects = env_var("MORPHOGEN_ADMIN_MTLS_ALLOWED_SUBJECTS")
+        .map(|raw| {
+            raw.split(',')
+                .map(|subject| subject.trim().to_string())
+                .filter(|subject| !subject.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let admin_mtls_trust_proxy_headers =
+        parse_env_bool("MORPHOGEN_ADMIN_TRUST_PROXY_HEADERS")?.unwrap_or(false);
+    validate_admin_mtls_proxy_trust(&admin_mtls_allowed_subjects, admin_mtls_trust_proxy_headers)?;
     let admin_snapshot_allow_local_paths =
         parse_env_bool("MORPHOGEN_ADMIN_ALLOW_LOCAL_SNAPSHOT")?.unwrap_or(false);
     let admin_snapshot_allowed_hosts = env_var("MORPHOGEN_ADMIN_SNAPSHOT_ALLOWED_HOSTS")
@@ -1097,6 +1133,9 @@ async fn run() -> Result<(), StartupError> {
         epoch_tx,
         snapshot_rotation_lock: Arc::new(tokio::sync::Mutex::new(())),
         admin_snapshot_token,
+        admin_mtls_subject_header,
+        admin_mtls_allowed_subjects,
+        admin_mtls_trust_proxy_headers,
         admin_snapshot_allow_local_paths,
         admin_snapshot_allowed_hosts,
         admin_snapshot_max_bytes,
@@ -1127,6 +1166,19 @@ async fn run() -> Result<(), StartupError> {
     let listener = tokio::net::TcpListener::bind(runtime.bind_addr)
         .await
         .map_err(|e| StartupError::new(format!("failed to bind {}: {}", runtime.bind_addr, e)))?;
+
+    if !runtime.bind_addr.ip().is_loopback() {
+        tracing::warn!(
+            bind_addr = %runtime.bind_addr,
+            "non-loopback bind configured; deploy behind TLS termination and restrict /admin/* with network ACLs"
+        );
+    }
+    if runtime.environment == Environment::Prod && runtime.bind_addr_is_default {
+        tracing::warn!(
+            bind_addr = %runtime.bind_addr,
+            "using default loopback bind in prod; set MORPHOGEN_SERVER_BIND_ADDR explicitly if remote access is required"
+        );
+    }
 
     tracing::info!(
         bind_addr = %runtime.bind_addr,
@@ -1179,6 +1231,47 @@ mod runtime_config_tests {
 
         let resolved = RuntimeConfig::resolve(cli, env, Some(file)).expect("config should resolve");
         assert_eq!(resolved.bind_addr, "127.0.0.1:4100".parse().unwrap());
+        assert!(!resolved.bind_addr_is_default);
+    }
+
+    #[test]
+    fn resolve_config_defaults_to_loopback_bind_addr() {
+        let mut cli = CliArgs::default_for_tests();
+        cli.environment = Some("dev".to_string());
+        cli.allow_synthetic_matrix = true;
+        cli.matrix_size_bytes = Some(4096);
+
+        let resolved = RuntimeConfig::resolve(cli, EnvConfig::default_for_tests(), None)
+            .expect("config should resolve");
+        assert_eq!(resolved.bind_addr, "127.0.0.1:3000".parse().unwrap());
+        assert!(resolved.bind_addr_is_default);
+    }
+
+    #[test]
+    fn parse_admin_mtls_subject_header_rejects_invalid_name() {
+        let err = parse_admin_mtls_subject_header(Some("bad header".to_string()))
+            .expect_err("invalid header name should fail");
+        assert!(err
+            .to_string()
+            .contains("MORPHOGEN_ADMIN_MTLS_SUBJECT_HEADER"));
+    }
+
+    #[test]
+    fn validate_admin_mtls_proxy_trust_rejects_allowlist_without_opt_in() {
+        let subjects = vec!["spiffe://morphogenesis/control-plane".to_string()];
+        let err = validate_admin_mtls_proxy_trust(&subjects, false)
+            .expect_err("mTLS allowlist without trusted-proxy opt-in should fail");
+        assert!(err
+            .to_string()
+            .contains("MORPHOGEN_ADMIN_TRUST_PROXY_HEADERS=true"));
+    }
+
+    #[test]
+    fn validate_admin_mtls_proxy_trust_accepts_safe_combinations() {
+        let subjects = vec!["spiffe://morphogenesis/control-plane".to_string()];
+        validate_admin_mtls_proxy_trust(&subjects, true).expect("explicit opt-in should pass");
+        validate_admin_mtls_proxy_trust(&Vec::new(), false)
+            .expect("empty mTLS allowlist should pass");
     }
 
     #[test]

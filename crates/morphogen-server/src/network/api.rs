@@ -11,7 +11,7 @@ use axum::{
         ws::{Message, WebSocket},
         DefaultBodyLimit, State, WebSocketUpgrade,
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderName, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -57,6 +57,9 @@ pub struct AppState {
     pub epoch_tx: watch::Sender<EpochMetadata>,
     pub snapshot_rotation_lock: Arc<Mutex<()>>,
     pub admin_snapshot_token: Option<String>,
+    pub admin_mtls_subject_header: HeaderName,
+    pub admin_mtls_allowed_subjects: Vec<String>,
+    pub admin_mtls_trust_proxy_headers: bool,
     pub admin_snapshot_allow_local_paths: bool,
     pub admin_snapshot_allowed_hosts: Vec<String>,
     pub admin_snapshot_max_bytes: usize,
@@ -345,20 +348,83 @@ enum SnapshotSource {
 }
 
 const ADMIN_SNAPSHOT_TOKEN_HEADER: &str = "x-admin-token";
+const AUTHORIZATION_BEARER_SCHEME: &str = "bearer";
 
-fn authorize_admin_snapshot(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
-    let expected = state
-        .admin_snapshot_token
-        .as_deref()
-        .ok_or(StatusCode::FORBIDDEN)?;
-    let provided = headers
+fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())?
+        .trim();
+    let mut parts = raw.split_whitespace();
+    let scheme = parts.next()?;
+    let token = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if scheme.eq_ignore_ascii_case(AUTHORIZATION_BEARER_SCHEME) && !token.is_empty() {
+        return Some(token);
+    }
+    None
+}
+
+fn legacy_admin_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
         .get(ADMIN_SNAPSHOT_TOKEN_HEADER)
         .and_then(|v| v.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
-    if provided != expected {
-        return Err(StatusCode::UNAUTHORIZED);
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+}
+
+// Compares secrets without early exit on mismatch.
+fn admin_token_eq_constant_time(expected: &str, provided: &str) -> bool {
+    let expected = expected.as_bytes();
+    let provided = provided.as_bytes();
+    let max_len = expected.len().max(provided.len());
+    let mut diff = expected.len() ^ provided.len();
+    for idx in 0..max_len {
+        let a = expected.get(idx).copied().unwrap_or(0);
+        let b = provided.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(a ^ b);
     }
-    Ok(())
+    diff == 0
+}
+
+fn authorize_admin_snapshot(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let token_configured = state.admin_snapshot_token.is_some();
+    let mtls_configured =
+        state.admin_mtls_trust_proxy_headers && !state.admin_mtls_allowed_subjects.is_empty();
+    if !token_configured && !mtls_configured {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if let Some(expected) = state.admin_snapshot_token.as_deref() {
+        let bearer_matches = bearer_token_from_headers(headers)
+            .is_some_and(|provided| admin_token_eq_constant_time(expected, provided));
+        let legacy_matches = legacy_admin_token_from_headers(headers)
+            .is_some_and(|provided| admin_token_eq_constant_time(expected, provided));
+        if bearer_matches || legacy_matches {
+            return Ok(());
+        }
+    }
+
+    if mtls_configured {
+        if let Some(subject) = headers
+            .get(&state.admin_mtls_subject_header)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            if state
+                .admin_mtls_allowed_subjects
+                .iter()
+                .any(|allowed| allowed == subject)
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(StatusCode::UNAUTHORIZED)
 }
 
 fn is_allowed_snapshot_host(host: &str, allowed_hosts: &[String]) -> bool {
@@ -1816,6 +1882,9 @@ mod tests {
             epoch_tx: tx,
             snapshot_rotation_lock: Arc::new(Mutex::new(())),
             admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
             admin_snapshot_allow_local_paths: true,
             admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
             admin_snapshot_max_bytes: 16 * 1024 * 1024,
@@ -1931,6 +2000,22 @@ mod tests {
     }
 
     #[test]
+    fn admin_token_eq_constant_time_compares_values_and_lengths() {
+        assert!(admin_token_eq_constant_time(
+            "test-admin-token",
+            "test-admin-token"
+        ));
+        assert!(!admin_token_eq_constant_time(
+            "test-admin-token",
+            "test-admin-token-x"
+        ));
+        assert!(!admin_token_eq_constant_time(
+            "test-admin-token",
+            "wrong-token"
+        ));
+    }
+
+    #[test]
     fn query_handler_requires_25_byte_keys() {
         // AES_DPF_KEY_SIZE = 25 bytes
         // Keys shorter than 25 bytes should be rejected
@@ -2041,6 +2126,488 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_snapshot_rejects_when_no_auth_methods_configured() {
+        let mut config = (*test_state()).clone();
+        config.admin_snapshot_token = None;
+        config.admin_mtls_allowed_subjects = Vec::new();
+        let state = Arc::new(config);
+        let request = AdminSnapshotRequest {
+            r2_url: "/tmp/snapshot.bin".to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+
+        let result =
+            admin_snapshot_handler(State(state), admin_snapshot_bearer_headers(), Json(request))
+                .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_accepts_bearer_token_header() {
+        let row_size_bytes = 4usize;
+        let num_rows = 2usize;
+        let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+        let snapshot = EpochSnapshot {
+            epoch_id: 1,
+            matrix,
+        };
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+        let (tx, rx) = watch::channel(EpochMetadata {
+            epoch_id: 1,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+        });
+        let epoch_manager = Arc::new(
+            EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+        );
+        let state = Arc::new(AppState {
+            global: global.clone(),
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(Mutex::new(())),
+            admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
+            admin_snapshot_allow_local_paths: true,
+            admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+            admin_snapshot_max_bytes: 16 * 1024 * 1024,
+            row_size_bytes,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+            epoch_rx: rx,
+            page_config: None,
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
+        });
+
+        let path = unique_temp_path("admin_snapshot_bearer.bin");
+        fs::write(&path, vec![0xABu8; row_size_bytes * num_rows]).expect("write snapshot fixture");
+
+        let request = AdminSnapshotRequest {
+            r2_url: path.to_string_lossy().to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+        let result =
+            admin_snapshot_handler(State(state), admin_snapshot_bearer_headers(), Json(request))
+                .await;
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_ok(), "bearer auth should be accepted");
+        assert_eq!(result.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_accepts_lowercase_bearer_scheme() {
+        let row_size_bytes = 4usize;
+        let num_rows = 2usize;
+        let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+        let snapshot = EpochSnapshot {
+            epoch_id: 1,
+            matrix,
+        };
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+        let (tx, rx) = watch::channel(EpochMetadata {
+            epoch_id: 1,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+        });
+        let epoch_manager = Arc::new(
+            EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+        );
+        let state = Arc::new(AppState {
+            global: global.clone(),
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(Mutex::new(())),
+            admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
+            admin_snapshot_allow_local_paths: true,
+            admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+            admin_snapshot_max_bytes: 16 * 1024 * 1024,
+            row_size_bytes,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+            epoch_rx: rx,
+            page_config: None,
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
+        });
+
+        let path = unique_temp_path("admin_snapshot_bearer_lowercase.bin");
+        fs::write(&path, vec![0xABu8; row_size_bytes * num_rows]).expect("write snapshot fixture");
+
+        let request = AdminSnapshotRequest {
+            r2_url: path.to_string_lossy().to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("bearer test-admin-token"),
+        );
+        let result = admin_snapshot_handler(State(state), headers, Json(request)).await;
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_ok(), "lowercase bearer auth should be accepted");
+        assert_eq!(result.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_accepts_legacy_token_when_bearer_is_wrong() {
+        let row_size_bytes = 4usize;
+        let num_rows = 2usize;
+        let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+        let snapshot = EpochSnapshot {
+            epoch_id: 1,
+            matrix,
+        };
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+        let (tx, rx) = watch::channel(EpochMetadata {
+            epoch_id: 1,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+        });
+        let epoch_manager = Arc::new(
+            EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+        );
+        let state = Arc::new(AppState {
+            global: global.clone(),
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(Mutex::new(())),
+            admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
+            admin_snapshot_allow_local_paths: true,
+            admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+            admin_snapshot_max_bytes: 16 * 1024 * 1024,
+            row_size_bytes,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+            epoch_rx: rx,
+            page_config: None,
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
+        });
+
+        let path = unique_temp_path("admin_snapshot_mixed_auth_headers.bin");
+        fs::write(&path, vec![0xABu8; row_size_bytes * num_rows]).expect("write snapshot fixture");
+
+        let request = AdminSnapshotRequest {
+            r2_url: path.to_string_lossy().to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong-token"),
+        );
+        headers.insert(
+            ADMIN_SNAPSHOT_TOKEN_HEADER,
+            HeaderValue::from_static("test-admin-token"),
+        );
+        let result = admin_snapshot_handler(State(state), headers, Json(request)).await;
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            result.is_ok(),
+            "legacy token should still authorize when bearer token is wrong"
+        );
+        assert_eq!(result.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_accepts_mtls_subject_header() {
+        let row_size_bytes = 4usize;
+        let num_rows = 2usize;
+        let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+        let snapshot = EpochSnapshot {
+            epoch_id: 1,
+            matrix,
+        };
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+        let (tx, rx) = watch::channel(EpochMetadata {
+            epoch_id: 1,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+        });
+        let epoch_manager = Arc::new(
+            EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+        );
+        let state = Arc::new(AppState {
+            global: global.clone(),
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(Mutex::new(())),
+            admin_snapshot_token: None,
+            admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: vec!["spiffe://morphogenesis/control-plane".to_string()],
+            admin_mtls_trust_proxy_headers: true,
+            admin_snapshot_allow_local_paths: true,
+            admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+            admin_snapshot_max_bytes: 16 * 1024 * 1024,
+            row_size_bytes,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+            epoch_rx: rx,
+            page_config: None,
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
+        });
+
+        let path = unique_temp_path("admin_snapshot_mtls.bin");
+        fs::write(&path, vec![0xAAu8; row_size_bytes * num_rows]).expect("write snapshot fixture");
+
+        let request = AdminSnapshotRequest {
+            r2_url: path.to_string_lossy().to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+        let result =
+            admin_snapshot_handler(State(state), admin_snapshot_mtls_headers(), Json(request))
+                .await;
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_ok(), "mTLS subject should be accepted");
+        assert_eq!(result.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_accepts_custom_mtls_subject_header() {
+        let row_size_bytes = 4usize;
+        let num_rows = 2usize;
+        let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+        let snapshot = EpochSnapshot {
+            epoch_id: 1,
+            matrix,
+        };
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+        let (tx, rx) = watch::channel(EpochMetadata {
+            epoch_id: 1,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+        });
+        let epoch_manager = Arc::new(
+            EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+        );
+        let state = Arc::new(AppState {
+            global: global.clone(),
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(Mutex::new(())),
+            admin_snapshot_token: None,
+            admin_mtls_subject_header: HeaderName::from_static("x-client-subject"),
+            admin_mtls_allowed_subjects: vec!["spiffe://morphogenesis/control-plane".to_string()],
+            admin_mtls_trust_proxy_headers: true,
+            admin_snapshot_allow_local_paths: true,
+            admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+            admin_snapshot_max_bytes: 16 * 1024 * 1024,
+            row_size_bytes,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+            epoch_rx: rx,
+            page_config: None,
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
+        });
+
+        let path = unique_temp_path("admin_snapshot_custom_mtls_header.bin");
+        fs::write(&path, vec![0xAAu8; row_size_bytes * num_rows]).expect("write snapshot fixture");
+
+        let request = AdminSnapshotRequest {
+            r2_url: path.to_string_lossy().to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-client-subject",
+            HeaderValue::from_static("spiffe://morphogenesis/control-plane"),
+        );
+        let result = admin_snapshot_handler(State(state), headers, Json(request)).await;
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_ok(), "custom mTLS header should be accepted");
+        assert_eq!(result.unwrap(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_rejects_mtls_subject_when_trust_proxy_headers_disabled() {
+        let row_size_bytes = 4usize;
+        let num_rows = 2usize;
+        let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+        let snapshot = EpochSnapshot {
+            epoch_id: 1,
+            matrix,
+        };
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+        let (tx, rx) = watch::channel(EpochMetadata {
+            epoch_id: 1,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+        });
+        let epoch_manager = Arc::new(
+            EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+        );
+        let state = Arc::new(AppState {
+            global: global.clone(),
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(Mutex::new(())),
+            admin_snapshot_token: None,
+            admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: vec!["spiffe://morphogenesis/control-plane".to_string()],
+            admin_mtls_trust_proxy_headers: false,
+            admin_snapshot_allow_local_paths: true,
+            admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+            admin_snapshot_max_bytes: 16 * 1024 * 1024,
+            row_size_bytes,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+            epoch_rx: rx,
+            page_config: None,
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
+        });
+
+        let request = AdminSnapshotRequest {
+            r2_url: "/tmp/snapshot.bin".to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-mtls-subject",
+            HeaderValue::from_static("spiffe://morphogenesis/control-plane"),
+        );
+        let result = admin_snapshot_handler(State(state), headers, Json(request)).await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_rejects_mtls_subject_not_allowlisted() {
+        let row_size_bytes = 4usize;
+        let num_rows = 2usize;
+        let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+        let snapshot = EpochSnapshot {
+            epoch_id: 1,
+            matrix,
+        };
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+        let (tx, rx) = watch::channel(EpochMetadata {
+            epoch_id: 1,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+        });
+        let epoch_manager = Arc::new(
+            EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+        );
+        let state = Arc::new(AppState {
+            global: global.clone(),
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(Mutex::new(())),
+            admin_snapshot_token: None,
+            admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: vec!["spiffe://morphogenesis/control-plane".to_string()],
+            admin_mtls_trust_proxy_headers: true,
+            admin_snapshot_allow_local_paths: true,
+            admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+            admin_snapshot_max_bytes: 16 * 1024 * 1024,
+            row_size_bytes,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+            epoch_rx: rx,
+            page_config: None,
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
+        });
+
+        let request = AdminSnapshotRequest {
+            r2_url: "/tmp/snapshot.bin".to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-mtls-subject",
+            HeaderValue::from_static("spiffe://morphogenesis/untrusted"),
+        );
+        let result = admin_snapshot_handler(State(state), headers, Json(request)).await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn admin_snapshot_rejects_local_path_when_disabled() {
         let mut config = (*test_state()).clone();
         config.admin_snapshot_allow_local_paths = false;
@@ -2108,6 +2675,9 @@ mod tests {
             epoch_tx: tx,
             snapshot_rotation_lock: Arc::new(Mutex::new(())),
             admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
             admin_snapshot_allow_local_paths: true,
             admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
             admin_snapshot_max_bytes: 16 * 1024 * 1024,
@@ -2229,6 +2799,9 @@ mod tests {
             epoch_tx: tx,
             snapshot_rotation_lock: Arc::new(Mutex::new(())),
             admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
             admin_snapshot_allow_local_paths: true,
             admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
             admin_snapshot_max_bytes: 16 * 1024 * 1024,
@@ -2374,6 +2947,24 @@ mod tests {
         headers.insert(
             ADMIN_SNAPSHOT_TOKEN_HEADER,
             HeaderValue::from_static("test-admin-token"),
+        );
+        headers
+    }
+
+    fn admin_snapshot_bearer_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer test-admin-token"),
+        );
+        headers
+    }
+
+    fn admin_snapshot_mtls_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-mtls-subject",
+            HeaderValue::from_static("spiffe://morphogenesis/control-plane"),
         );
         headers
     }
