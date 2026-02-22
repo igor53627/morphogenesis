@@ -30,6 +30,8 @@ struct BlockInfo {
     number: u64,
     timestamp: u64,
     gas_limit: u64,
+    /// True when block exposes blob gas fields (Cancun-era behavior).
+    is_cancun_or_later: bool,
 }
 
 /// Known named block tags per Ethereum JSON-RPC specification.
@@ -123,6 +125,8 @@ async fn fetch_block_info(
         number: parse_hex_u64("number")?,
         timestamp: parse_hex_u64("timestamp")?,
         gas_limit: parse_hex_u64("gasLimit")?,
+        is_cancun_or_later: result.get("blobGasUsed").is_some_and(|v| !v.is_null())
+            || result.get("excessBlobGas").is_some_and(|v| !v.is_null()),
     })
 }
 
@@ -385,7 +389,7 @@ async fn run_evm(
     call_params: &Value,
     block_tag: &Value,
     access_list_collector: Option<SharedAccessListCollector>,
-) -> Result<(ExecutionResult, CallParams, u64), EthCallError> {
+) -> Result<(ExecutionResult, CallParams, bool), EthCallError> {
     let parsed = parse_call_params(call_params)?;
 
     let validated_tag = validate_block_tag(block_tag).map_err(EthCallError::InvalidParams)?;
@@ -411,7 +415,7 @@ async fn run_evm(
 
     let handle = Handle::current();
 
-    let block_number = block_info.number;
+    let is_cancun_or_later = block_info.is_cancun_or_later;
     let result = tokio::task::spawn_blocking(move || {
         let pir_db = match access_list_collector {
             Some(collector) => PirDatabase::new_with_access_list_collector(
@@ -465,7 +469,7 @@ async fn run_evm(
     .await
     .map_err(|e| EthCallError::Internal(format!("spawn_blocking: {}", e)))??;
 
-    Ok((result, parsed, block_number))
+    Ok((result, parsed, is_cancun_or_later))
 }
 
 /// Execute an eth_call privately using revm with PIR-backed state.
@@ -547,20 +551,14 @@ pub async fn execute_eth_estimate_gas(
     }
 }
 
-const CANCUN_MAINNET_BLOCK: u64 = 19_426_587;
-
-fn warm_addresses_for_call(call: &CallParams, block_number: u64) -> Vec<[u8; 20]> {
+fn warm_addresses_for_call(call: &CallParams, is_cancun_or_later: bool) -> Vec<[u8; 20]> {
     let mut warmed = Vec::with_capacity(12);
     warmed.push(call.from.into_array());
     if let Some(to) = call.to {
         warmed.push(to.into_array());
     }
     // Precompiles 0x1..0x9 are always warm (EIP-2929); 0x0a is warm from Cancun.
-    let max_precompile = if block_number >= CANCUN_MAINNET_BLOCK {
-        10
-    } else {
-        9
-    };
+    let max_precompile = if is_cancun_or_later { 10 } else { 9 };
     for idx in 1u8..=max_precompile {
         let mut addr = [0u8; 20];
         addr[19] = idx;
@@ -582,13 +580,13 @@ fn gas_used_from_result(result: &ExecutionResult) -> u64 {
 fn collected_access_list(
     collector: &SharedAccessListCollector,
     call: &CallParams,
-    block_number: u64,
+    is_cancun_or_later: bool,
 ) -> Value {
     let mut guard = match collector.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    for addr in warm_addresses_for_call(call, block_number) {
+    for addr in warm_addresses_for_call(call, is_cancun_or_later) {
         guard.remove_account_if_empty(&addr);
     }
     guard.to_rpc_entries()
@@ -648,7 +646,7 @@ pub async fn execute_eth_create_access_list(
         )));
     }
 
-    let (result, parsed_call, block_number) = run_evm(
+    let (result, parsed_call, is_cancun_or_later) = run_evm(
         Arc::clone(&pir_client),
         Arc::clone(&code_resolver),
         upstream_client.clone(),
@@ -659,7 +657,7 @@ pub async fn execute_eth_create_access_list(
     )
     .await?;
 
-    let access_list = collected_access_list(&collector, &parsed_call, block_number);
+    let access_list = collected_access_list(&collector, &parsed_call, is_cancun_or_later);
     let mut gas_used = gas_used_from_result(&result);
     if let Some(replay_call_params) = with_access_list_override(call_params, access_list.clone()) {
         if let Ok((replayed_result, _, _)) = run_evm(
@@ -1133,7 +1131,7 @@ mod tests {
             output: Output::Call(Bytes::new()),
         };
 
-        let access_list = collected_access_list(&collector, &call, CANCUN_MAINNET_BLOCK);
+        let access_list = collected_access_list(&collector, &call, true);
         let response = create_access_list_result_from_execution(&result, access_list, 21_000);
         let object = response.as_object().unwrap();
         assert_eq!(object.get("gasUsed"), Some(&Value::String("0x5208".into())));
@@ -1172,7 +1170,7 @@ mod tests {
             access_list: TxAccessList::default(),
         };
 
-        let access_list = collected_access_list(&collector, &call, CANCUN_MAINNET_BLOCK - 1);
+        let access_list = collected_access_list(&collector, &call, false);
         assert_eq!(
             access_list,
             json!([{
