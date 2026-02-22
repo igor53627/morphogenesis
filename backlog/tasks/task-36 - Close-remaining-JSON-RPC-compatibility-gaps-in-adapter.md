@@ -1,9 +1,10 @@
 ---
 id: TASK-36
 title: Close remaining JSON-RPC compatibility gaps in adapter
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-02-22 10:42'
+updated_date: '2026-02-22 18:04'
 labels:
   - rpc-adapter
   - compatibility
@@ -26,7 +27,15 @@ Close or explicitly gate these gaps with predictable behavior.
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Support EIP-1898 block object form (or provide feature-gated behavior with explicit, documented fallback strategy)
-- [ ] #2 Support safe/finalized block tags in log filtering paths
-- [ ] #3 Handle state-overrides for estimate/access-list with deterministic behavior and privacy policy integration
+- [x] #1 Support EIP-1898 block object form (or provide feature-gated behavior with explicit, documented fallback strategy)
+- [x] #2 Support safe/finalized block tags in log filtering paths
+- [x] #3 Handle state-overrides for estimate/access-list with deterministic behavior and privacy policy integration
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Started TASK-36 implementation. Scoping remaining JSON-RPC compatibility gaps and preparing TDD updates in morphogen-rpc-adapter.
+
+Implemented TDD updates and compatibility fixes in morphogen-rpc-adapter: (1) EIP-1898 block object form now supported in local EVM block spec parsing, including blockNumber and blockHash with requireCanonical handling; (2) safe/finalized tags are accepted in log filter parsing paths and resolve deterministically to the current local latest cached block; (3) state-overrides handling for eth_estimateGas/eth_createAccessList is now deterministic and privacy-policy integrated via strict override-shape validation and fail-closed gating before any upstream proxy. Added/updated unit tests in evm.rs, block_cache.rs, and main.rs; cargo test/clippy/fmt all pass for morphogen-rpc-adapter.
+<!-- SECTION:NOTES:END -->

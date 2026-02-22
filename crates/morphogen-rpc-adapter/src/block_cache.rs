@@ -394,22 +394,16 @@ pub enum TopicFilter {
 /// Returns Err with a human-readable message on invalid input.
 pub fn parse_log_filter_object(filter_obj: &Value, latest: u64) -> Result<LogFilter, String> {
     let from_block = match filter_obj.get("fromBlock").and_then(|v| v.as_str()) {
-        Some("latest") | Some("pending") | None => latest,
+        Some("latest") | Some("pending") | Some("safe") | Some("finalized") | None => latest,
         Some("earliest") => 0,
-        Some("safe") | Some("finalized") => {
-            return Err("\"safe\" and \"finalized\" block tags are not supported; use an explicit block number".to_string());
-        }
         Some(hex) => {
             parse_hex_block_number(hex).ok_or_else(|| format!("invalid fromBlock: {}", hex))?
         }
     };
 
     let to_block = match filter_obj.get("toBlock").and_then(|v| v.as_str()) {
-        Some("latest") | Some("pending") | None => latest,
+        Some("latest") | Some("pending") | Some("safe") | Some("finalized") | None => latest,
         Some("earliest") => 0,
-        Some("safe") | Some("finalized") => {
-            return Err("\"safe\" and \"finalized\" block tags are not supported; use an explicit block number".to_string());
-        }
         Some(hex) => {
             parse_hex_block_number(hex).ok_or_else(|| format!("invalid toBlock: {}", hex))?
         }
@@ -1590,10 +1584,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_filter_rejects_safe_finalized() {
+    fn parse_filter_supports_safe_finalized() {
         let obj = serde_json::json!({"fromBlock": "safe"});
-        assert!(parse_log_filter_object(&obj, 100).is_err());
+        let filter = parse_log_filter_object(&obj, 100).expect("safe should be accepted");
+        assert_eq!(filter.from_block, 100);
+
         let obj = serde_json::json!({"toBlock": "finalized"});
-        assert!(parse_log_filter_object(&obj, 100).is_err());
+        let filter = parse_log_filter_object(&obj, 100).expect("finalized should be accepted");
+        assert_eq!(filter.to_block, 100);
     }
 }

@@ -4,7 +4,7 @@ mod evm;
 mod pir_db;
 mod telemetry;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use block_cache::BlockCache;
 use clap::Parser;
 use code_resolver::CodeResolver;
@@ -14,8 +14,8 @@ use morphogen_client::network::PirClient;
 use serde_json::Value;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -187,9 +187,7 @@ fn validate_privacy_fallback_config(args: &Args) -> Result<()> {
         && args.environment == AdapterEnvironment::Prod
         && !args.allow_privacy_degraded_fallback
     {
-        bail!(
-            "--fallback-to-upstream in prod requires --allow-privacy-degraded-fallback"
-        );
+        bail!("--fallback-to-upstream in prod requires --allow-privacy-degraded-fallback");
     }
 
     Ok(())
@@ -223,6 +221,23 @@ fn fail_closed_if_fallback_disabled(
             None::<()>,
         ))
     }
+}
+
+fn has_nonempty_state_overrides(raw_params: &[Value]) -> Result<bool, ErrorObjectOwned> {
+    let Some(overrides) = raw_params.get(2) else {
+        return Ok(false);
+    };
+    if overrides.is_null() {
+        return Ok(false);
+    }
+    let Some(overrides_obj) = overrides.as_object() else {
+        return Err(ErrorObjectOwned::owned(
+            -32602,
+            "state overrides must be an object when provided",
+            None::<()>,
+        ));
+    };
+    Ok(!overrides_obj.is_empty())
 }
 
 #[tokio::main]
@@ -632,30 +647,26 @@ async fn main() -> Result<()> {
                 ));
             }
 
-            // If state overrides (3rd param) are present, we can't handle them locally.
-            // Proxy to upstream if fallback is enabled, otherwise reject explicitly.
-            let has_overrides =
-                raw.len() == 3 && !raw[2].is_null() && raw[2] != serde_json::json!({});
+            // Non-empty state overrides are unsupported in the local EVM path.
+            // Use fail-closed behavior unless degraded upstream fallback is explicitly enabled.
+            let has_overrides = has_nonempty_state_overrides(&raw)?;
             if has_overrides {
-                if state.args.fallback_to_upstream {
-                    record_privacy_degrading_fallback(
-                        state.as_ref(),
-                        "eth_estimateGas",
-                        "state_overrides_not_supported_locally",
-                    );
-                    return proxy_to_upstream(
-                        &state.args.upstream,
-                        &state.http_client,
-                        "eth_estimateGas",
-                        Value::Array(raw),
-                    )
-                    .await;
-                }
-                return Err(ErrorObjectOwned::owned(
-                    -32602,
+                fail_closed_if_fallback_disabled(
+                    state.args.fallback_to_upstream,
                     "state overrides not supported for local eth_estimateGas",
-                    None::<()>,
-                ));
+                )?;
+                record_privacy_degrading_fallback(
+                    state.as_ref(),
+                    "eth_estimateGas",
+                    "state_overrides_not_supported_locally",
+                );
+                return proxy_to_upstream(
+                    &state.args.upstream,
+                    &state.http_client,
+                    "eth_estimateGas",
+                    Value::Array(raw),
+                )
+                .await;
             }
 
             let call_params = &raw[0];
@@ -721,30 +732,26 @@ async fn main() -> Result<()> {
                 ));
             }
 
-            // If state overrides (3rd param) are present, we can't handle them locally.
-            // Proxy to upstream if fallback is enabled, otherwise reject explicitly.
-            let has_overrides =
-                raw.len() == 3 && !raw[2].is_null() && raw[2] != serde_json::json!({});
+            // Non-empty state overrides are unsupported in the local EVM path.
+            // Use fail-closed behavior unless degraded upstream fallback is explicitly enabled.
+            let has_overrides = has_nonempty_state_overrides(&raw)?;
             if has_overrides {
-                if state.args.fallback_to_upstream {
-                    record_privacy_degrading_fallback(
-                        state.as_ref(),
-                        "eth_createAccessList",
-                        "state_overrides_not_supported_locally",
-                    );
-                    return proxy_to_upstream(
-                        &state.args.upstream,
-                        &state.http_client,
-                        "eth_createAccessList",
-                        Value::Array(raw),
-                    )
-                    .await;
-                }
-                return Err(ErrorObjectOwned::owned(
-                    -32602,
+                fail_closed_if_fallback_disabled(
+                    state.args.fallback_to_upstream,
                     "state overrides not supported for local eth_createAccessList",
-                    None::<()>,
-                ));
+                )?;
+                record_privacy_degrading_fallback(
+                    state.as_ref(),
+                    "eth_createAccessList",
+                    "state_overrides_not_supported_locally",
+                );
+                return proxy_to_upstream(
+                    &state.args.upstream,
+                    &state.http_client,
+                    "eth_createAccessList",
+                    Value::Array(raw),
+                )
+                .await;
             }
 
             let call_params = &raw[0];
@@ -1223,9 +1230,10 @@ fn upstream_invalid_json_error(method: &str) -> ErrorObjectOwned {
 #[cfg(test)]
 mod tests {
     use super::{
-        fail_closed_if_fallback_disabled, next_privacy_degraded_fallback_count,
-        proxy_to_upstream, upstream_invalid_json_error, validate_privacy_fallback_config,
-        AdapterEnvironment, Args, DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS,
+        fail_closed_if_fallback_disabled, has_nonempty_state_overrides,
+        next_privacy_degraded_fallback_count, proxy_to_upstream, upstream_invalid_json_error,
+        validate_privacy_fallback_config, AdapterEnvironment, Args, DROPPED_METHODS,
+        PASSTHROUGH_METHODS, RELAY_METHODS,
     };
     use serde_json::json;
     use std::sync::atomic::AtomicU64;
@@ -1421,10 +1429,9 @@ mod tests {
 
         let err = validate_privacy_fallback_config(&args)
             .expect_err("prod degraded fallback should require explicit override");
-        assert!(
-            err.to_string()
-                .contains("--allow-privacy-degraded-fallback")
-        );
+        assert!(err
+            .to_string()
+            .contains("--allow-privacy-degraded-fallback"));
     }
 
     #[test]
@@ -1469,5 +1476,33 @@ mod tests {
     fn fail_closed_gate_allows_when_fallback_enabled() {
         fail_closed_if_fallback_disabled(true, "unused")
             .expect("gate should allow when fallback is enabled");
+    }
+
+    #[test]
+    fn state_overrides_presence_is_deterministic() {
+        assert!(!has_nonempty_state_overrides(&[]).expect("empty params"));
+        assert!(!has_nonempty_state_overrides(&[json!({})]).expect("single param"));
+        assert!(!has_nonempty_state_overrides(&[json!({}), json!("latest")]).expect("two params"));
+        assert!(
+            !has_nonempty_state_overrides(&[json!({}), json!("latest"), json!(null)])
+                .expect("null overrides")
+        );
+        assert!(
+            !has_nonempty_state_overrides(&[json!({}), json!("latest"), json!({})])
+                .expect("empty object overrides")
+        );
+        assert!(has_nonempty_state_overrides(&[
+            json!({}),
+            json!("latest"),
+            json!({"0xabc": {"balance": "0x1"}})
+        ])
+        .expect("non-empty overrides"));
+    }
+
+    #[test]
+    fn state_overrides_reject_non_object_values() {
+        let err = has_nonempty_state_overrides(&[json!({}), json!("latest"), json!(42)])
+            .expect_err("non-object state overrides should fail");
+        assert_eq!(err.code(), -32602);
     }
 }
