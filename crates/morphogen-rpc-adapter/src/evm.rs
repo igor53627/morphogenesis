@@ -71,10 +71,31 @@ fn validate_block_tag(block_tag: &Value) -> Result<String, String> {
 
 /// Fetch block header fields from upstream for the EVM block env.
 /// `block_tag` must be a pre-validated tag string (from `validate_block_tag`).
+fn parse_u64_env(var_name: &str, raw: &str) -> Option<u64> {
+    let parsed = if let Some(hex) = raw.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16)
+    } else {
+        raw.parse::<u64>()
+    };
+
+    match parsed {
+        Ok(value) => Some(value),
+        Err(e) => {
+            warn!(
+                env_var = var_name,
+                env_value = raw,
+                error = %e,
+                "Invalid u64 env var; ignoring value"
+            );
+            None
+        }
+    }
+}
+
 fn configured_cancun_block() -> Option<u64> {
     std::env::var("MORPHOGEN_CANCUN_BLOCK")
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|v| parse_u64_env("MORPHOGEN_CANCUN_BLOCK", &v))
 }
 
 fn infer_is_cancun_or_later(
@@ -940,6 +961,18 @@ mod tests {
         let block = json!({});
         assert!(!infer_is_cancun_or_later(&block, 99, Some(100)));
         assert!(infer_is_cancun_or_later(&block, 100, Some(100)));
+    }
+
+    #[test]
+    fn parse_u64_env_accepts_decimal_and_hex() {
+        assert_eq!(parse_u64_env("TEST_VAR", "42"), Some(42));
+        assert_eq!(parse_u64_env("TEST_VAR", "0x2a"), Some(42));
+    }
+
+    #[test]
+    fn parse_u64_env_rejects_invalid_values() {
+        assert_eq!(parse_u64_env("TEST_VAR", "not-a-number"), None);
+        assert_eq!(parse_u64_env("TEST_VAR", "0xzz"), None);
     }
 
     #[test]
