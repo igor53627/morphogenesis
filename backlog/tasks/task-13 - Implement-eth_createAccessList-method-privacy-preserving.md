@@ -1,9 +1,10 @@
 ---
 id: TASK-13
 title: Implement eth_createAccessList method (privacy-preserving)
-status: Icebox
+status: Done
 assignee: []
 created_date: '2026-02-03 14:38'
+updated_date: '2026-02-22 03:54'
 labels:
   - rpc
   - research
