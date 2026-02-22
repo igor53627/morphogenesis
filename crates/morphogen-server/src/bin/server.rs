@@ -38,6 +38,7 @@ const DEFAULT_PAGE_ROWS_PER_PAGE: usize = 1;
 const DEFAULT_SEEDS: [u64; 3] = [0x1234, 0x5678, 0x9ABC];
 const CTRL_C_INITIAL_RETRY_DELAY_MS: u64 = 250;
 const CTRL_C_MAX_RETRY_DELAY_MS: u64 = 5_000;
+const CTRL_C_MAX_FAILURES_BEFORE_FORCED_SHUTDOWN: u32 = 12;
 
 /// Type alias for stub GPU scanner (non-CUDA builds).
 type StubGpuScanner = Option<Arc<()>>;
@@ -847,6 +848,20 @@ fn should_log_ctrl_c_failure(failures: u32) -> bool {
     failures <= 3 || failures.is_multiple_of(10)
 }
 
+fn should_force_shutdown_after_ctrl_c_failures(failures: u32) -> bool {
+    failures >= CTRL_C_MAX_FAILURES_BEFORE_FORCED_SHUTDOWN
+}
+
+#[cfg(unix)]
+fn ctrl_c_failures_force_shutdown() -> bool {
+    false
+}
+
+#[cfg(not(unix))]
+fn ctrl_c_failures_force_shutdown() -> bool {
+    true
+}
+
 fn next_ctrl_c_retry_delay_ms(current_delay_ms: u64) -> u64 {
     (current_delay_ms * 2).min(CTRL_C_MAX_RETRY_DELAY_MS)
 }
@@ -862,28 +877,52 @@ struct ShutdownWaiters {
     ctrl_c: ShutdownFuture,
 }
 
-async fn wait_for_ctrl_c_signal() {
+async fn wait_for_ctrl_c_signal_with<WaitOnce, WaitFuture, SleepFn, SleepFuture>(
+    mut wait_once: WaitOnce,
+    mut sleep_fn: SleepFn,
+) where
+    WaitOnce: FnMut() -> WaitFuture,
+    WaitFuture: std::future::Future<Output = std::io::Result<()>>,
+    SleepFn: FnMut(Duration) -> SleepFuture,
+    SleepFuture: std::future::Future<Output = ()>,
+{
     let mut failures = 0u32;
     let mut retry_delay_ms = CTRL_C_INITIAL_RETRY_DELAY_MS;
 
     loop {
-        match tokio::signal::ctrl_c().await {
+        match wait_once().await {
             Ok(()) => break,
             Err(err) => {
                 failures = failures.saturating_add(1);
                 if should_log_ctrl_c_failure(failures) {
-                    tracing::error!(
-                        failures,
-                        "ctrl+c signal stream failed: {}",
-                        err
-                    );
+                    tracing::error!(failures, "ctrl+c signal stream failed: {}", err);
                 }
 
-                tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                if should_force_shutdown_after_ctrl_c_failures(failures) {
+                    if ctrl_c_failures_force_shutdown() {
+                        tracing::error!(
+                            failures,
+                            "ctrl+c signal stream failed repeatedly; forcing shutdown"
+                        );
+                        break;
+                    }
+
+                    tracing::error!(
+                        failures,
+                        "ctrl+c signal stream failed repeatedly; disabling ctrl+c waiter and relying on SIGTERM"
+                    );
+                    std::future::pending::<()>().await;
+                }
+
+                sleep_fn(Duration::from_millis(retry_delay_ms)).await;
                 retry_delay_ms = next_ctrl_c_retry_delay_ms(retry_delay_ms);
             }
         }
     }
+}
+
+async fn wait_for_ctrl_c_signal() {
+    wait_for_ctrl_c_signal_with(tokio::signal::ctrl_c, tokio::time::sleep).await;
 }
 
 #[cfg(unix)]
@@ -1248,6 +1287,22 @@ mod runtime_config_tests {
     }
 
     #[test]
+    fn ctrl_c_failure_forced_shutdown_policy_matches_expected_thresholds() {
+        assert!(!should_force_shutdown_after_ctrl_c_failures(0));
+        assert!(!should_force_shutdown_after_ctrl_c_failures(
+            CTRL_C_MAX_FAILURES_BEFORE_FORCED_SHUTDOWN - 1
+        ));
+        assert!(should_force_shutdown_after_ctrl_c_failures(
+            CTRL_C_MAX_FAILURES_BEFORE_FORCED_SHUTDOWN
+        ));
+
+        #[cfg(unix)]
+        assert!(!ctrl_c_failures_force_shutdown());
+        #[cfg(not(unix))]
+        assert!(ctrl_c_failures_force_shutdown());
+    }
+
+    #[test]
     fn ctrl_c_retry_delay_backoff_is_capped() {
         assert_eq!(
             next_ctrl_c_retry_delay_ms(CTRL_C_INITIAL_RETRY_DELAY_MS),
@@ -1260,6 +1315,180 @@ mod runtime_config_tests {
         assert_eq!(
             next_ctrl_c_retry_delay_ms(CTRL_C_MAX_RETRY_DELAY_MS / 2),
             CTRL_C_MAX_RETRY_DELAY_MS
+        );
+    }
+
+    fn expected_ctrl_c_retry_durations(retry_count: u32) -> Vec<Duration> {
+        let mut delay_ms = CTRL_C_INITIAL_RETRY_DELAY_MS;
+        let mut durations = Vec::with_capacity(retry_count as usize);
+
+        for _ in 0..retry_count {
+            durations.push(Duration::from_millis(delay_ms));
+            delay_ms = next_ctrl_c_retry_delay_ms(delay_ms);
+        }
+
+        durations
+    }
+
+    #[tokio::test]
+    async fn wait_for_ctrl_c_signal_with_retries_until_success() {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sleep_durations = Arc::new(Mutex::new(Vec::new()));
+        let outcomes = Arc::new(Mutex::new(VecDeque::from(vec![
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "transient ctrl-c stream failure 1",
+            )),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "transient ctrl-c stream failure 2",
+            )),
+            Ok(()),
+        ])));
+
+        wait_for_ctrl_c_signal_with(
+            {
+                let attempts = Arc::clone(&attempts);
+                let outcomes = Arc::clone(&outcomes);
+                move || {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    let next = outcomes
+                        .lock()
+                        .expect("lock outcomes")
+                        .pop_front()
+                        .expect("must provide enough outcomes");
+                    async move { next }
+                }
+            },
+            {
+                let sleep_durations = Arc::clone(&sleep_durations);
+                move |duration| {
+                    let sleep_durations = Arc::clone(&sleep_durations);
+                    async move {
+                        sleep_durations
+                            .lock()
+                            .expect("lock sleep_durations")
+                            .push(duration);
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            sleep_durations
+                .lock()
+                .expect("lock sleep_durations")
+                .clone(),
+            expected_ctrl_c_retry_durations(2)
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn wait_for_ctrl_c_signal_with_forces_shutdown_after_persistent_failures() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sleep_durations = Arc::new(Mutex::new(Vec::new()));
+
+        wait_for_ctrl_c_signal_with(
+            {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    async {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "persistent ctrl-c stream failure",
+                        ))
+                    }
+                }
+            },
+            {
+                let sleep_durations = Arc::clone(&sleep_durations);
+                move |duration| {
+                    let sleep_durations = Arc::clone(&sleep_durations);
+                    async move {
+                        sleep_durations
+                            .lock()
+                            .expect("lock sleep_durations")
+                            .push(duration);
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            attempts.load(Ordering::Relaxed) as u32,
+            CTRL_C_MAX_FAILURES_BEFORE_FORCED_SHUTDOWN
+        );
+        assert_eq!(
+            sleep_durations
+                .lock()
+                .expect("lock sleep_durations")
+                .clone(),
+            expected_ctrl_c_retry_durations(CTRL_C_MAX_FAILURES_BEFORE_FORCED_SHUTDOWN - 1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wait_for_ctrl_c_signal_with_disables_waiter_after_persistent_failures() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let sleep_durations = Arc::new(Mutex::new(Vec::new()));
+        let waiter = wait_for_ctrl_c_signal_with(
+            {
+                let attempts = Arc::clone(&attempts);
+                move || {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    async {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "persistent ctrl-c stream failure",
+                        ))
+                    }
+                }
+            },
+            {
+                let sleep_durations = Arc::clone(&sleep_durations);
+                move |duration| {
+                    let sleep_durations = Arc::clone(&sleep_durations);
+                    async move {
+                        sleep_durations
+                            .lock()
+                            .expect("lock sleep_durations")
+                            .push(duration);
+                    }
+                }
+            },
+        );
+
+        let timeout = tokio::time::timeout(Duration::from_millis(25), waiter).await;
+        assert!(
+            timeout.is_err(),
+            "ctrl+c waiter should stay pending on unix"
+        );
+        assert_eq!(
+            attempts.load(Ordering::Relaxed) as u32,
+            CTRL_C_MAX_FAILURES_BEFORE_FORCED_SHUTDOWN
+        );
+        assert_eq!(
+            sleep_durations
+                .lock()
+                .expect("lock sleep_durations")
+                .clone(),
+            expected_ctrl_c_retry_durations(CTRL_C_MAX_FAILURES_BEFORE_FORCED_SHUTDOWN - 1)
         );
     }
 
