@@ -4,7 +4,7 @@ mod evm;
 mod pir_db;
 mod telemetry;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use block_cache::BlockCache;
 use clap::Parser;
 use code_resolver::CodeResolver;
@@ -15,11 +15,19 @@ use serde_json::Value;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tower::ServiceBuilder;
 use tracing::{error, info, warn, Instrument};
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum AdapterEnvironment {
+    Dev,
+    Test,
+    Prod,
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about = "Morphogenesis RPC Adapter")]
@@ -64,6 +72,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     fallback_to_upstream: bool,
 
+    /// Deployment environment profile
+    #[arg(long, value_enum, default_value_t = AdapterEnvironment::Prod)]
+    environment: AdapterEnvironment,
+
+    /// Explicit acknowledgement required to allow privacy-degrading fallback in prod
+    #[arg(long, default_value_t = false)]
+    allow_privacy_degraded_fallback: bool,
+
     /// Transaction relay URL for eth_sendRawTransaction.
     /// Defaults to Flashbots Protect so txs bypass the public mempool.
     #[arg(
@@ -93,12 +109,39 @@ struct Args {
     otel_version: String,
 }
 
+#[cfg(test)]
+impl Args {
+    fn default_for_tests() -> Self {
+        Self {
+            port: 8545,
+            upstream: "https://ethereum-rpc.publicnode.com".to_string(),
+            pir_server_a: "http://localhost:3000".to_string(),
+            pir_server_b: "http://localhost:3001".to_string(),
+            dict_url: "http://localhost:8080/mainnet_compact.dict".to_string(),
+            cas_url: "http://localhost:8080/cas".to_string(),
+            file_url_root: None,
+            refresh_interval: 12,
+            upstream_timeout: 15,
+            fallback_to_upstream: false,
+            environment: AdapterEnvironment::Prod,
+            allow_privacy_degraded_fallback: false,
+            tx_relay: "https://rpc.flashbots.net/?hint=hash&originId=morphogenesis".to_string(),
+            otel_traces: false,
+            otel_endpoint: "http://127.0.0.1:4317".to_string(),
+            otel_service_name: "morphogen-rpc-adapter".to_string(),
+            otel_env: "e2e".to_string(),
+            otel_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
 struct AdapterState {
     args: Args,
     http_client: reqwest::Client,
     pir_client: Arc<PirClient>,
     code_resolver: Arc<CodeResolver>,
     block_cache: Arc<RwLock<BlockCache>>,
+    privacy_degraded_fallback_total: AtomicU64,
 }
 
 const PASSTHROUGH_METHODS: &[&str] = &[
@@ -139,6 +182,49 @@ const DROPPED_METHODS: &[(&str, &str)] = &[
 /// eth_sendRawTransaction goes to Flashbots Protect to avoid public mempool exposure.
 const RELAY_METHODS: &[&str] = &["eth_sendRawTransaction"];
 
+fn validate_privacy_fallback_config(args: &Args) -> Result<()> {
+    if args.fallback_to_upstream
+        && args.environment == AdapterEnvironment::Prod
+        && !args.allow_privacy_degraded_fallback
+    {
+        bail!(
+            "--fallback-to-upstream in prod requires --allow-privacy-degraded-fallback"
+        );
+    }
+
+    Ok(())
+}
+
+fn next_privacy_degraded_fallback_count(counter: &AtomicU64) -> u64 {
+    counter.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+fn record_privacy_degrading_fallback(state: &AdapterState, method: &str, reason: &str) {
+    let total = next_privacy_degraded_fallback_count(&state.privacy_degraded_fallback_total);
+    warn!(
+        rpc.method = %method,
+        privacy.degraded = true,
+        privacy.fallback_reason = %reason,
+        privacy.degraded_fallback_total = total,
+        "Proxying private method to upstream (privacy degraded)"
+    );
+}
+
+fn fail_closed_if_fallback_disabled(
+    fallback_to_upstream: bool,
+    fail_closed_message: &'static str,
+) -> Result<(), ErrorObjectOwned> {
+    if fallback_to_upstream {
+        Ok(())
+    } else {
+        Err(ErrorObjectOwned::owned(
+            -32000,
+            fail_closed_message,
+            None::<()>,
+        ))
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -150,6 +236,7 @@ async fn main() -> Result<()> {
         service_version: args.otel_version.clone(),
     };
     let _telemetry_guard = telemetry::init_tracing(otel)?;
+    validate_privacy_fallback_config(&args)?;
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     let server = Server::builder()
@@ -183,6 +270,7 @@ async fn main() -> Result<()> {
         pir_client,
         code_resolver,
         block_cache: block_cache.clone(),
+        privacy_degraded_fallback_total: AtomicU64::new(0),
     });
 
     // Background task for block cache polling
@@ -245,7 +333,11 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     error!("PIR query failed for eth_getBalance: {}", e);
                     if state.args.fallback_to_upstream {
-                        warn!("Falling back to upstream for eth_getBalance (privacy degraded)");
+                        record_privacy_degrading_fallback(
+                            state.as_ref(),
+                            "eth_getBalance",
+                            "pir_query_failed",
+                        );
                         let params = serde_json::json!([address_str, block]);
                         return proxy_to_upstream(
                             &state.args.upstream,
@@ -286,9 +378,11 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     error!("PIR query failed for eth_getTransactionCount: {}", e);
                     if state.args.fallback_to_upstream {
-                        warn!(
-                        "Falling back to upstream for eth_getTransactionCount (privacy degraded)"
-                    );
+                        record_privacy_degrading_fallback(
+                            state.as_ref(),
+                            "eth_getTransactionCount",
+                            "pir_query_failed",
+                        );
                         let params = serde_json::json!([address_str, block]);
                         return proxy_to_upstream(
                             &state.args.upstream,
@@ -328,7 +422,11 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     error!("PIR query failed for eth_getCode: {}", e);
                     if state.args.fallback_to_upstream {
-                        warn!("Falling back to upstream for eth_getCode (privacy degraded)");
+                        record_privacy_degrading_fallback(
+                            state.as_ref(),
+                            "eth_getCode",
+                            "pir_query_failed",
+                        );
                         let params = serde_json::json!([address_str, block]);
                         return proxy_to_upstream(
                             &state.args.upstream,
@@ -429,7 +527,11 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     error!("PIR storage query failed: {}", e);
                     if state.args.fallback_to_upstream {
-                        warn!("Falling back to upstream for eth_getStorageAt (privacy degraded)");
+                        record_privacy_degrading_fallback(
+                            state.as_ref(),
+                            "eth_getStorageAt",
+                            "pir_query_failed",
+                        );
                         let params = serde_json::json!([address_str, slot_str, block]);
                         return proxy_to_upstream(
                             &state.args.upstream,
@@ -491,7 +593,11 @@ async fn main() -> Result<()> {
                 Err(evm::EthCallError::Internal(e)) => {
                     error!("Private eth_call failed: {}", e);
                     if state.args.fallback_to_upstream {
-                        warn!("Falling back to upstream for eth_call (privacy degraded)");
+                        record_privacy_degrading_fallback(
+                            state.as_ref(),
+                            "eth_call",
+                            "local_evm_failed",
+                        );
                         let params = serde_json::json!([call_params, block]);
                         return proxy_to_upstream(
                             &state.args.upstream,
@@ -532,9 +638,11 @@ async fn main() -> Result<()> {
                 raw.len() == 3 && !raw[2].is_null() && raw[2] != serde_json::json!({});
             if has_overrides {
                 if state.args.fallback_to_upstream {
-                    warn!(
-                    "eth_estimateGas with state overrides, proxying to upstream (privacy degraded)"
-                );
+                    record_privacy_degrading_fallback(
+                        state.as_ref(),
+                        "eth_estimateGas",
+                        "state_overrides_not_supported_locally",
+                    );
                     return proxy_to_upstream(
                         &state.args.upstream,
                         &state.http_client,
@@ -575,7 +683,11 @@ async fn main() -> Result<()> {
                 Err(evm::EthCallError::Internal(e)) => {
                     error!("Private eth_estimateGas failed: {}", e);
                     if state.args.fallback_to_upstream {
-                        warn!("Falling back to upstream for eth_estimateGas (privacy degraded)");
+                        record_privacy_degrading_fallback(
+                            state.as_ref(),
+                            "eth_estimateGas",
+                            "local_evm_failed",
+                        );
                         return proxy_to_upstream(
                             &state.args.upstream,
                             &state.http_client,
@@ -615,8 +727,10 @@ async fn main() -> Result<()> {
                 raw.len() == 3 && !raw[2].is_null() && raw[2] != serde_json::json!({});
             if has_overrides {
                 if state.args.fallback_to_upstream {
-                    warn!(
-                        "eth_createAccessList with state overrides, proxying to upstream (privacy degraded)"
+                    record_privacy_degrading_fallback(
+                        state.as_ref(),
+                        "eth_createAccessList",
+                        "state_overrides_not_supported_locally",
                     );
                     return proxy_to_upstream(
                         &state.args.upstream,
@@ -658,8 +772,10 @@ async fn main() -> Result<()> {
                 Err(evm::EthCallError::Internal(e)) => {
                     error!("Private eth_createAccessList failed: {}", e);
                     if state.args.fallback_to_upstream {
-                        warn!(
-                            "Falling back to upstream for eth_createAccessList (privacy degraded)"
+                        record_privacy_degrading_fallback(
+                            state.as_ref(),
+                            "eth_createAccessList",
+                            "local_evm_failed",
                         );
                         return proxy_to_upstream(
                             &state.args.upstream,
@@ -703,14 +819,15 @@ async fn main() -> Result<()> {
             }
 
             // Cache miss: respect fallback setting
-            if !state.args.fallback_to_upstream {
-                return Err(ErrorObjectOwned::owned(
-                    -32000,
-                    "transaction not found in local cache",
-                    None::<()>,
-                ));
-            }
-            info!("Proxying eth_getTransactionByHash to upstream (not in cache)");
+            fail_closed_if_fallback_disabled(
+                state.args.fallback_to_upstream,
+                "transaction not found in local cache",
+            )?;
+            record_privacy_degrading_fallback(
+                state.as_ref(),
+                "eth_getTransactionByHash",
+                "cache_miss",
+            );
             proxy_to_upstream(
                 &state.args.upstream,
                 &state.http_client,
@@ -745,14 +862,15 @@ async fn main() -> Result<()> {
             }
 
             // Cache miss: respect fallback setting
-            if !state.args.fallback_to_upstream {
-                return Err(ErrorObjectOwned::owned(
-                    -32000,
-                    "receipt not found in local cache",
-                    None::<()>,
-                ));
-            }
-            info!("Proxying eth_getTransactionReceipt to upstream (not in cache)");
+            fail_closed_if_fallback_disabled(
+                state.args.fallback_to_upstream,
+                "receipt not found in local cache",
+            )?;
+            record_privacy_degrading_fallback(
+                state.as_ref(),
+                "eth_getTransactionReceipt",
+                "cache_miss",
+            );
             proxy_to_upstream(
                 &state.args.upstream,
                 &state.http_client,
@@ -780,14 +898,15 @@ async fn main() -> Result<()> {
 
             // If blockHash is present, proxy to upstream (out of scope for cache)
             if filter_obj.get("blockHash").is_some() {
-                if !state.args.fallback_to_upstream {
-                    return Err(ErrorObjectOwned::owned(
-                        -32000,
-                        "eth_getLogs by blockHash not supported without upstream fallback",
-                        None::<()>,
-                    ));
-                }
-                info!("eth_getLogs with blockHash, proxying to upstream");
+                fail_closed_if_fallback_disabled(
+                    state.args.fallback_to_upstream,
+                    "eth_getLogs by blockHash not supported without upstream fallback",
+                )?;
+                record_privacy_degrading_fallback(
+                    state.as_ref(),
+                    "eth_getLogs",
+                    "block_hash_filter_not_supported_locally",
+                );
                 return proxy_to_upstream(
                     &state.args.upstream,
                     &state.http_client,
@@ -815,17 +934,14 @@ async fn main() -> Result<()> {
                 Ok::<Value, ErrorObjectOwned>(Value::Array(logs))
             } else {
                 drop(cache);
-                if !state.args.fallback_to_upstream {
-                    return Err(ErrorObjectOwned::owned(
-                        -32000,
-                        "requested log range not fully cached",
-                        None::<()>,
-                    ));
-                }
-                warn!(
-                    from = filter.from_block,
-                    to = filter.to_block,
-                    "eth_getLogs range not fully cached, proxying to upstream (privacy degraded)"
+                fail_closed_if_fallback_disabled(
+                    state.args.fallback_to_upstream,
+                    "requested log range not fully cached",
+                )?;
+                record_privacy_degrading_fallback(
+                    state.as_ref(),
+                    "eth_getLogs",
+                    "range_not_fully_cached",
                 );
                 proxy_to_upstream(
                     &state.args.upstream,
@@ -1001,7 +1117,12 @@ async fn main() -> Result<()> {
     info!("Upstream RPC: {}", sanitized_upstream);
     info!("Tx relay: {}", sanitized_relay);
     if args.fallback_to_upstream {
-        warn!("Fallback to upstream enabled - privacy will be degraded when PIR is unavailable");
+        warn!(
+            environment = ?args.environment,
+            "Fallback to upstream enabled - privacy will be degraded when PIR is unavailable"
+        );
+    } else {
+        info!("Privacy fallback policy: fail-closed");
     }
 
     let handle = server.start(module);
@@ -1102,10 +1223,12 @@ fn upstream_invalid_json_error(method: &str) -> ErrorObjectOwned {
 #[cfg(test)]
 mod tests {
     use super::{
-        proxy_to_upstream, upstream_invalid_json_error, DROPPED_METHODS, PASSTHROUGH_METHODS,
-        RELAY_METHODS,
+        fail_closed_if_fallback_disabled, next_privacy_degraded_fallback_count,
+        proxy_to_upstream, upstream_invalid_json_error, validate_privacy_fallback_config,
+        AdapterEnvironment, Args, DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS,
     };
     use serde_json::json;
+    use std::sync::atomic::AtomicU64;
     use std::time::Duration;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -1280,5 +1403,71 @@ mod tests {
     fn proxy_to_upstream_invalid_json_error_is_redacted() {
         let err = upstream_invalid_json_error("eth_getBalance");
         assert_eq!(err.message(), "Invalid JSON response for eth_getBalance");
+    }
+
+    #[test]
+    fn privacy_fallback_defaults_to_fail_closed() {
+        let args = Args::default_for_tests();
+        assert!(!args.fallback_to_upstream);
+        validate_privacy_fallback_config(&args).expect("default fail-closed config should pass");
+    }
+
+    #[test]
+    fn privacy_fallback_prod_requires_explicit_override() {
+        let mut args = Args::default_for_tests();
+        args.fallback_to_upstream = true;
+        args.environment = AdapterEnvironment::Prod;
+        args.allow_privacy_degraded_fallback = false;
+
+        let err = validate_privacy_fallback_config(&args)
+            .expect_err("prod degraded fallback should require explicit override");
+        assert!(
+            err.to_string()
+                .contains("--allow-privacy-degraded-fallback")
+        );
+    }
+
+    #[test]
+    fn privacy_fallback_prod_allows_override() {
+        let mut args = Args::default_for_tests();
+        args.fallback_to_upstream = true;
+        args.environment = AdapterEnvironment::Prod;
+        args.allow_privacy_degraded_fallback = true;
+
+        validate_privacy_fallback_config(&args)
+            .expect("prod degraded fallback with explicit override should pass");
+    }
+
+    #[test]
+    fn privacy_fallback_non_prod_allows_without_override() {
+        let mut args = Args::default_for_tests();
+        args.fallback_to_upstream = true;
+        args.environment = AdapterEnvironment::Dev;
+        args.allow_privacy_degraded_fallback = false;
+
+        validate_privacy_fallback_config(&args)
+            .expect("non-prod degraded fallback should not require prod override");
+    }
+
+    #[test]
+    fn privacy_fallback_counter_increments_monotonically() {
+        let counter = AtomicU64::new(0);
+        assert_eq!(next_privacy_degraded_fallback_count(&counter), 1);
+        assert_eq!(next_privacy_degraded_fallback_count(&counter), 2);
+        assert_eq!(next_privacy_degraded_fallback_count(&counter), 3);
+    }
+
+    #[test]
+    fn fail_closed_gate_returns_error_when_fallback_disabled() {
+        let err = fail_closed_if_fallback_disabled(false, "blocked")
+            .expect_err("fail-closed gate should reject when fallback is disabled");
+        assert_eq!(err.code(), -32000);
+        assert_eq!(err.message(), "blocked");
+    }
+
+    #[test]
+    fn fail_closed_gate_allows_when_fallback_enabled() {
+        fail_closed_if_fallback_disabled(true, "unused")
+            .expect("gate should allow when fallback is enabled");
     }
 }
