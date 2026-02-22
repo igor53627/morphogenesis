@@ -166,10 +166,10 @@ fn parse_call_params(call_params: &Value) -> Result<CallParams, EthCallError> {
 /// Caps memory/network cost from attacker-controlled input.
 const MAX_PREFETCH_ACCOUNTS: usize = 64;
 const MAX_PREFETCH_STORAGE: usize = 256;
-/// Safety cap for seeded access-list entries in request payloads.
-const MAX_SEEDED_ACCESS_LIST_ENTRIES: usize = 1024;
-/// Safety cap for total seeded storage-key items in request payloads.
-const MAX_SEEDED_STORAGE_KEYS: usize = 4096;
+/// Safety cap for user-provided access-list entries in request payloads.
+const MAX_ACCESS_LIST_ENTRIES: usize = 1024;
+/// Safety cap for total user-provided access-list storage-key items.
+const MAX_ACCESS_LIST_STORAGE_KEYS: usize = 4096;
 
 /// Parse a fixed-width hex value into an array (`0x` prefix optional).
 fn parse_prefixed_hex_array<const N: usize>(raw: &str) -> Option<[u8; N]> {
@@ -180,6 +180,14 @@ fn parse_prefixed_hex_array<const N: usize>(raw: &str) -> Option<[u8; N]> {
     let mut out = [0u8; N];
     hex::decode_to_slice(hex, &mut out).ok()?;
     Some(out)
+}
+
+fn access_list_storage_keys(entry: &Value) -> Option<&[Value]> {
+    entry
+        .get("storageKeys")
+        .or_else(|| entry.get("storage_keys"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
 }
 
 fn parse_access_list_strict(val: Option<&Value>) -> Result<TxAccessList, String> {
@@ -193,7 +201,15 @@ fn parse_access_list_strict(val: Option<&Value>) -> Result<TxAccessList, String>
     let entries = v
         .as_array()
         .ok_or("expected accessList to be an array".to_string())?;
+    if entries.len() > MAX_ACCESS_LIST_ENTRIES {
+        return Err(format!(
+            "accessList exceeds entry limit: got {}, max {}",
+            entries.len(),
+            MAX_ACCESS_LIST_ENTRIES
+        ));
+    }
     let mut items = Vec::with_capacity(entries.len());
+    let mut total_storage_keys = 0usize;
 
     for (entry_idx, entry) in entries.iter().enumerate() {
         let address = entry
@@ -207,11 +223,17 @@ fn parse_access_list_strict(val: Option<&Value>) -> Result<TxAccessList, String>
                 )
             })?;
 
-        let storage_vals = entry
-            .get("storageKeys")
-            .or_else(|| entry.get("storage_keys"))
-            .and_then(Value::as_array)
+        let storage_vals = access_list_storage_keys(entry)
             .ok_or_else(|| format!("accessList[{entry_idx}].storageKeys must be an array"))?;
+        total_storage_keys = total_storage_keys
+            .checked_add(storage_vals.len())
+            .ok_or_else(|| "accessList storage key count overflow".to_string())?;
+        if total_storage_keys > MAX_ACCESS_LIST_STORAGE_KEYS {
+            return Err(format!(
+                "accessList exceeds storage key limit: got {}, max {}",
+                total_storage_keys, MAX_ACCESS_LIST_STORAGE_KEYS
+            ));
+        }
         let mut storage_keys = Vec::with_capacity(storage_vals.len());
 
         for (key_idx, key) in storage_vals.iter().enumerate() {
@@ -266,7 +288,7 @@ async fn prefetch_access_list(pir_client: &Arc<PirClient>, entries: &[Value]) {
             addresses.push(addr);
         }
 
-        if let Some(keys) = entry.get("storageKeys").and_then(|v| v.as_array()) {
+        if let Some(keys) = access_list_storage_keys(entry) {
             for key in keys {
                 if storage_queries.len() >= MAX_PREFETCH_STORAGE {
                     break;
@@ -315,12 +337,12 @@ fn seed_access_list_collector(call_params: &Value, collector: &SharedAccessListC
         Err(poisoned) => poisoned.into_inner(),
     };
 
-    let mut truncated = entries.len() > MAX_SEEDED_ACCESS_LIST_ENTRIES;
+    let mut truncated = entries.len() > MAX_ACCESS_LIST_ENTRIES;
     let mut seen_accounts: HashSet<[u8; 20]> = HashSet::new();
     let mut seen_storage: HashSet<([u8; 20], [u8; 32])> = HashSet::new();
-    let mut seen_storage_items = 0usize;
+    let mut scanned_storage_items = 0usize;
 
-    for entry in entries.iter().take(MAX_SEEDED_ACCESS_LIST_ENTRIES) {
+    for entry in entries.iter().take(MAX_ACCESS_LIST_ENTRIES) {
         let Some(addr) = entry
             .get("address")
             .and_then(|v| v.as_str())
@@ -333,16 +355,16 @@ fn seed_access_list_collector(call_params: &Value, collector: &SharedAccessListC
             guard.record_account(addr);
         }
 
-        if let Some(keys) = entry.get("storageKeys").and_then(|v| v.as_array()) {
+        if let Some(keys) = access_list_storage_keys(entry) {
             for key in keys {
-                if seen_storage_items >= MAX_SEEDED_STORAGE_KEYS {
+                if scanned_storage_items >= MAX_ACCESS_LIST_STORAGE_KEYS {
                     truncated = true;
                     break;
                 }
+                scanned_storage_items += 1;
                 if let Some(slot) = key.as_str().and_then(parse_prefixed_hex_array::<32>) {
                     if seen_storage.insert((addr, slot)) {
                         guard.record_storage(addr, slot);
-                        seen_storage_items += 1;
                     }
                 }
             }
@@ -525,13 +547,13 @@ pub async fn execute_eth_estimate_gas(
 }
 
 fn warm_addresses_for_call(call: &CallParams) -> Vec<[u8; 20]> {
-    let mut warmed = Vec::with_capacity(11);
+    let mut warmed = Vec::with_capacity(12);
     warmed.push(call.from.into_array());
     if let Some(to) = call.to {
         warmed.push(to.into_array());
     }
-    // Precompiles 0x1..0x9 are warm per EIP-2929.
-    for idx in 1u8..=9 {
+    // Precompiles 0x1..0xa are warm on modern mainnet.
+    for idx in 1u8..=10 {
         let mut addr = [0u8; 20];
         addr[19] = idx;
         warmed.push(addr);
@@ -610,7 +632,7 @@ pub async fn execute_eth_create_access_list(
     if seed_truncated {
         return Err(EthCallError::InvalidParams(format!(
             "accessList exceeds safety limits (max entries={}, max storage items={})",
-            MAX_SEEDED_ACCESS_LIST_ENTRIES, MAX_SEEDED_STORAGE_KEYS
+            MAX_ACCESS_LIST_ENTRIES, MAX_ACCESS_LIST_STORAGE_KEYS
         )));
     }
 
@@ -900,6 +922,42 @@ mod tests {
     }
 
     #[test]
+    fn parse_access_list_strict_rejects_too_many_entries() {
+        let address = format!("0x{}", "11".repeat(20));
+        let entries: Vec<Value> = (0..(MAX_ACCESS_LIST_ENTRIES + 1))
+            .map(|_| {
+                json!({
+                    "address": address,
+                    "storageKeys": []
+                })
+            })
+            .collect();
+        let input = Value::Array(entries);
+
+        assert!(parse_access_list_strict(Some(&input)).is_err());
+    }
+
+    #[test]
+    fn parse_access_list_strict_rejects_too_many_storage_keys() {
+        let address = format!("0x{}", "11".repeat(20));
+        let storage_keys: Vec<Value> = (0..(MAX_ACCESS_LIST_STORAGE_KEYS + 1))
+            .map(|i| {
+                let mut slot = [0u8; 32];
+                slot[24..32].copy_from_slice(&(i as u64).to_be_bytes());
+                Value::String(format!("0x{}", hex::encode(slot)))
+            })
+            .collect();
+        let input = json!([
+            {
+                "address": address,
+                "storageKeys": storage_keys
+            }
+        ]);
+
+        assert!(parse_access_list_strict(Some(&input)).is_err());
+    }
+
+    #[test]
     fn seed_access_list_collector_dedups_and_validates_lengths() {
         let collector = Arc::new(Mutex::new(AccessListCollector::default()));
         let address = format!("0x{}", "11".repeat(20));
@@ -933,7 +991,7 @@ mod tests {
     fn seed_access_list_collector_reports_truncation_when_entry_cap_hit() {
         let collector = Arc::new(Mutex::new(AccessListCollector::default()));
         let address = format!("0x{}", "11".repeat(20));
-        let entries: Vec<Value> = (0..(MAX_SEEDED_ACCESS_LIST_ENTRIES + 1))
+        let entries: Vec<Value> = (0..(MAX_ACCESS_LIST_ENTRIES + 1))
             .map(|_| {
                 json!({
                     "address": address,
@@ -952,7 +1010,7 @@ mod tests {
     fn seed_access_list_collector_reports_truncation_when_storage_cap_hit() {
         let collector = Arc::new(Mutex::new(AccessListCollector::default()));
         let address = format!("0x{}", "11".repeat(20));
-        let storage_keys: Vec<Value> = (0..(MAX_SEEDED_STORAGE_KEYS + 1))
+        let storage_keys: Vec<Value> = (0..(MAX_ACCESS_LIST_STORAGE_KEYS + 1))
             .map(|i| {
                 let mut slot = [0u8; 32];
                 slot[24..32].copy_from_slice(&(i as u64).to_be_bytes());
@@ -975,7 +1033,55 @@ mod tests {
             .and_then(|entry| entry.get("storageKeys"))
             .and_then(Value::as_array)
             .expect("seeded entry has storageKeys array");
-        assert_eq!(seeded_keys.len(), MAX_SEEDED_STORAGE_KEYS);
+        assert_eq!(seeded_keys.len(), MAX_ACCESS_LIST_STORAGE_KEYS);
+    }
+
+    #[test]
+    fn seed_access_list_collector_supports_storage_keys_alias() {
+        let collector = Arc::new(Mutex::new(AccessListCollector::default()));
+        let address = format!("0x{}", "11".repeat(20));
+        let slot = format!("0x{}", "22".repeat(32));
+        let params = json!({
+            "accessList": [{
+                "address": address,
+                "storage_keys": [slot]
+            }]
+        });
+
+        assert!(!seed_access_list_collector(&params, &collector));
+        let entries = collector.lock().unwrap().to_rpc_entries();
+        assert_eq!(
+            entries,
+            json!([{
+                "address": format!("0x{}", "11".repeat(20)),
+                "storageKeys": [format!("0x{}", "22".repeat(32))]
+            }])
+        );
+    }
+
+    #[test]
+    fn seed_access_list_collector_truncates_invalid_heavy_storage_keys() {
+        let collector = Arc::new(Mutex::new(AccessListCollector::default()));
+        let address = format!("0x{}", "11".repeat(20));
+        let storage_keys: Vec<Value> = (0..(MAX_ACCESS_LIST_STORAGE_KEYS + 1))
+            .map(|_| Value::String("0x1234".to_string()))
+            .collect();
+        let params = json!({
+            "accessList": [{
+                "address": address,
+                "storageKeys": storage_keys
+            }]
+        });
+
+        assert!(seed_access_list_collector(&params, &collector));
+        let entries = collector.lock().unwrap().to_rpc_entries();
+        assert_eq!(
+            entries,
+            json!([{
+                "address": format!("0x{}", "11".repeat(20)),
+                "storageKeys": []
+            }])
+        );
     }
 
     #[test]
@@ -985,6 +1091,8 @@ mod tests {
         let keep = [0xcc_u8; 20];
         let mut precompile = [0_u8; 20];
         precompile[19] = 1;
+        let mut precompile_ten = [0_u8; 20];
+        precompile_ten[19] = 10;
         let keep_slot = [0x33_u8; 32];
         let warm_slot = [0x44_u8; 32];
         let collector = Arc::new(Mutex::new(AccessListCollector::default()));
@@ -993,6 +1101,7 @@ mod tests {
             guard.record_account(from);
             guard.record_account(to);
             guard.record_account(precompile);
+            guard.record_account(precompile_ten);
             guard.record_storage(from, warm_slot);
             guard.record_storage(keep, keep_slot);
         }
