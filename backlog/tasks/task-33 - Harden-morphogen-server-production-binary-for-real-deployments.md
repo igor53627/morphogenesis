@@ -4,7 +4,7 @@ title: Harden morphogen-server production binary for real deployments
 status: Done
 assignee: []
 created_date: '2026-02-22 10:42'
-updated_date: '2026-02-22 12:54'
+updated_date: '2026-02-22 12:59'
 labels:
   - production
   - server
@@ -50,4 +50,8 @@ Verification: cargo test -p morphogen-server --features network --bin server; ca
 2026-02-22: Added shutdown orchestration tests (ctrl_c/sigterm future paths) and config tests for prod key requirements and CLI enable/disable overrides.
 
 Verification (follow-up): cargo test -p morphogen-server --features network --bin server; cargo test -p morphogen-server --features network; cargo clippy --package morphogen-server --features network --bin server -- -D warnings
+
+2026-02-22: Addressed second roborev pass for TASK-33 by moving shutdown waiter installation ahead of merge-worker spawn, adding bounded ctrl-c retry/backoff behavior, and adding parser/flag conflict tests (plus CLI override coverage).
+
+Verification (second follow-up): cargo test -p morphogen-server --features network --bin server; cargo test -p morphogen-server --features network; cargo clippy --package morphogen-server --features network --bin server -- -D warnings
 <!-- SECTION:NOTES:END -->

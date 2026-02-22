@@ -36,6 +36,9 @@ const DEFAULT_MATRIX_SEED: u64 = 42;
 const DEFAULT_PAGE_DOMAIN_BITS: usize = 25;
 const DEFAULT_PAGE_ROWS_PER_PAGE: usize = 1;
 const DEFAULT_SEEDS: [u64; 3] = [0x1234, 0x5678, 0x9ABC];
+const CTRL_C_MAX_RETRIES: u32 = 8;
+const CTRL_C_INITIAL_RETRY_DELAY_MS: u64 = 250;
+const CTRL_C_MAX_RETRY_DELAY_MS: u64 = 5_000;
 
 /// Type alias for stub GPU scanner (non-CUDA builds).
 type StubGpuScanner = Option<Arc<()>>;
@@ -853,12 +856,44 @@ struct ShutdownWaiters {
 }
 
 async fn wait_for_ctrl_c_signal() {
+    let mut failures = 0u32;
+    let mut retry_delay_ms = CTRL_C_INITIAL_RETRY_DELAY_MS;
+
     loop {
         match tokio::signal::ctrl_c().await {
             Ok(()) => break,
             Err(err) => {
-                tracing::error!("ctrl+c signal stream failed: {}", err);
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                failures = failures.saturating_add(1);
+                if failures <= 3 || failures.is_multiple_of(10) {
+                    tracing::error!(
+                        failures,
+                        "ctrl+c signal stream failed: {}",
+                        err
+                    );
+                }
+
+                if failures >= CTRL_C_MAX_RETRIES {
+                    #[cfg(unix)]
+                    {
+                        tracing::error!(
+                            failures,
+                            "ctrl+c listener disabled after repeated failures; waiting on SIGTERM"
+                        );
+                        std::future::pending::<()>().await;
+                    }
+
+                    #[cfg(not(unix))]
+                    {
+                        tracing::error!(
+                            failures,
+                            "ctrl+c listener failed repeatedly; forcing shutdown"
+                        );
+                        break;
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_millis(retry_delay_ms)).await;
+                retry_delay_ms = (retry_delay_ms * 2).min(CTRL_C_MAX_RETRY_DELAY_MS);
             }
         }
     }
@@ -996,6 +1031,7 @@ async fn run() -> Result<(), StartupError> {
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_waiters = install_shutdown_waiters()?;
     let merge_worker = tokio::spawn(epoch::spawn_merge_worker(
         epoch_manager,
         runtime.merge_interval,
@@ -1016,7 +1052,6 @@ async fn run() -> Result<(), StartupError> {
         "morphogen-server listening"
     );
 
-    let shutdown_waiters = install_shutdown_waiters()?;
     let shutdown_tx_for_signal = shutdown_tx.clone();
     let graceful_shutdown = async move {
         drive_shutdown_signal(shutdown_waiters, shutdown_tx_for_signal).await;
@@ -1161,6 +1196,43 @@ mod runtime_config_tests {
         cli = CliArgs::default_for_tests();
         cli.enable_page_pir = true;
         assert_eq!(cli.disable_page_pir_override(), Some(false));
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cli_gpu_preload_override_supports_explicit_enable_and_disable() {
+        let mut cli = CliArgs::default_for_tests();
+        assert_eq!(cli.gpu_preload_override(), None);
+
+        cli.gpu_preload = true;
+        assert_eq!(cli.gpu_preload_override(), Some(true));
+
+        cli = CliArgs::default_for_tests();
+        cli.no_gpu_preload = true;
+        assert_eq!(cli.gpu_preload_override(), Some(false));
+    }
+
+    #[test]
+    fn cli_rejects_conflicting_allow_synthetic_flags() {
+        let result = CliArgs::try_parse_from([
+            "server",
+            "--allow-synthetic-matrix",
+            "--no-allow-synthetic-matrix",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_rejects_conflicting_page_pir_flags() {
+        let result = CliArgs::try_parse_from(["server", "--disable-page-pir", "--enable-page-pir"]);
+        assert!(result.is_err());
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cli_rejects_conflicting_gpu_preload_flags() {
+        let result = CliArgs::try_parse_from(["server", "--gpu-preload", "--no-gpu-preload"]);
+        assert!(result.is_err());
     }
 
     #[test]
