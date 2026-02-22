@@ -39,6 +39,7 @@ const DEFAULT_SEEDS: [u64; 3] = [0x1234, 0x5678, 0x9ABC];
 const CTRL_C_INITIAL_RETRY_DELAY_MS: u64 = 250;
 const CTRL_C_MAX_RETRY_DELAY_MS: u64 = 5_000;
 const CTRL_C_MAX_FAILURES_BEFORE_FORCED_SHUTDOWN: u32 = 12;
+const DEFAULT_ADMIN_SNAPSHOT_MAX_BYTES: u64 = 1_073_741_824;
 
 /// Type alias for stub GPU scanner (non-CUDA builds).
 type StubGpuScanner = Option<Arc<()>>;
@@ -1008,6 +1009,32 @@ async fn run() -> Result<(), StartupError> {
     };
 
     let runtime = RuntimeConfig::resolve(cli, env, file)?;
+    let admin_snapshot_token = env_var("MORPHOGEN_ADMIN_SNAPSHOT_TOKEN").and_then(|v| {
+        let trimmed = v.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+    let admin_snapshot_allow_local_paths =
+        parse_env_bool("MORPHOGEN_ADMIN_ALLOW_LOCAL_SNAPSHOT")?.unwrap_or(false);
+    let admin_snapshot_allowed_hosts = env_var("MORPHOGEN_ADMIN_SNAPSHOT_ALLOWED_HOSTS")
+        .map(|raw| {
+            raw.split(',')
+                .map(|host| host.trim().to_ascii_lowercase())
+                .filter(|host| !host.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let admin_snapshot_max_bytes_u64 = parse_env_u64("MORPHOGEN_ADMIN_SNAPSHOT_MAX_BYTES")?
+        .unwrap_or(DEFAULT_ADMIN_SNAPSHOT_MAX_BYTES);
+    let admin_snapshot_max_bytes = usize::try_from(admin_snapshot_max_bytes_u64).map_err(|_| {
+        StartupError::new(format!(
+            "MORPHOGEN_ADMIN_SNAPSHOT_MAX_BYTES={} exceeds usize::MAX",
+            admin_snapshot_max_bytes_u64
+        ))
+    })?;
 
     let matrix = Arc::new(build_matrix(&runtime)?);
     validate_server_config(&runtime, matrix.total_size_bytes())?;
@@ -1028,7 +1055,7 @@ async fn run() -> Result<(), StartupError> {
     let pending = Arc::new(DeltaBuffer::new_with_epoch(runtime.row_size_bytes, 0));
     let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
 
-    let (_epoch_tx, epoch_rx) = watch::channel(EpochMetadata {
+    let (epoch_tx, epoch_rx) = watch::channel(EpochMetadata {
         epoch_id: 0,
         num_rows,
         seeds: runtime.seeds,
@@ -1036,8 +1063,43 @@ async fn run() -> Result<(), StartupError> {
         state_root: runtime.state_root,
     });
 
+    #[cfg(feature = "cuda")]
+    let shared_gpu_matrix = gpu_matrix
+        .clone()
+        .unwrap_or_else(|| Arc::new(Mutex::new(None)));
+
+    #[cfg(feature = "cuda")]
+    let epoch_manager = Arc::new(
+        EpochManager::new_with_gpu_matrix(
+            global.clone(),
+            runtime.row_size_bytes,
+            shared_gpu_matrix.clone(),
+        )
+        .map_err(|e| StartupError::new(format!("failed to initialize epoch manager: {}", e)))?,
+    );
+
+    #[cfg(not(feature = "cuda"))]
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), runtime.row_size_bytes)
+            .map_err(|e| StartupError::new(format!("failed to initialize epoch manager: {}", e)))?,
+    );
+
+    #[cfg(feature = "cuda")]
+    let gpu_matrix_state = if gpu_matrix.is_some() {
+        Some(shared_gpu_matrix)
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         global: global.clone(),
+        epoch_manager: epoch_manager.clone(),
+        epoch_tx,
+        snapshot_rotation_lock: Arc::new(tokio::sync::Mutex::new(())),
+        admin_snapshot_token,
+        admin_snapshot_allow_local_paths,
+        admin_snapshot_allowed_hosts,
+        admin_snapshot_max_bytes,
         row_size_bytes: runtime.row_size_bytes,
         num_rows,
         seeds: runtime.seeds,
@@ -1048,13 +1110,8 @@ async fn run() -> Result<(), StartupError> {
         #[cfg(feature = "cuda")]
         gpu_scanner,
         #[cfg(feature = "cuda")]
-        gpu_matrix,
+        gpu_matrix: gpu_matrix_state,
     });
-
-    let epoch_manager = Arc::new(
-        EpochManager::new(global, runtime.row_size_bytes)
-            .map_err(|e| StartupError::new(format!("failed to initialize epoch manager: {}", e)))?,
-    );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let shutdown_waiters = install_shutdown_waiters()?;

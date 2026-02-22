@@ -20,6 +20,8 @@ use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState, ROW_SIZE_BYTES};
 #[cfg(feature = "network")]
 use morphogen_dpf::AesDpfKey;
 #[cfg(feature = "network")]
+use morphogen_server::epoch::EpochManager;
+#[cfg(feature = "network")]
 use morphogen_server::network::api::{
     batch_query_handler, AppState, BatchQueryRequest, EpochMetadata, QueryRequest, MAX_BATCH_SIZE,
 };
@@ -41,7 +43,7 @@ const DEFAULT_CHUNK_SIZE_BYTES: usize = 4 * 1024 * 1024;
 #[cfg(feature = "network")]
 const DEFAULT_BATCH_SIZES: &str = "1,2,4,8,16,32";
 #[cfg(feature = "network")]
-const DEFAULT_SEED: u64 = 0xBAD5_EED;
+const DEFAULT_SEED: u64 = 0x0BAD_5EED;
 
 #[cfg(feature = "network")]
 #[derive(Debug)]
@@ -243,10 +245,20 @@ fn build_state(
         block_number: 1,
         state_root: [0xAB; 32],
     };
-    let (_tx, rx) = watch::channel(metadata);
+    let (tx, rx) = watch::channel(metadata);
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should initialize"),
+    );
 
     Arc::new(AppState {
         global,
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(tokio::sync::Mutex::new(())),
+        admin_snapshot_token: None,
+        admin_snapshot_allow_local_paths: false,
+        admin_snapshot_allowed_hosts: vec![],
+        admin_snapshot_max_bytes: 1_073_741_824,
         row_size_bytes,
         num_rows: cfg.rows,
         seeds: [0x1234, 0x5678, 0x9ABC],

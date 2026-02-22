@@ -18,6 +18,7 @@ morphogen-core = { path = "../morphogen-core", default-features = false }
  serde_json = { version = "1", optional = true }
  hex = { version = "0.4", optional = true }
  tower = { version = "0.5", features = ["limit"], optional = true }
+ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
  tracing = { version = "0.1", optional = true }
  tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
  metrics = { version = "0.24", optional = true }
@@ -40,7 +41,7 @@ morphogen-client = { path = "../morphogen-client", default-features = false }
  profiling = []
  streaming_stores = []
 parallel = []
-network = ["axum", "tokio", "serde", "serde_json", "hex", "tower", "tracing", "tracing-subscriber", "metrics", "metrics-exporter-prometheus", "dep:clap", "dep:morphogen-gpu-dpf"]
+network = ["axum", "tokio", "serde", "serde_json", "hex", "tower", "reqwest", "tracing", "tracing-subscriber", "metrics", "metrics-exporter-prometheus", "dep:clap", "dep:morphogen-gpu-dpf"]
 verifiable-pir = ["morphogen-core/verifiable-pir"]
 fused-batch-scan = []
 

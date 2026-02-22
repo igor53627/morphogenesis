@@ -297,12 +297,47 @@ impl EpochManager {
         if !global.try_acquire_manager() {
             return Err(EpochManagerError::ManagerAlreadyExists);
         }
-        let initial_epoch = global.load().epoch_id;
+        let pending = global.load_pending();
+        if pending.row_size_bytes() != row_size_bytes {
+            global.release_manager();
+            return Err(EpochManagerError::InvalidRowSize {
+                row_size: row_size_bytes,
+            });
+        }
         Ok(Self {
             global,
-            pending: Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, initial_epoch)),
+            pending,
             #[cfg(feature = "cuda")]
             gpu_matrix: Arc::new(Mutex::new(None)),
+            merge_lock: Mutex::new(()),
+        })
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn new_with_gpu_matrix(
+        global: Arc<GlobalState>,
+        row_size_bytes: usize,
+        gpu_matrix: Arc<Mutex<Option<morphogen_gpu_dpf::storage::GpuPageMatrix>>>,
+    ) -> Result<Self, EpochManagerError> {
+        if row_size_bytes == 0 {
+            return Err(EpochManagerError::InvalidRowSize {
+                row_size: row_size_bytes,
+            });
+        }
+        if !global.try_acquire_manager() {
+            return Err(EpochManagerError::ManagerAlreadyExists);
+        }
+        let pending = global.load_pending();
+        if pending.row_size_bytes() != row_size_bytes {
+            global.release_manager();
+            return Err(EpochManagerError::InvalidRowSize {
+                row_size: row_size_bytes,
+            });
+        }
+        Ok(Self {
+            global,
+            pending,
+            gpu_matrix,
             merge_lock: Mutex::new(()),
         })
     }
@@ -350,8 +385,17 @@ impl EpochManager {
 
     /// Submit a full snapshot for a major epoch transition (e.g. seed rotation).
     ///
-    /// This replaces the current matrix entirely and resets the delta buffer.
+    /// This replaces the current matrix entirely and clears pre-rotation pending deltas.
     /// Returns the new epoch ID.
+    ///
+    /// Failure safety:
+    /// 1. On CUDA builds, the replacement GPU matrix is prepared before state mutation.
+    /// 2. Pending deltas are drained/advanced to the next epoch.
+    /// 3. The new CPU snapshot is published.
+    /// 4. The prepared GPU matrix is swapped in.
+    ///
+    /// Because fallible preparation happens before state mutation, failed submissions do not
+    /// partially rotate the serving state.
     ///
     /// # Warning
     /// This operation acquires the merge lock and blocks updates.
@@ -361,8 +405,6 @@ impl EpochManager {
         new_matrix: ChunkedMatrix,
         _new_seeds: [u64; 3],
     ) -> Result<u64, MergeError> {
-        // Future: Prepare GPU upload here (Blue/Green strategy) to minimize lock time.
-
         let _guard = self
             .merge_lock
             .lock()
@@ -374,6 +416,31 @@ impl EpochManager {
             .checked_add(1)
             .ok_or(MergeError::EpochOverflow)?;
 
+        #[cfg(feature = "cuda")]
+        let mut gpu_guard = self
+            .gpu_matrix
+            .lock()
+            .map_err(|_| MergeError::LockPoisoned)?;
+
+        #[cfg(feature = "cuda")]
+        let next_gpu_matrix = if let Some(active_gpu_matrix) = gpu_guard.as_ref() {
+            let device = active_gpu_matrix.device();
+            Some(
+                morphogen_gpu_dpf::storage::GpuPageMatrix::from_chunked_matrix(device, &new_matrix)
+                    .map_err(|err| MergeError::GpuUploadFailed {
+                        reason: err.to_string(),
+                    })?,
+            )
+        } else {
+            None
+        };
+
+        // Drain pending entries and advance pending_epoch before publishing the new snapshot.
+        // This avoids serving stale deltas after a full snapshot replacement.
+        self.pending
+            .drain_for_epoch(next_epoch_id)
+            .map_err(|_| MergeError::LockPoisoned)?;
+
         let next_snapshot = EpochSnapshot {
             epoch_id: next_epoch_id,
             matrix: Arc::new(new_matrix),
@@ -381,16 +448,11 @@ impl EpochManager {
 
         self.global.store(Arc::new(next_snapshot));
 
-        // Reset delta buffer for new epoch
-        self.pending
-            .reset_with_epoch(next_epoch_id)
-            .map_err(|_| MergeError::LockPoisoned)?;
-
         #[cfg(feature = "cuda")]
         {
-            // TODO: Implement actual GPU matrix swap.
-            // For now, we just acknowledge the transition.
-            // Real implementation requires uploading ChunkedMatrix to GpuPageMatrix.
+            if let Some(next_gpu_matrix) = next_gpu_matrix {
+                *gpu_guard = Some(next_gpu_matrix);
+            }
         }
 
         Ok(next_epoch_id)
@@ -536,6 +598,9 @@ pub enum MergeError {
         chunk_offset: usize,
         len: usize,
     },
+    GpuUploadFailed {
+        reason: String,
+    },
     /// Merge failed AND rollback also failed - entries may be lost.
     /// Contains the original merge error message and the rollback error message.
     RollbackFailed {
@@ -584,6 +649,13 @@ impl std::fmt::Display for MergeError {
                     f,
                     "offset overflow: chunk_offset {} + len {} exceeds usize::MAX",
                     chunk_offset, len
+                )
+            }
+            MergeError::GpuUploadFailed { reason } => {
+                write!(
+                    f,
+                    "gpu matrix upload failed during snapshot rotation: {}",
+                    reason
                 )
             }
             MergeError::RollbackFailed {
@@ -944,6 +1016,18 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn epoch_manager_new_with_gpu_matrix_uses_shared_lock() {
+        let global = make_global_state(0, 4);
+        let shared_gpu = Arc::new(Mutex::new(None));
+        let manager =
+            EpochManager::new_with_gpu_matrix(global, 4, shared_gpu.clone()).expect("manager");
+
+        let manager_gpu = manager.gpu_matrix();
+        assert!(Arc::ptr_eq(&manager_gpu, &shared_gpu));
+    }
+
     #[test]
     fn epoch_manager_new_returns_error_with_zero_row_size() {
         let global = make_global_state(0, 4);
@@ -1022,6 +1106,48 @@ mod tests {
     }
 
     #[test]
+    fn epoch_manager_submit_snapshot_replaces_matrix_and_clears_pending() {
+        let global = make_global_state(0, 4);
+        let manager = EpochManager::new(global, 4).unwrap();
+
+        manager.submit_update(0, vec![1, 2, 3, 4]).unwrap();
+        assert_eq!(manager.pending().len().unwrap(), 1);
+
+        let mut new_matrix = ChunkedMatrix::new(64, 16);
+        new_matrix.write_row(0, 4, &[9, 8, 7, 6]);
+
+        let next_epoch = manager
+            .submit_snapshot(new_matrix, [0xAA, 0xBB, 0xCC])
+            .expect("snapshot submit should succeed");
+
+        assert_eq!(next_epoch, 1);
+        assert_eq!(manager.current().epoch_id, 1);
+        assert_eq!(manager.pending().pending_epoch(), 1);
+        assert!(manager.pending().is_empty().unwrap());
+        assert_eq!(
+            manager.current().matrix.chunk(0).as_slice()[0..4],
+            [9, 8, 7, 6]
+        );
+    }
+
+    #[test]
+    fn epoch_manager_submit_snapshot_overflow_keeps_existing_state() {
+        let global = make_global_state(u64::MAX, 4);
+        let manager = EpochManager::new(global, 4).unwrap();
+
+        manager.submit_update(0, vec![5, 5, 5, 5]).unwrap();
+        let pending_before = manager.pending().snapshot().unwrap();
+        let epoch_before = manager.current().epoch_id;
+
+        let result = manager.submit_snapshot(ChunkedMatrix::new(64, 16), [1, 2, 3]);
+        assert!(matches!(result, Err(MergeError::EpochOverflow)));
+
+        assert_eq!(manager.current().epoch_id, epoch_before);
+        assert_eq!(manager.pending().pending_epoch(), epoch_before);
+        assert_eq!(manager.pending().snapshot().unwrap(), pending_before);
+    }
+
+    #[test]
     fn rollback_failed_error_contains_both_messages() {
         let err = MergeError::RollbackFailed {
             merge_error: "merge failed".to_string(),
@@ -1038,6 +1164,16 @@ mod tests {
             msg.contains("DATA MAY BE LOST"),
             "should warn about data loss"
         );
+    }
+
+    #[test]
+    fn gpu_upload_failed_error_contains_reason() {
+        let err = MergeError::GpuUploadFailed {
+            reason: "driver error".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("gpu matrix upload failed"));
+        assert!(msg.contains("driver error"));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use axum::{
         ws::{Message, WebSocket},
         DefaultBodyLimit, State, WebSocketUpgrade,
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -23,12 +23,15 @@ use metrics::histogram;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
+use crate::epoch::EpochManager;
 #[cfg(feature = "verifiable-pir")]
 use morphogen_core::sumcheck::SumCheckProof;
 use morphogen_core::GlobalState;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::io::AsyncReadExt;
+use tokio::sync::{watch, Mutex};
 
 #[derive(Clone, Serialize)]
 pub struct EpochMetadata {
@@ -50,6 +53,13 @@ pub struct PagePirConfig {
 #[derive(Clone)]
 pub struct AppState {
     pub global: Arc<GlobalState>,
+    pub epoch_manager: Arc<EpochManager>,
+    pub epoch_tx: watch::Sender<EpochMetadata>,
+    pub snapshot_rotation_lock: Arc<Mutex<()>>,
+    pub admin_snapshot_token: Option<String>,
+    pub admin_snapshot_allow_local_paths: bool,
+    pub admin_snapshot_allowed_hosts: Vec<String>,
+    pub admin_snapshot_max_bytes: usize,
     pub row_size_bytes: usize,
     pub num_rows: usize,
     pub seeds: [u64; 3],
@@ -213,6 +223,12 @@ pub struct BatchGpuPageQueryResult {
 pub struct AdminSnapshotRequest {
     #[serde(alias = "url")]
     pub r2_url: String,
+    #[serde(default)]
+    pub seeds: Option<[u64; 3]>,
+    #[serde(default)]
+    pub block_number: Option<u64>,
+    #[serde(default, deserialize_with = "hex_bytes::deserialize_option")]
+    pub state_root: Option<[u8; 32]>,
 }
 
 mod hex_bytes {
@@ -296,15 +312,17 @@ mod hex_bytes_array {
 
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let snapshot = state.global.load();
+    let metadata = state.epoch_rx.borrow().clone();
     Json(HealthResponse {
         status: "ok".to_string(),
         epoch_id: snapshot.epoch_id,
-        block_number: state.block_number,
+        block_number: metadata.block_number,
     })
 }
 
 pub async fn epoch_handler(State(state): State<Arc<AppState>>) -> Json<EpochMetadataResponse> {
     let snapshot = state.global.load();
+    let metadata = state.epoch_rx.borrow().clone();
     let page_pir = state.page_config.as_ref().map(|cfg| PagePirResponse {
         domain_bits: cfg.domain_bits,
         rows_per_page: cfg.rows_per_page,
@@ -313,21 +331,266 @@ pub async fn epoch_handler(State(state): State<Arc<AppState>>) -> Json<EpochMeta
     });
     Json(EpochMetadataResponse {
         epoch_id: snapshot.epoch_id,
-        num_rows: state.num_rows,
-        seeds: state.seeds,
-        block_number: state.block_number,
-        state_root: state.state_root,
+        num_rows: metadata.num_rows,
+        seeds: metadata.seeds,
+        block_number: metadata.block_number,
+        state_root: metadata.state_root,
         page_pir,
     })
+}
+
+enum SnapshotSource {
+    Http(reqwest::Url),
+    Local(PathBuf),
+}
+
+const ADMIN_SNAPSHOT_TOKEN_HEADER: &str = "x-admin-token";
+
+fn authorize_admin_snapshot(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
+    let expected = state
+        .admin_snapshot_token
+        .as_deref()
+        .ok_or(StatusCode::FORBIDDEN)?;
+    let provided = headers
+        .get(ADMIN_SNAPSHOT_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+    if provided != expected {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(())
+}
+
+fn is_allowed_snapshot_host(host: &str, allowed_hosts: &[String]) -> bool {
+    let host = host.to_ascii_lowercase();
+    allowed_hosts.iter().any(|allowed| {
+        host == *allowed
+            || host
+                .strip_suffix(allowed)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn parse_snapshot_source(
+    raw: &str,
+    allow_local_paths: bool,
+    allowed_hosts: &[String],
+) -> Result<SnapshotSource, StatusCode> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        let url = reqwest::Url::parse(trimmed).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let host = url.host_str().ok_or(StatusCode::BAD_REQUEST)?;
+        if allowed_hosts.is_empty() || !is_allowed_snapshot_host(host, allowed_hosts) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        return Ok(SnapshotSource::Http(url));
+    }
+
+    if trimmed.starts_with("file://") {
+        if !allow_local_paths {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let url = reqwest::Url::parse(trimmed).map_err(|_| StatusCode::BAD_REQUEST)?;
+        let path = url.to_file_path().map_err(|_| StatusCode::BAD_REQUEST)?;
+        return Ok(SnapshotSource::Local(path));
+    }
+
+    if trimmed.contains("://") {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if !allow_local_paths {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(SnapshotSource::Local(PathBuf::from(trimmed)))
+}
+
+async fn fetch_snapshot_bytes(
+    source: SnapshotSource,
+    max_bytes: usize,
+) -> Result<Vec<u8>, StatusCode> {
+    if max_bytes == 0 {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    match source {
+        SnapshotSource::Http(url) => {
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+                .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let mut response = client
+                .get(url)
+                .send()
+                .await
+                .map_err(|_| StatusCode::BAD_GATEWAY)?;
+            if !response.status().is_success() {
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+            if let Some(content_length) = response.content_length() {
+                if content_length == 0 {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                if content_length > max_bytes as u64 {
+                    return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                }
+            }
+
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| StatusCode::BAD_GATEWAY)?
+            {
+                if bytes.len().saturating_add(chunk.len()) > max_bytes {
+                    return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+
+            if bytes.is_empty() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Ok(bytes)
+        }
+        SnapshotSource::Local(path) => {
+            let mut file = tokio::fs::File::open(path)
+                .await
+                .map_err(|err| match err.kind() {
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput => {
+                        StatusCode::BAD_REQUEST
+                    }
+                    std::io::ErrorKind::PermissionDenied => StatusCode::FORBIDDEN,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                })?;
+
+            let mut bytes = Vec::new();
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                let read = file
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                if read == 0 {
+                    break;
+                }
+                if bytes.len().saturating_add(read) > max_bytes {
+                    return Err(StatusCode::PAYLOAD_TOO_LARGE);
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+
+            if bytes.is_empty() {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+fn decode_snapshot_matrix(
+    bytes: &[u8],
+    row_size_bytes: usize,
+    chunk_size_bytes: usize,
+) -> Result<morphogen_storage::ChunkedMatrix, StatusCode> {
+    if row_size_bytes == 0 || chunk_size_bytes == 0 {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    if bytes.is_empty() || !bytes.len().is_multiple_of(row_size_bytes) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(morphogen_storage::ChunkedMatrix::from_bytes(
+        bytes,
+        chunk_size_bytes,
+    ))
+}
+
+fn validate_snapshot_page_pir_compatibility(
+    state: &AppState,
+    matrix: &morphogen_storage::ChunkedMatrix,
+    num_rows: usize,
+) -> Result<(), StatusCode> {
+    let Some(page_config) = state.page_config.as_ref() else {
+        return Ok(());
+    };
+
+    let page_size_bytes = morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+    if !matrix.total_size_bytes().is_multiple_of(page_size_bytes) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    for chunk_idx in 0..matrix.num_chunks() {
+        if !matrix.chunk_size(chunk_idx).is_multiple_of(page_size_bytes) {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    let Some(num_pages) = 1usize.checked_shl(page_config.domain_bits as u32) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    let Some(max_rows) = num_pages.checked_mul(page_config.rows_per_page) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    if num_rows > max_rows {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    Ok(())
 }
 
 #[cfg_attr(feature = "tracing", instrument(skip(state, request)))]
 pub async fn admin_snapshot_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<AdminSnapshotRequest>,
 ) -> Result<StatusCode, StatusCode> {
-    let _ = (state, request);
-    Ok(StatusCode::NOT_IMPLEMENTED)
+    authorize_admin_snapshot(state.as_ref(), &headers)?;
+
+    let source = parse_snapshot_source(
+        &request.r2_url,
+        state.admin_snapshot_allow_local_paths,
+        &state.admin_snapshot_allowed_hosts,
+    )?;
+    let snapshot_bytes = fetch_snapshot_bytes(source, state.admin_snapshot_max_bytes).await?;
+
+    let _rotation_guard = state.snapshot_rotation_lock.lock().await;
+
+    let current = state.global.load();
+    let chunk_size_bytes = current.matrix.chunk_size_bytes();
+    let matrix = decode_snapshot_matrix(&snapshot_bytes, state.row_size_bytes, chunk_size_bytes)?;
+    let num_rows = matrix.total_size_bytes() / state.row_size_bytes;
+    if num_rows == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    validate_snapshot_page_pir_compatibility(state.as_ref(), &matrix, num_rows)?;
+
+    let current_metadata = state.epoch_rx.borrow().clone();
+    let seeds = request.seeds.unwrap_or(current_metadata.seeds);
+    let block_number = request
+        .block_number
+        .unwrap_or(current_metadata.block_number);
+    let state_root = request.state_root.unwrap_or(current_metadata.state_root);
+
+    let next_epoch_id = state
+        .epoch_manager
+        .submit_snapshot(matrix, seeds)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let metadata = EpochMetadata {
+        epoch_id: next_epoch_id,
+        num_rows,
+        seeds,
+        block_number,
+        state_root,
+    };
+    let _ = state.epoch_tx.send(metadata);
+
+    Ok(StatusCode::OK)
 }
 
 fn scan_error_to_status(e: crate::scan::ScanError) -> StatusCode {
@@ -1519,8 +1782,11 @@ pub fn create_router_with_concurrency(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderValue;
     use morphogen_core::{DeltaBuffer, EpochSnapshot};
     use morphogen_storage::ChunkedMatrix;
+    use std::fs;
+    use std::path::PathBuf;
 
     fn test_state() -> Arc<AppState> {
         let row_size_bytes = 256;
@@ -1540,9 +1806,19 @@ mod tests {
             block_number: 12345678,
             state_root: [0xAB; 32],
         };
-        let (_tx, rx) = watch::channel(initial);
+        let (tx, rx) = watch::channel(initial);
+        let epoch_manager = Arc::new(
+            EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+        );
         Arc::new(AppState {
             global,
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(Mutex::new(())),
+            admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_snapshot_allow_local_paths: true,
+            admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+            admin_snapshot_max_bytes: 16 * 1024 * 1024,
             row_size_bytes,
             num_rows: 100_000,
             seeds: [0x1234, 0x5678, 0x9ABC],
@@ -1733,6 +2009,332 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admin_snapshot_rejects_empty_url() {
+        let state = test_state();
+        let request = AdminSnapshotRequest {
+            r2_url: "   ".to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+        let headers = admin_snapshot_headers();
+
+        let result = admin_snapshot_handler(State(state.clone()), headers, Json(request)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_rejects_missing_token() {
+        let state = test_state();
+        let request = AdminSnapshotRequest {
+            r2_url: "/tmp/snapshot.bin".to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+
+        let result =
+            admin_snapshot_handler(State(state.clone()), HeaderMap::new(), Json(request)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_rejects_local_path_when_disabled() {
+        let mut config = (*test_state()).clone();
+        config.admin_snapshot_allow_local_paths = false;
+        let state = Arc::new(config);
+        let request = AdminSnapshotRequest {
+            r2_url: "/tmp/snapshot.bin".to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+
+        let result =
+            admin_snapshot_handler(State(state), admin_snapshot_headers(), Json(request)).await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_rejects_http_host_not_allowlisted() {
+        let request = AdminSnapshotRequest {
+            r2_url: "https://not-allowed.invalid/snapshot.bin".to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+
+        let result =
+            admin_snapshot_handler(State(test_state()), admin_snapshot_headers(), Json(request))
+                .await;
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_ingests_local_matrix_and_rotates_epoch() {
+        let row_size_bytes = 4usize;
+        let num_rows = 8usize;
+        let matrix_size = row_size_bytes * num_rows;
+
+        let matrix = Arc::new(ChunkedMatrix::new(matrix_size, 8));
+        let snapshot = EpochSnapshot {
+            epoch_id: 7,
+            matrix,
+        };
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 7));
+        pending
+            .push(0, vec![0xAA, 0xBB, 0xCC, 0xDD])
+            .expect("seed pending delta");
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+
+        let initial = EpochMetadata {
+            epoch_id: 7,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 10,
+            state_root: [0x11; 32],
+        };
+        let (tx, rx) = watch::channel(initial);
+        let epoch_manager = Arc::new(
+            EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+        );
+        let state = Arc::new(AppState {
+            global: global.clone(),
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(Mutex::new(())),
+            admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_snapshot_allow_local_paths: true,
+            admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+            admin_snapshot_max_bytes: 16 * 1024 * 1024,
+            row_size_bytes,
+            num_rows,
+            seeds: [1, 2, 3],
+            block_number: 10,
+            state_root: [0x11; 32],
+            epoch_rx: rx,
+            page_config: None,
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
+        });
+
+        let path = unique_temp_path("admin_snapshot.bin");
+        let expected = vec![0x5Au8; matrix_size];
+        fs::write(&path, &expected).expect("write snapshot fixture");
+
+        let request = AdminSnapshotRequest {
+            r2_url: path.to_string_lossy().to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+        let result = admin_snapshot_handler(
+            State(state.clone()),
+            admin_snapshot_headers(),
+            Json(request),
+        )
+        .await;
+
+        let _ = fs::remove_file(&path);
+
+        assert!(
+            result.is_ok(),
+            "snapshot ingestion should succeed: {result:?}"
+        );
+        assert_eq!(result.unwrap(), StatusCode::OK);
+        assert_eq!(state.global.load().epoch_id, 8);
+        let metadata = state.epoch_rx.borrow().clone();
+        assert_eq!(metadata.epoch_id, 8);
+        assert_eq!(metadata.num_rows, num_rows);
+        assert!(
+            state
+                .global
+                .load_pending()
+                .is_empty()
+                .expect("pending buffer readable"),
+            "rotation should clear pending deltas"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_rejects_misaligned_matrix_size() {
+        let state = test_state();
+        let epoch_before = state.global.load().epoch_id;
+        let pending_before = state
+            .global
+            .load_pending()
+            .snapshot()
+            .expect("pending snapshot");
+        let path = unique_temp_path("admin_snapshot_misaligned.bin");
+        fs::write(&path, [0u8; 3]).expect("write misaligned snapshot fixture");
+
+        let request = AdminSnapshotRequest {
+            r2_url: path.to_string_lossy().to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+
+        let result = admin_snapshot_handler(
+            State(state.clone()),
+            admin_snapshot_headers(),
+            Json(request),
+        )
+        .await;
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.global.load().epoch_id, epoch_before);
+        assert_eq!(
+            state
+                .global
+                .load_pending()
+                .snapshot()
+                .expect("pending snapshot"),
+            pending_before
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_snapshot_rejects_page_pir_incompatible_row_capacity() {
+        let row_size_bytes = 256usize;
+        let initial_rows = 8usize;
+        let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * initial_rows, 4096));
+        let snapshot = EpochSnapshot {
+            epoch_id: 5,
+            matrix,
+        };
+        let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 5));
+        let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+        let (tx, rx) = watch::channel(EpochMetadata {
+            epoch_id: 5,
+            num_rows: initial_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+        });
+        let epoch_manager = Arc::new(
+            EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+        );
+        let state = Arc::new(AppState {
+            global: global.clone(),
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(Mutex::new(())),
+            admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_snapshot_allow_local_paths: true,
+            admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+            admin_snapshot_max_bytes: 16 * 1024 * 1024,
+            row_size_bytes,
+            num_rows: initial_rows,
+            seeds: [1, 2, 3],
+            block_number: 1,
+            state_root: [0; 32],
+            epoch_rx: rx,
+            page_config: Some(PagePirConfig {
+                domain_bits: 2,   // 4 pages
+                rows_per_page: 2, // max_rows = 8
+                prg_keys: [[0x11; 16], [0x22; 16]],
+            }),
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
+        });
+
+        let epoch_before = state.global.load().epoch_id;
+        let path = unique_temp_path("admin_snapshot_page_capacity.bin");
+        // 4096 bytes -> 16 rows at 256 bytes/row, exceeding max_rows=8.
+        fs::write(&path, vec![0xCDu8; 4096]).expect("write snapshot fixture");
+
+        let request = AdminSnapshotRequest {
+            r2_url: path.to_string_lossy().to_string(),
+            seeds: None,
+            block_number: None,
+            state_root: None,
+        };
+        let result = admin_snapshot_handler(
+            State(state.clone()),
+            admin_snapshot_headers(),
+            Json(request),
+        )
+        .await;
+        let _ = fs::remove_file(&path);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+        assert_eq!(state.global.load().epoch_id, epoch_before);
+    }
+
+    #[tokio::test]
+    async fn fetch_snapshot_bytes_rejects_http_redirects() {
+        use std::future::IntoFuture;
+
+        let app = Router::new().route(
+            "/redirect",
+            get(|| async {
+                axum::http::Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(
+                        axum::http::header::LOCATION,
+                        "https://example.com/snapshot.bin",
+                    )
+                    .body(axum::body::Body::empty())
+                    .expect("build redirect response")
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        let url = reqwest::Url::parse(&format!("http://{addr}/redirect")).expect("url");
+        let result = fetch_snapshot_bytes(SnapshotSource::Http(url), 1024).await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn fetch_snapshot_bytes_rejects_oversize_chunked_http_body() {
+        use futures_util::stream;
+        use std::convert::Infallible;
+        use std::future::IntoFuture;
+
+        let app = Router::new().route(
+            "/stream",
+            get(|| async {
+                let chunks = vec![
+                    Ok::<axum::body::Bytes, Infallible>(axum::body::Bytes::from(vec![0u8; 8])),
+                    Ok::<axum::body::Bytes, Infallible>(axum::body::Bytes::from(vec![0u8; 8])),
+                ];
+                axum::body::Body::from_stream(stream::iter(chunks))
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        let url = reqwest::Url::parse(&format!("http://{addr}/stream")).expect("url");
+        let result = fetch_snapshot_bytes(SnapshotSource::Http(url), 10).await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
     async fn batch_query_too_large_returns_bad_request() {
         let state = test_state();
         let queries: Vec<QueryRequest> = (0..MAX_BATCH_SIZE + 1)
@@ -1757,6 +2359,23 @@ mod tests {
         let result = batch_query_handler(State(state), Json(request)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{}_{}", nanos, name))
+    }
+
+    fn admin_snapshot_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            ADMIN_SNAPSHOT_TOKEN_HEADER,
+            HeaderValue::from_static("test-admin-token"),
+        );
+        headers
     }
 
     #[tokio::test]

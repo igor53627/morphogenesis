@@ -122,6 +122,25 @@ impl ChunkedMatrix {
         }
     }
 
+    pub fn from_bytes(bytes: &[u8], chunk_size_bytes: usize) -> Self {
+        let mut matrix = Self::new(bytes.len(), chunk_size_bytes);
+        if bytes.is_empty() {
+            return matrix;
+        }
+
+        let mut offset = 0usize;
+        for chunk_index in 0..matrix.num_chunks() {
+            let size = matrix.chunk_size(chunk_index);
+            let chunk = Arc::get_mut(&mut matrix.chunks[chunk_index])
+                .expect("matrix chunks should be uniquely owned during construction");
+            chunk
+                .as_mut_slice()
+                .copy_from_slice(&bytes[offset..offset + size]);
+            offset += size;
+        }
+        matrix
+    }
+
     pub fn write_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
         use std::io::Write;
         let mut file = std::fs::File::create(path)?;
@@ -129,5 +148,25 @@ impl ChunkedMatrix {
             file.write_all(chunk.as_slice())?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChunkedMatrix;
+
+    #[test]
+    fn from_bytes_preserves_input_across_chunk_boundaries() {
+        let bytes: Vec<u8> = (0u8..32u8).collect();
+        let matrix = ChunkedMatrix::from_bytes(&bytes, 10);
+
+        let mut roundtrip = Vec::new();
+        for index in 0..matrix.num_chunks() {
+            roundtrip.extend_from_slice(matrix.chunk(index).as_slice());
+        }
+
+        assert_eq!(roundtrip, bytes);
+        assert_eq!(matrix.total_size_bytes(), bytes.len());
+        assert_eq!(matrix.chunk_size_bytes(), 10);
     }
 }
