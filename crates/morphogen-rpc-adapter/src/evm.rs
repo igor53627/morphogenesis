@@ -71,6 +71,30 @@ fn validate_block_tag(block_tag: &Value) -> Result<String, String> {
 
 /// Fetch block header fields from upstream for the EVM block env.
 /// `block_tag` must be a pre-validated tag string (from `validate_block_tag`).
+fn configured_cancun_block() -> Option<u64> {
+    std::env::var("MORPHOGEN_CANCUN_BLOCK")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
+fn infer_is_cancun_or_later(
+    block_result: &Value,
+    block_number: u64,
+    fallback_cancun_block: Option<u64>,
+) -> bool {
+    let has_blob_fields = block_result
+        .get("blobGasUsed")
+        .is_some_and(|v| !v.is_null())
+        || block_result
+            .get("excessBlobGas")
+            .is_some_and(|v| !v.is_null());
+    if has_blob_fields {
+        return true;
+    }
+
+    fallback_cancun_block.is_some_and(|fork_block| block_number >= fork_block)
+}
+
 async fn fetch_block_info(
     client: &reqwest::Client,
     upstream_url: &str,
@@ -121,12 +145,15 @@ async fn fetch_block_info(
         u64::from_str_radix(hex, 16).map_err(|e| format!("invalid block field '{}': {}", field, e))
     };
 
+    let number = parse_hex_u64("number")?;
+    let timestamp = parse_hex_u64("timestamp")?;
+    let gas_limit = parse_hex_u64("gasLimit")?;
+
     Ok(BlockInfo {
-        number: parse_hex_u64("number")?,
-        timestamp: parse_hex_u64("timestamp")?,
-        gas_limit: parse_hex_u64("gasLimit")?,
-        is_cancun_or_later: result.get("blobGasUsed").is_some_and(|v| !v.is_null())
-            || result.get("excessBlobGas").is_some_and(|v| !v.is_null()),
+        number,
+        timestamp,
+        gas_limit,
+        is_cancun_or_later: infer_is_cancun_or_later(result, number, configured_cancun_block()),
     })
 }
 
@@ -889,6 +916,30 @@ mod tests {
         assert!(validate_block_tag(&json!(1)).is_err());
         assert!(validate_block_tag(&json!(true)).is_err());
         assert!(validate_block_tag(&json!([1, 2])).is_err());
+    }
+
+    #[test]
+    fn infer_is_cancun_or_later_detects_blob_fields() {
+        let block = json!({
+            "blobGasUsed": "0x0"
+        });
+        assert!(infer_is_cancun_or_later(&block, 10, None));
+    }
+
+    #[test]
+    fn infer_is_cancun_or_later_is_false_without_blob_fields_or_fallback() {
+        let block = json!({
+            "blobGasUsed": null,
+            "excessBlobGas": null
+        });
+        assert!(!infer_is_cancun_or_later(&block, 10, None));
+    }
+
+    #[test]
+    fn infer_is_cancun_or_later_uses_fallback_schedule() {
+        let block = json!({});
+        assert!(!infer_is_cancun_or_later(&block, 99, Some(100)));
+        assert!(infer_is_cancun_or_later(&block, 100, Some(100)));
     }
 
     #[test]
