@@ -341,6 +341,103 @@ async fn parse_log_filter_for_rpc(
     .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))
 }
 
+async fn handle_eth_get_logs(
+    raw: Vec<Value>,
+    state: Arc<AdapterState>,
+) -> Result<Value, ErrorObjectOwned> {
+    if raw.len() != 1 {
+        return Err(ErrorObjectOwned::owned(
+            -32602,
+            format!("expected 1 param (filter object), got {}", raw.len()),
+            None::<()>,
+        ));
+    }
+    let filter_obj = &raw[0];
+
+    // If blockHash is present, proxy to upstream (out of scope for cache)
+    if filter_obj.get("blockHash").is_some() {
+        fail_closed_if_fallback_disabled(
+            state.args.fallback_to_upstream,
+            "eth_getLogs by blockHash not supported without upstream fallback",
+        )?;
+        record_privacy_degrading_fallback(
+            state.as_ref(),
+            "eth_getLogs",
+            "block_hash_filter_not_supported_locally",
+        );
+        return proxy_to_upstream(
+            &state.args.upstream,
+            &state.http_client,
+            "eth_getLogs",
+            Value::Array(raw),
+        )
+        .await;
+    }
+
+    let cache_latest = state.block_cache.read().await.latest_block();
+    let filter = parse_log_filter_for_rpc(
+        filter_obj,
+        cache_latest,
+        &state.http_client,
+        &state.args.upstream,
+    )
+    .await?;
+
+    // Check cache coverage
+    let cache = state.block_cache.read().await;
+    if cache.has_block_range(filter.from_block, filter.to_block) {
+        let logs = cache.get_logs(&filter);
+        info!(
+            from = filter.from_block,
+            to = filter.to_block,
+            matched = logs.len(),
+            "Serving eth_getLogs from cache (private)"
+        );
+        Ok(Value::Array(logs))
+    } else {
+        drop(cache);
+        fail_closed_if_fallback_disabled(
+            state.args.fallback_to_upstream,
+            "requested log range not fully cached",
+        )?;
+        record_privacy_degrading_fallback(state.as_ref(), "eth_getLogs", "range_not_fully_cached");
+        proxy_to_upstream(
+            &state.args.upstream,
+            &state.http_client,
+            "eth_getLogs",
+            Value::Array(raw),
+        )
+        .await
+    }
+}
+
+async fn handle_eth_new_filter(
+    raw: Vec<Value>,
+    state: Arc<AdapterState>,
+) -> Result<Value, ErrorObjectOwned> {
+    if raw.len() != 1 {
+        return Err(ErrorObjectOwned::owned(
+            -32602,
+            format!("expected 1 param (filter object), got {}", raw.len()),
+            None::<()>,
+        ));
+    }
+    let filter_obj = &raw[0];
+
+    let cache_latest = state.block_cache.read().await.latest_block();
+    let filter = parse_log_filter_for_rpc(
+        filter_obj,
+        cache_latest,
+        &state.http_client,
+        &state.args.upstream,
+    )
+    .await?;
+
+    let id = state.block_cache.write().await.create_log_filter(filter);
+    info!("Created private log filter {}", id);
+    Ok(Value::String(id))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -995,74 +1092,7 @@ async fn main() -> Result<()> {
         let request_span = telemetry::rpc_server_span("eth_getLogs", &extensions);
         async move {
             let raw: Vec<Value> = params.parse()?;
-            if raw.len() != 1 {
-                return Err(ErrorObjectOwned::owned(
-                    -32602,
-                    format!("expected 1 param (filter object), got {}", raw.len()),
-                    None::<()>,
-                ));
-            }
-            let filter_obj = &raw[0];
-
-            // If blockHash is present, proxy to upstream (out of scope for cache)
-            if filter_obj.get("blockHash").is_some() {
-                fail_closed_if_fallback_disabled(
-                    state.args.fallback_to_upstream,
-                    "eth_getLogs by blockHash not supported without upstream fallback",
-                )?;
-                record_privacy_degrading_fallback(
-                    state.as_ref(),
-                    "eth_getLogs",
-                    "block_hash_filter_not_supported_locally",
-                );
-                return proxy_to_upstream(
-                    &state.args.upstream,
-                    &state.http_client,
-                    "eth_getLogs",
-                    Value::Array(raw),
-                )
-                .await;
-            }
-
-            let cache_latest = state.block_cache.read().await.latest_block();
-            let filter = parse_log_filter_for_rpc(
-                filter_obj,
-                cache_latest,
-                &state.http_client,
-                &state.args.upstream,
-            )
-            .await?;
-
-            // Check cache coverage
-            let cache = state.block_cache.read().await;
-            if cache.has_block_range(filter.from_block, filter.to_block) {
-                let logs = cache.get_logs(&filter);
-                info!(
-                    from = filter.from_block,
-                    to = filter.to_block,
-                    matched = logs.len(),
-                    "Serving eth_getLogs from cache (private)"
-                );
-                Ok::<Value, ErrorObjectOwned>(Value::Array(logs))
-            } else {
-                drop(cache);
-                fail_closed_if_fallback_disabled(
-                    state.args.fallback_to_upstream,
-                    "requested log range not fully cached",
-                )?;
-                record_privacy_degrading_fallback(
-                    state.as_ref(),
-                    "eth_getLogs",
-                    "range_not_fully_cached",
-                );
-                proxy_to_upstream(
-                    &state.args.upstream,
-                    &state.http_client,
-                    "eth_getLogs",
-                    Value::Array(raw),
-                )
-                .await
-            }
+            handle_eth_get_logs(raw, state.clone()).await
         }
         .instrument(request_span)
     })?;
@@ -1072,27 +1102,7 @@ async fn main() -> Result<()> {
         let request_span = telemetry::rpc_server_span("eth_newFilter", &extensions);
         async move {
             let raw: Vec<Value> = params.parse()?;
-            if raw.len() != 1 {
-                return Err(ErrorObjectOwned::owned(
-                    -32602,
-                    format!("expected 1 param (filter object), got {}", raw.len()),
-                    None::<()>,
-                ));
-            }
-            let filter_obj = &raw[0];
-
-            let cache_latest = state.block_cache.read().await.latest_block();
-            let filter = parse_log_filter_for_rpc(
-                filter_obj,
-                cache_latest,
-                &state.http_client,
-                &state.args.upstream,
-            )
-            .await?;
-
-            let id = state.block_cache.write().await.create_log_filter(filter);
-            info!("Created private log filter {}", id);
-            Ok::<Value, ErrorObjectOwned>(Value::String(id))
+            handle_eth_new_filter(raw, state.clone()).await
         }
         .instrument(request_span)
     })?;
@@ -1339,18 +1349,58 @@ fn upstream_invalid_json_error(method: &str) -> ErrorObjectOwned {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_latest_for_filter, fail_closed_if_fallback_disabled,
-        has_nonempty_state_overrides, next_privacy_degraded_fallback_count,
+        effective_latest_for_filter, fail_closed_if_fallback_disabled, handle_eth_get_logs,
+        handle_eth_new_filter, has_nonempty_state_overrides, next_privacy_degraded_fallback_count,
         parse_log_filter_for_rpc, proxy_to_upstream, upstream_invalid_json_error,
         validate_privacy_fallback_config, AdapterEnvironment, Args, DROPPED_METHODS,
         PASSTHROUGH_METHODS, RELAY_METHODS,
     };
     use serde_json::{json, Value};
     use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::RwLock;
     use tokio::time::sleep;
+
+    async fn read_http_request_body(socket: &mut TcpStream) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            let read = socket.read(&mut chunk).await.expect("read request bytes");
+            assert!(read > 0, "request closed before headers were received");
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(idx) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break idx + 4;
+            }
+        };
+
+        let headers = std::str::from_utf8(&buffer[..header_end]).expect("request headers utf8");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let mut body = buffer[header_end..].to_vec();
+        while body.len() < content_length {
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .expect("read request body bytes");
+            assert!(read > 0, "request closed before body was fully read");
+            body.extend_from_slice(&chunk[..read]);
+        }
+        body.truncate(content_length);
+        body
+    }
 
     async fn spawn_mock_upstream(responses: Vec<Value>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -1378,6 +1428,64 @@ mod tests {
         });
 
         format!("http://{}", addr)
+    }
+
+    async fn spawn_mock_upstream_script(script: Vec<(&'static str, Value)>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scripted mock upstream listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        tokio::spawn(async move {
+            for (expected_method, response) in script {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let body = read_http_request_body(&mut socket).await;
+                let req_json: Value =
+                    serde_json::from_slice(&body).expect("valid json-rpc request");
+                let method = req_json
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>");
+                assert_eq!(method, expected_method, "unexpected upstream method order");
+
+                let body = response.to_string();
+                let response_text = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket
+                    .write_all(response_text.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+
+        format!("http://{}", addr)
+    }
+
+    fn make_test_state(upstream: String, fallback_to_upstream: bool) -> Arc<super::AdapterState> {
+        let mut args = Args::default_for_tests();
+        args.upstream = upstream;
+        args.fallback_to_upstream = fallback_to_upstream;
+
+        Arc::new(super::AdapterState {
+            args,
+            http_client: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("build test http client"),
+            pir_client: Arc::new(super::PirClient::new(
+                "http://localhost:3000".to_string(),
+                "http://localhost:3001".to_string(),
+            )),
+            code_resolver: Arc::new(super::CodeResolver::new(
+                "http://localhost:8080/mainnet_compact.dict".to_string(),
+                "http://localhost:8080/cas".to_string(),
+            )),
+            block_cache: Arc::new(RwLock::new(super::BlockCache::new())),
+            privacy_degraded_fallback_total: AtomicU64::new(0),
+        })
     }
 
     #[test]
@@ -1739,5 +1847,95 @@ mod tests {
 
         assert_eq!(filter.from_block, 130);
         assert_eq!(filter.to_block, 130);
+    }
+
+    #[tokio::test]
+    async fn eth_get_logs_handler_accepts_stale_cache_safe_range_with_fallback() {
+        let upstream = spawn_mock_upstream_script(vec![
+            (
+                "eth_getBlockByNumber",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": { "number": "0x78" }
+                }),
+            ),
+            (
+                "eth_getLogs",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": []
+                }),
+            ),
+        ])
+        .await;
+        let state = make_test_state(upstream, true);
+        {
+            let mut cache = state.block_cache.write().await;
+            cache.insert_block(100, [0x01; 32], vec![], vec![]);
+        }
+
+        let result = handle_eth_get_logs(vec![json!({"fromBlock": "safe"})], state)
+            .await
+            .expect("handler should not reject stale-cache safe range");
+
+        assert_eq!(result, Value::Array(vec![]));
+    }
+
+    #[tokio::test]
+    async fn eth_new_filter_handler_accepts_stale_cache_finalized_latest_range() {
+        let upstream = spawn_mock_upstream_script(vec![(
+            "eth_getBlockByNumber",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "number": "0x82" }
+            }),
+        )])
+        .await;
+        let state = make_test_state(upstream, false);
+        {
+            let mut cache = state.block_cache.write().await;
+            cache.insert_block(100, [0x01; 32], vec![], vec![]);
+        }
+
+        let filter_id = handle_eth_new_filter(
+            vec![json!({"fromBlock": "finalized", "toBlock": "latest"})],
+            state.clone(),
+        )
+        .await
+        .expect("handler should accept stale-cache finalized/latest filter")
+        .as_str()
+        .expect("filter id string")
+        .to_string();
+
+        let early_log = json!({"address": "0x1111", "topics": [], "data": "0x"});
+        let finalized_log = json!({"address": "0x2222", "topics": [], "data": "0x"});
+        {
+            let mut cache = state.block_cache.write().await;
+            cache.insert_block(
+                110,
+                [0x02; 32],
+                vec![],
+                vec![([0xAA; 32], json!({"logs": [early_log]}))],
+            );
+            cache.insert_block(
+                130,
+                [0x03; 32],
+                vec![],
+                vec![([0xBB; 32], json!({"logs": [finalized_log.clone()]}))],
+            );
+        }
+
+        let logs = state
+            .block_cache
+            .write()
+            .await
+            .get_filter_logs(&filter_id)
+            .expect("filter exists")
+            .expect("log filter");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0], finalized_log);
     }
 }
