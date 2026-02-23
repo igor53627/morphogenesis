@@ -50,16 +50,17 @@ fn validate_named_or_hex_block_tag(s: &str) -> Result<String, String> {
     if NAMED_BLOCK_TAGS.contains(&s) {
         return Ok(s.to_string());
     }
+    validate_hex_block_quantity(s)
+}
+
+fn validate_hex_block_quantity(s: &str) -> Result<String, String> {
     // Must be a hex quantity: "0x" followed by one or more hex digits
-    let hex = s.strip_prefix("0x").ok_or_else(|| {
-        format!(
-            "invalid block tag '{}': expected named tag or hex quantity",
-            s
-        )
-    })?;
+    let hex = s
+        .strip_prefix("0x")
+        .ok_or_else(|| format!("invalid block quantity '{}': expected hex quantity", s))?;
     if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!(
-            "invalid block tag '{}': expected named tag or hex quantity",
+            "invalid block quantity '{}': expected hex quantity",
             s
         ));
     }
@@ -101,9 +102,7 @@ fn validate_eip_1898_block_tag(block_tag: &Value) -> Result<BlockSpecifier, Stri
         let number = number_val
             .as_str()
             .ok_or_else(|| "EIP-1898 'blockNumber' must be a string".to_string())?;
-        return Ok(BlockSpecifier::Tag(validate_named_or_hex_block_tag(
-            number,
-        )?));
+        return Ok(BlockSpecifier::Tag(validate_hex_block_quantity(number)?));
     }
 
     let hash = block_hash
@@ -928,6 +927,74 @@ mod tests {
     use super::*;
     use revm::context_interface::result::{HaltReason, SuccessReason};
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_http_request_body(socket: &mut TcpStream) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            let read = socket.read(&mut chunk).await.expect("read request bytes");
+            assert!(read > 0, "request closed before headers were received");
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(idx) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break idx + 4;
+            }
+        };
+
+        let headers = std::str::from_utf8(&buffer[..header_end]).expect("request headers utf8");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let mut body = buffer[header_end..].to_vec();
+        while body.len() < content_length {
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .expect("read request body bytes");
+            assert!(read > 0, "request closed before body was fully read");
+            body.extend_from_slice(&chunk[..read]);
+        }
+        body.truncate(content_length);
+        body
+    }
+
+    async fn spawn_mock_upstream(responses: Vec<Value>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock upstream listener");
+        let addr = listener.local_addr().expect("mock listener addr");
+
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.expect("accept mock request");
+                let body = read_http_request_body(&mut socket).await;
+                let _: Value = serde_json::from_slice(&body).expect("json rpc request");
+
+                let response_body = response.to_string();
+                let response_text = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                socket
+                    .write_all(response_text.as_bytes())
+                    .await
+                    .expect("write mock response");
+            }
+        });
+
+        format!("http://{}", addr)
+    }
 
     #[test]
     fn parse_address_with_0x_prefix() {
@@ -1103,11 +1170,132 @@ mod tests {
         assert!(
             validate_block_tag(&json!({"blockNumber": "0x1", "requireCanonical": true})).is_err()
         );
+        assert!(validate_block_tag(&json!({"blockNumber": "latest"})).is_err());
         assert!(validate_block_tag(&json!({"blockHash": "0x1234"})).is_err());
         assert!(validate_block_tag(
             &json!({"blockHash": format!("0x{}", "aa".repeat(32)), "requireCanonical": "yes"})
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_block_info_require_canonical_accepts_matching_hash() {
+        let hash = format!("0x{}", "11".repeat(32));
+        let upstream = spawn_mock_upstream(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "number": "0x10",
+                    "timestamp": "0x20",
+                    "gasLimit": "0x30",
+                    "hash": hash
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "number": "0x10",
+                    "timestamp": "0x20",
+                    "gasLimit": "0x30",
+                    "hash": format!("0x{}", "11".repeat(32))
+                }
+            }),
+        ])
+        .await;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let info = fetch_block_info(
+            &client,
+            &upstream,
+            &BlockSpecifier::Hash {
+                hash: format!("0x{}", "11".repeat(32)),
+                require_canonical: true,
+            },
+        )
+        .await
+        .expect("canonical hash should resolve");
+
+        assert_eq!(info.number, 16);
+        assert_eq!(info.timestamp, 32);
+        assert_eq!(info.gas_limit, 48);
+    }
+
+    #[tokio::test]
+    async fn fetch_block_info_require_canonical_rejects_mismatch() {
+        let upstream = spawn_mock_upstream(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "number": "0x10",
+                    "timestamp": "0x20",
+                    "gasLimit": "0x30",
+                    "hash": format!("0x{}", "22".repeat(32))
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "number": "0x10",
+                    "timestamp": "0x20",
+                    "gasLimit": "0x30",
+                    "hash": format!("0x{}", "33".repeat(32))
+                }
+            }),
+        ])
+        .await;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let err = fetch_block_info(
+            &client,
+            &upstream,
+            &BlockSpecifier::Hash {
+                hash: format!("0x{}", "22".repeat(32)),
+                require_canonical: true,
+            },
+        )
+        .await
+        .err()
+        .expect("mismatched canonical hash should fail");
+
+        assert!(err.contains("not canonical"));
+    }
+
+    #[tokio::test]
+    async fn fetch_block_info_hash_null_result_is_error() {
+        let upstream = spawn_mock_upstream(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": null
+        })])
+        .await;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let err = fetch_block_info(
+            &client,
+            &upstream,
+            &BlockSpecifier::Hash {
+                hash: format!("0x{}", "44".repeat(32)),
+                require_canonical: false,
+            },
+        )
+        .await
+        .err()
+        .expect("null block result should fail");
+
+        assert!(err.contains("No block result from upstream"));
     }
 
     #[test]

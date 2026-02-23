@@ -240,6 +240,79 @@ fn has_nonempty_state_overrides(raw_params: &[Value]) -> Result<bool, ErrorObjec
     Ok(!overrides_obj.is_empty())
 }
 
+fn filter_uses_tag(filter_obj: &Value, tag: &str) -> bool {
+    ["fromBlock", "toBlock"].iter().any(|field| {
+        filter_obj
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == tag)
+    })
+}
+
+fn parse_block_number_quantity(number: &str, tag: &str) -> Result<u64, ErrorObjectOwned> {
+    let hex = number.strip_prefix("0x").ok_or_else(|| {
+        ErrorObjectOwned::owned(
+            -32000,
+            format!("Invalid {} block number format from upstream", tag),
+            None::<()>,
+        )
+    })?;
+    u64::from_str_radix(hex, 16).map_err(|_| {
+        ErrorObjectOwned::owned(
+            -32000,
+            format!("Invalid {} block number value from upstream", tag),
+            None::<()>,
+        )
+    })
+}
+
+async fn resolve_block_tag_height(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    tag: &'static str,
+) -> Result<u64, ErrorObjectOwned> {
+    let result = proxy_to_upstream(
+        upstream_url,
+        client,
+        "eth_getBlockByNumber",
+        serde_json::json!([tag, false]),
+    )
+    .await?;
+
+    let number = result
+        .get("number")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ErrorObjectOwned::owned(
+                -32000,
+                format!("Missing {} block number from upstream", tag),
+                None::<()>,
+            )
+        })?;
+
+    parse_block_number_quantity(number, tag)
+}
+
+async fn resolve_filter_finality_heights(
+    filter_obj: &Value,
+    client: &reqwest::Client,
+    upstream_url: &str,
+) -> Result<(Option<u64>, Option<u64>), ErrorObjectOwned> {
+    let safe_height = if filter_uses_tag(filter_obj, "safe") {
+        Some(resolve_block_tag_height(client, upstream_url, "safe").await?)
+    } else {
+        None
+    };
+
+    let finalized_height = if filter_uses_tag(filter_obj, "finalized") {
+        Some(resolve_block_tag_height(client, upstream_url, "finalized").await?)
+    } else {
+        None
+    };
+
+    Ok((safe_height, finalized_height))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -924,9 +997,20 @@ async fn main() -> Result<()> {
             }
 
             let latest = state.block_cache.read().await.latest_block();
+            let (safe_height, finalized_height) = resolve_filter_finality_heights(
+                filter_obj,
+                &state.http_client,
+                &state.args.upstream,
+            )
+            .await?;
 
-            let filter = block_cache::parse_log_filter_object(filter_obj, latest)
-                .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
+            let filter = block_cache::parse_log_filter_object(
+                filter_obj,
+                latest,
+                safe_height,
+                finalized_height,
+            )
+            .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
 
             // Check cache coverage
             let cache = state.block_cache.read().await;
@@ -977,9 +1061,20 @@ async fn main() -> Result<()> {
             let filter_obj = &raw[0];
 
             let latest = state.block_cache.read().await.latest_block();
+            let (safe_height, finalized_height) = resolve_filter_finality_heights(
+                filter_obj,
+                &state.http_client,
+                &state.args.upstream,
+            )
+            .await?;
 
-            let filter = block_cache::parse_log_filter_object(filter_obj, latest)
-                .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
+            let filter = block_cache::parse_log_filter_object(
+                filter_obj,
+                latest,
+                safe_height,
+                finalized_height,
+            )
+            .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
 
             let id = state.block_cache.write().await.create_log_filter(filter);
             info!("Created private log filter {}", id);
