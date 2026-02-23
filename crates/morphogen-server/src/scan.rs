@@ -430,7 +430,7 @@ pub fn scan_pages_consistent_with_max_retries(
     })
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", all(test, feature = "network")))]
 pub fn scan_delta_for_gpu(
     delta: &DeltaBuffer,
     keys: &[morphogen_gpu_dpf::dpf::ChaChaKey; 3],
@@ -453,6 +453,13 @@ pub fn scan_delta_for_gpu(
         return Ok(results); // Should probably be error, but safe
     }
     let rows_per_page = page_size_bytes / row_size;
+    if rows_per_page == 0 {
+        return Err(ScanError::MatrixNotAligned {
+            total_bytes: page_size_bytes,
+            unit_size: row_size,
+            remainder: page_size_bytes % row_size,
+        });
+    }
 
     for entry in entries {
         let page_idx = entry.row_idx / rows_per_page;
@@ -1903,5 +1910,36 @@ mod concurrency_tests {
         for page in &pages {
             assert_eq!(page.len(), page_size);
         }
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn scan_delta_for_gpu_rejects_row_size_larger_than_page_size() {
+        use super::{scan_delta_for_gpu, ScanError};
+        use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+        use morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+
+        let row_size_bytes = PAGE_SIZE_BYTES + 1;
+        let delta = DeltaBuffer::new(row_size_bytes);
+        delta
+            .push(0, vec![0xAB; row_size_bytes])
+            .expect("delta push should succeed");
+
+        let params = ChaChaParams::new(8).expect("params should be valid");
+        let (k0, _) = generate_chacha_dpf_keys(&params, 0).expect("keygen should succeed");
+        let (k1, _) = generate_chacha_dpf_keys(&params, 1).expect("keygen should succeed");
+        let (k2, _) = generate_chacha_dpf_keys(&params, 2).expect("keygen should succeed");
+        let keys = [k0, k1, k2];
+
+        let err = scan_delta_for_gpu(&delta, &keys, PAGE_SIZE_BYTES)
+            .expect_err("row_size > page_size must return an error");
+        assert!(matches!(
+            err,
+            ScanError::MatrixNotAligned {
+                total_bytes,
+                unit_size,
+                ..
+            } if total_bytes == PAGE_SIZE_BYTES && unit_size == row_size_bytes
+        ));
     }
 }

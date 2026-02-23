@@ -1,5 +1,7 @@
 use clap::Parser;
-use reth_adapter::{build_matrix, RowScheme};
+#[cfg(not(feature = "reth"))]
+use reth_adapter::build_matrix;
+use reth_adapter::RowScheme;
 use std::path::PathBuf;
 
 #[derive(Parser)]

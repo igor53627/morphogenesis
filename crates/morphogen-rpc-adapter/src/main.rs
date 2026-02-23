@@ -223,6 +223,21 @@ fn fail_closed_if_fallback_disabled(
     }
 }
 
+fn fail_closed_invalid_params_if_fallback_disabled(
+    fallback_to_upstream: bool,
+    invalid_params_message: &'static str,
+) -> Result<(), ErrorObjectOwned> {
+    if fallback_to_upstream {
+        Ok(())
+    } else {
+        Err(ErrorObjectOwned::owned(
+            -32602,
+            invalid_params_message,
+            None::<()>,
+        ))
+    }
+}
+
 fn has_nonempty_state_overrides(raw_params: &[Value]) -> Result<bool, ErrorObjectOwned> {
     let Some(overrides) = raw_params.get(2) else {
         return Ok(false);
@@ -238,6 +253,180 @@ fn has_nonempty_state_overrides(raw_params: &[Value]) -> Result<bool, ErrorObjec
         ));
     };
     Ok(!overrides_obj.is_empty())
+}
+
+fn register_eth_estimate_gas_method(module: &mut RpcModule<AdapterState>) -> Result<()> {
+    module.register_async_method("eth_estimateGas", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_estimateGas", &extensions);
+        async move {
+            // Accept 1-3 params: (call_obj, [block_tag], [state_overrides])
+            let raw: Vec<Value> = params.parse()?;
+            if raw.is_empty() || raw.len() > 3 {
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    format!("expected 1-3 params, got {}", raw.len()),
+                    None::<()>,
+                ));
+            }
+
+            // Non-empty state overrides are unsupported in the local EVM path.
+            // Use fail-closed behavior unless degraded upstream fallback is explicitly enabled.
+            let has_overrides = has_nonempty_state_overrides(&raw)?;
+            if has_overrides {
+                fail_closed_invalid_params_if_fallback_disabled(
+                    state.args.fallback_to_upstream,
+                    "state overrides not supported for local eth_estimateGas",
+                )?;
+                record_privacy_degrading_fallback(
+                    state.as_ref(),
+                    "eth_estimateGas",
+                    "state_overrides_not_supported_locally",
+                );
+                return proxy_to_upstream(
+                    &state.args.upstream,
+                    &state.http_client,
+                    "eth_estimateGas",
+                    Value::Array(raw),
+                )
+                .await;
+            }
+
+            let call_params = &raw[0];
+            let block = raw
+                .get(1)
+                .cloned()
+                .unwrap_or(Value::String("latest".into()));
+
+            info!("Private eth_estimateGas via local EVM");
+
+            match evm::execute_eth_estimate_gas(
+                Arc::clone(&state.pir_client),
+                Arc::clone(&state.code_resolver),
+                state.http_client.clone(),
+                state.args.upstream.clone(),
+                call_params,
+                &block,
+            )
+            .await
+            {
+                Ok(gas) => Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", gas))),
+                Err(evm::EthCallError::InvalidParams(msg)) => {
+                    Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
+                }
+                Err(evm::EthCallError::Internal(e)) => {
+                    error!("Private eth_estimateGas failed: {}", e);
+                    if state.args.fallback_to_upstream {
+                        record_privacy_degrading_fallback(
+                            state.as_ref(),
+                            "eth_estimateGas",
+                            "local_evm_failed",
+                        );
+                        return proxy_to_upstream(
+                            &state.args.upstream,
+                            &state.http_client,
+                            "eth_estimateGas",
+                            Value::Array(raw),
+                        )
+                        .await;
+                    }
+                    Err(ErrorObjectOwned::owned(
+                        -32000,
+                        format!("eth_estimateGas failed: {}", e),
+                        None::<()>,
+                    ))
+                }
+            }
+        }
+        .instrument(request_span)
+    })?;
+    Ok(())
+}
+
+fn register_eth_create_access_list_method(module: &mut RpcModule<AdapterState>) -> Result<()> {
+    module.register_async_method("eth_createAccessList", |params, state, extensions| {
+        let request_span = telemetry::rpc_server_span("eth_createAccessList", &extensions);
+        async move {
+            // Accept 1-3 params: (call_obj, [block_tag], [state_overrides])
+            let raw: Vec<Value> = params.parse()?;
+            if raw.is_empty() || raw.len() > 3 {
+                return Err(ErrorObjectOwned::owned(
+                    -32602,
+                    format!("expected 1-3 params, got {}", raw.len()),
+                    None::<()>,
+                ));
+            }
+
+            // Non-empty state overrides are unsupported in the local EVM path.
+            // Use fail-closed behavior unless degraded upstream fallback is explicitly enabled.
+            let has_overrides = has_nonempty_state_overrides(&raw)?;
+            if has_overrides {
+                fail_closed_invalid_params_if_fallback_disabled(
+                    state.args.fallback_to_upstream,
+                    "state overrides not supported for local eth_createAccessList",
+                )?;
+                record_privacy_degrading_fallback(
+                    state.as_ref(),
+                    "eth_createAccessList",
+                    "state_overrides_not_supported_locally",
+                );
+                return proxy_to_upstream(
+                    &state.args.upstream,
+                    &state.http_client,
+                    "eth_createAccessList",
+                    Value::Array(raw),
+                )
+                .await;
+            }
+
+            let call_params = &raw[0];
+            let block = raw
+                .get(1)
+                .cloned()
+                .unwrap_or(Value::String("latest".into()));
+
+            info!("Private eth_createAccessList via local EVM");
+
+            match evm::execute_eth_create_access_list(
+                Arc::clone(&state.pir_client),
+                Arc::clone(&state.code_resolver),
+                state.http_client.clone(),
+                state.args.upstream.clone(),
+                call_params,
+                &block,
+            )
+            .await
+            {
+                Ok(result) => Ok::<Value, ErrorObjectOwned>(result),
+                Err(evm::EthCallError::InvalidParams(msg)) => {
+                    Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
+                }
+                Err(evm::EthCallError::Internal(e)) => {
+                    error!("Private eth_createAccessList failed: {}", e);
+                    if state.args.fallback_to_upstream {
+                        record_privacy_degrading_fallback(
+                            state.as_ref(),
+                            "eth_createAccessList",
+                            "local_evm_failed",
+                        );
+                        return proxy_to_upstream(
+                            &state.args.upstream,
+                            &state.http_client,
+                            "eth_createAccessList",
+                            Value::Array(raw),
+                        )
+                        .await;
+                    }
+                    Err(ErrorObjectOwned::owned(
+                        -32000,
+                        format!("eth_createAccessList failed: {}", e),
+                        None::<()>,
+                    ))
+                }
+            }
+        }
+        .instrument(request_span)
+    })?;
+    Ok(())
 }
 
 fn filter_uses_tag(filter_obj: &Value, tag: &str) -> bool {
@@ -858,175 +1047,9 @@ async fn main() -> Result<()> {
         .instrument(request_span)
     })?;
 
-    // Register eth_estimateGas (Private via local EVM execution)
-    module.register_async_method("eth_estimateGas", |params, state, extensions| {
-        let request_span = telemetry::rpc_server_span("eth_estimateGas", &extensions);
-        async move {
-            // Accept 1-3 params: (call_obj, [block_tag], [state_overrides])
-            let raw: Vec<Value> = params.parse()?;
-            if raw.is_empty() || raw.len() > 3 {
-                return Err(ErrorObjectOwned::owned(
-                    -32602,
-                    format!("expected 1-3 params, got {}", raw.len()),
-                    None::<()>,
-                ));
-            }
-
-            // Non-empty state overrides are unsupported in the local EVM path.
-            // Use fail-closed behavior unless degraded upstream fallback is explicitly enabled.
-            let has_overrides = has_nonempty_state_overrides(&raw)?;
-            if has_overrides {
-                fail_closed_if_fallback_disabled(
-                    state.args.fallback_to_upstream,
-                    "state overrides not supported for local eth_estimateGas",
-                )?;
-                record_privacy_degrading_fallback(
-                    state.as_ref(),
-                    "eth_estimateGas",
-                    "state_overrides_not_supported_locally",
-                );
-                return proxy_to_upstream(
-                    &state.args.upstream,
-                    &state.http_client,
-                    "eth_estimateGas",
-                    Value::Array(raw),
-                )
-                .await;
-            }
-
-            let call_params = &raw[0];
-            let block = raw
-                .get(1)
-                .cloned()
-                .unwrap_or(Value::String("latest".into()));
-
-            info!("Private eth_estimateGas via local EVM");
-
-            match evm::execute_eth_estimate_gas(
-                Arc::clone(&state.pir_client),
-                Arc::clone(&state.code_resolver),
-                state.http_client.clone(),
-                state.args.upstream.clone(),
-                call_params,
-                &block,
-            )
-            .await
-            {
-                Ok(gas) => Ok::<Value, ErrorObjectOwned>(Value::String(format!("0x{:x}", gas))),
-                Err(evm::EthCallError::InvalidParams(msg)) => {
-                    Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
-                }
-                Err(evm::EthCallError::Internal(e)) => {
-                    error!("Private eth_estimateGas failed: {}", e);
-                    if state.args.fallback_to_upstream {
-                        record_privacy_degrading_fallback(
-                            state.as_ref(),
-                            "eth_estimateGas",
-                            "local_evm_failed",
-                        );
-                        return proxy_to_upstream(
-                            &state.args.upstream,
-                            &state.http_client,
-                            "eth_estimateGas",
-                            Value::Array(raw),
-                        )
-                        .await;
-                    }
-                    Err(ErrorObjectOwned::owned(
-                        -32000,
-                        format!("eth_estimateGas failed: {}", e),
-                        None::<()>,
-                    ))
-                }
-            }
-        }
-        .instrument(request_span)
-    })?;
-
-    // Register eth_createAccessList (Private via local EVM execution)
-    module.register_async_method("eth_createAccessList", |params, state, extensions| {
-        let request_span = telemetry::rpc_server_span("eth_createAccessList", &extensions);
-        async move {
-            // Accept 1-3 params: (call_obj, [block_tag], [state_overrides])
-            let raw: Vec<Value> = params.parse()?;
-            if raw.is_empty() || raw.len() > 3 {
-                return Err(ErrorObjectOwned::owned(
-                    -32602,
-                    format!("expected 1-3 params, got {}", raw.len()),
-                    None::<()>,
-                ));
-            }
-
-            // Non-empty state overrides are unsupported in the local EVM path.
-            // Use fail-closed behavior unless degraded upstream fallback is explicitly enabled.
-            let has_overrides = has_nonempty_state_overrides(&raw)?;
-            if has_overrides {
-                fail_closed_if_fallback_disabled(
-                    state.args.fallback_to_upstream,
-                    "state overrides not supported for local eth_createAccessList",
-                )?;
-                record_privacy_degrading_fallback(
-                    state.as_ref(),
-                    "eth_createAccessList",
-                    "state_overrides_not_supported_locally",
-                );
-                return proxy_to_upstream(
-                    &state.args.upstream,
-                    &state.http_client,
-                    "eth_createAccessList",
-                    Value::Array(raw),
-                )
-                .await;
-            }
-
-            let call_params = &raw[0];
-            let block = raw
-                .get(1)
-                .cloned()
-                .unwrap_or(Value::String("latest".into()));
-
-            info!("Private eth_createAccessList via local EVM");
-
-            match evm::execute_eth_create_access_list(
-                Arc::clone(&state.pir_client),
-                Arc::clone(&state.code_resolver),
-                state.http_client.clone(),
-                state.args.upstream.clone(),
-                call_params,
-                &block,
-            )
-            .await
-            {
-                Ok(result) => Ok::<Value, ErrorObjectOwned>(result),
-                Err(evm::EthCallError::InvalidParams(msg)) => {
-                    Err(ErrorObjectOwned::owned(-32602, msg, None::<()>))
-                }
-                Err(evm::EthCallError::Internal(e)) => {
-                    error!("Private eth_createAccessList failed: {}", e);
-                    if state.args.fallback_to_upstream {
-                        record_privacy_degrading_fallback(
-                            state.as_ref(),
-                            "eth_createAccessList",
-                            "local_evm_failed",
-                        );
-                        return proxy_to_upstream(
-                            &state.args.upstream,
-                            &state.http_client,
-                            "eth_createAccessList",
-                            Value::Array(raw),
-                        )
-                        .await;
-                    }
-                    Err(ErrorObjectOwned::owned(
-                        -32000,
-                        format!("eth_createAccessList failed: {}", e),
-                        None::<()>,
-                    ))
-                }
-            }
-        }
-        .instrument(request_span)
-    })?;
+    // Register eth_estimateGas and eth_createAccessList (Private via local EVM execution)
+    register_eth_estimate_gas_method(&mut module)?;
+    register_eth_create_access_list_method(&mut module)?;
 
     // Register eth_getTransactionByHash (Private via block cache, upstream fallback)
     module.register_async_method("eth_getTransactionByHash", |params, state, extensions| {
@@ -1364,7 +1387,8 @@ fn upstream_invalid_json_error(method: &str) -> ErrorObjectOwned {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_latest_for_filter, fail_closed_if_fallback_disabled, handle_eth_get_logs,
+        effective_latest_for_filter, fail_closed_if_fallback_disabled,
+        fail_closed_invalid_params_if_fallback_disabled, handle_eth_get_logs,
         handle_eth_new_filter, has_nonempty_state_overrides, next_privacy_degraded_fallback_count,
         parse_log_filter_for_rpc, proxy_to_upstream, upstream_invalid_json_error,
         validate_privacy_fallback_config, AdapterEnvironment, Args, DROPPED_METHODS,
@@ -1541,6 +1565,49 @@ mod tests {
 
         let handle = server.start(module);
         (format!("http://{}", addr), handle)
+    }
+
+    async fn start_state_override_rpc_server(
+        state: Arc<super::AdapterState>,
+    ) -> (String, jsonrpsee::server::ServerHandle) {
+        let server = super::Server::builder()
+            .build(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("parse addr"),
+            )
+            .await
+            .expect("build test rpc server");
+        let addr = server.local_addr().expect("server local addr");
+        let mut module = super::RpcModule::from_arc(state);
+
+        super::register_eth_estimate_gas_method(&mut module).expect("register eth_estimateGas");
+        super::register_eth_create_access_list_method(&mut module)
+            .expect("register eth_createAccessList");
+
+        let handle = server.start(module);
+        (format!("http://{}", addr), handle)
+    }
+
+    async fn send_rpc_request(rpc_url: &str, method: &str, params: Value) -> Value {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        client
+            .post(rpc_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": method,
+                "params": params
+            }))
+            .send()
+            .await
+            .expect("send rpc request")
+            .json::<Value>()
+            .await
+            .expect("parse rpc response")
     }
 
     #[test]
@@ -1780,6 +1847,20 @@ mod tests {
     }
 
     #[test]
+    fn state_override_gate_returns_invalid_params_when_fallback_disabled() {
+        let err = fail_closed_invalid_params_if_fallback_disabled(false, "unsupported")
+            .expect_err("state overrides gate should reject when fallback is disabled");
+        assert_eq!(err.code(), -32602);
+        assert_eq!(err.message(), "unsupported");
+    }
+
+    #[test]
+    fn state_override_gate_allows_when_fallback_enabled() {
+        fail_closed_invalid_params_if_fallback_disabled(true, "unused")
+            .expect("state overrides gate should allow when fallback is enabled");
+    }
+
+    #[test]
     fn state_overrides_presence_is_deterministic() {
         assert!(!has_nonempty_state_overrides(&[]).expect("empty params"));
         assert!(!has_nonempty_state_overrides(&[json!({})]).expect("single param"));
@@ -1805,6 +1886,101 @@ mod tests {
         let err = has_nonempty_state_overrides(&[json!({}), json!("latest"), json!(42)])
             .expect_err("non-object state overrides should fail");
         assert_eq!(err.code(), -32602);
+    }
+
+    #[tokio::test]
+    async fn estimate_gas_state_overrides_return_invalid_params_when_fallback_disabled() {
+        let state = make_test_state("http://127.0.0.1:9".to_string(), false);
+        let (rpc_url, server_handle) = start_state_override_rpc_server(state).await;
+
+        let response = send_rpc_request(
+            &rpc_url,
+            "eth_estimateGas",
+            json!([{}, "latest", {"0xabc": {"balance": "0x1"}}]),
+        )
+        .await;
+
+        assert_eq!(response.get("result"), None);
+        assert_eq!(
+            response
+                .get("error")
+                .and_then(|err| err.get("code"))
+                .and_then(Value::as_i64),
+            Some(-32602)
+        );
+        assert_eq!(
+            response
+                .get("error")
+                .and_then(|err| err.get("message"))
+                .and_then(Value::as_str),
+            Some("state overrides not supported for local eth_estimateGas")
+        );
+
+        server_handle.stop().expect("stop test rpc server");
+        server_handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn create_access_list_state_overrides_return_invalid_params_when_fallback_disabled() {
+        let state = make_test_state("http://127.0.0.1:9".to_string(), false);
+        let (rpc_url, server_handle) = start_state_override_rpc_server(state).await;
+
+        let response = send_rpc_request(
+            &rpc_url,
+            "eth_createAccessList",
+            json!([{}, "latest", {"0xabc": {"balance": "0x1"}}]),
+        )
+        .await;
+
+        assert_eq!(response.get("result"), None);
+        assert_eq!(
+            response
+                .get("error")
+                .and_then(|err| err.get("code"))
+                .and_then(Value::as_i64),
+            Some(-32602)
+        );
+        assert_eq!(
+            response
+                .get("error")
+                .and_then(|err| err.get("message"))
+                .and_then(Value::as_str),
+            Some("state overrides not supported for local eth_createAccessList")
+        );
+
+        server_handle.stop().expect("stop test rpc server");
+        server_handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn state_overrides_proxy_upstream_when_fallback_enabled() {
+        for method in ["eth_estimateGas", "eth_createAccessList"] {
+            let (upstream, upstream_handle) = spawn_mock_upstream_script(vec![(
+                method,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": "0x1234"
+                }),
+            )])
+            .await;
+            let state = make_test_state(upstream, true);
+            let (rpc_url, server_handle) = start_state_override_rpc_server(state).await;
+
+            let params = json!([{}, "latest", {"0xabc": {"balance": "0x1"}}]);
+            let response = send_rpc_request(&rpc_url, method, params).await;
+
+            assert_eq!(response.get("result"), Some(&json!("0x1234")));
+            assert!(response.get("error").is_none());
+
+            server_handle.stop().expect("stop test rpc server");
+            server_handle.stopped().await;
+
+            tokio::time::timeout(Duration::from_secs(5), upstream_handle)
+                .await
+                .expect("upstream capture should complete")
+                .expect("upstream capture task should succeed");
+        }
     }
 
     #[test]

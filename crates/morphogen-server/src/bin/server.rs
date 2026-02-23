@@ -409,6 +409,16 @@ impl RuntimeConfig {
         )
         .unwrap_or(false);
 
+        if !disable_page_pir {
+            let page_size_bytes = morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+            if row_size_bytes > page_size_bytes {
+                return Err(StartupError::new(format!(
+                    "row_size_bytes ({}) must be <= PAGE_SIZE_BYTES ({}) when page PIR is enabled",
+                    row_size_bytes, page_size_bytes
+                )));
+            }
+        }
+
         let page_config = if disable_page_pir {
             None
         } else {
@@ -1245,6 +1255,42 @@ mod runtime_config_tests {
             .expect("config should resolve");
         assert_eq!(resolved.bind_addr, "127.0.0.1:3000".parse().unwrap());
         assert!(resolved.bind_addr_is_default);
+    }
+
+    #[test]
+    fn resolve_config_rejects_row_size_larger_than_gpu_page_size() {
+        use morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+
+        let mut cli = CliArgs::default_for_tests();
+        cli.environment = Some("dev".to_string());
+        cli.allow_synthetic_matrix = true;
+        cli.row_size_bytes = Some(PAGE_SIZE_BYTES + 1);
+        cli.chunk_size_bytes = Some((PAGE_SIZE_BYTES + 1) * 2);
+        cli.matrix_size_bytes = Some((PAGE_SIZE_BYTES + 1) * 8);
+
+        let err = RuntimeConfig::resolve(cli, EnvConfig::default_for_tests(), None)
+            .expect_err("row size larger than PAGE_SIZE_BYTES should be rejected");
+        assert!(err.to_string().contains("PAGE_SIZE_BYTES"));
+    }
+
+    #[test]
+    fn resolve_config_allows_large_row_size_when_page_pir_disabled() {
+        use morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+
+        let mut cli = CliArgs::default_for_tests();
+        cli.environment = Some("dev".to_string());
+        cli.allow_synthetic_matrix = true;
+        cli.disable_page_pir = true;
+        cli.row_size_bytes = Some(PAGE_SIZE_BYTES + 1);
+        cli.chunk_size_bytes = Some((PAGE_SIZE_BYTES + 1) * 2);
+        cli.matrix_size_bytes = Some((PAGE_SIZE_BYTES + 1) * 8);
+
+        let resolved = RuntimeConfig::resolve(cli, EnvConfig::default_for_tests(), None)
+            .expect("row size larger than PAGE_SIZE_BYTES should be allowed when page PIR is disabled");
+        assert!(
+            resolved.page_config.is_none(),
+            "page PIR should be disabled in resolved runtime config"
+        );
     }
 
     #[test]
