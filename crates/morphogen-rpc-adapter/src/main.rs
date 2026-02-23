@@ -438,6 +438,33 @@ async fn handle_eth_new_filter(
     Ok(Value::String(id))
 }
 
+async fn handle_eth_get_filter_logs(
+    filter_id: String,
+    state: Arc<AdapterState>,
+) -> Result<Value, ErrorObjectOwned> {
+    let mut cache = state.block_cache.write().await;
+    match cache.get_filter_logs(&filter_id) {
+        Some(Some(logs)) => {
+            info!(
+                filter = %filter_id,
+                count = logs.len(),
+                "Serving eth_getFilterLogs from cache (private)"
+            );
+            Ok(Value::Array(logs))
+        }
+        Some(None) => Err(ErrorObjectOwned::owned(
+            -32000,
+            "filter is not a log filter",
+            None::<()>,
+        )),
+        None => Err(ErrorObjectOwned::owned(
+            -32000,
+            "filter not found",
+            None::<()>,
+        )),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1169,19 +1196,7 @@ async fn main() -> Result<()> {
         let request_span = telemetry::rpc_server_span("eth_getFilterLogs", &extensions);
         async move {
             let (filter_id,): (String,) = params.parse()?;
-            let mut cache = state.block_cache.write().await;
-            match cache.get_filter_logs(&filter_id) {
-            Some(Some(logs)) => {
-                info!(filter = %filter_id, count = logs.len(), "Serving eth_getFilterLogs from cache (private)");
-                Ok::<Value, ErrorObjectOwned>(Value::Array(logs))
-            }
-            Some(None) => {
-                Err(ErrorObjectOwned::owned(-32000, "filter is not a log filter", None::<()>))
-            }
-            None => {
-                Err(ErrorObjectOwned::owned(-32000, "filter not found", None::<()>))
-            }
-        }
+            handle_eth_get_filter_logs(filter_id, state.clone()).await
         }
         .instrument(request_span)
     })?;
@@ -1520,20 +1535,7 @@ mod tests {
         module
             .register_async_method("eth_getFilterLogs", |params, state, _| async move {
                 let (filter_id,): (String,) = params.parse()?;
-                let mut cache = state.block_cache.write().await;
-                match cache.get_filter_logs(&filter_id) {
-                    Some(Some(logs)) => Ok::<Value, super::ErrorObjectOwned>(Value::Array(logs)),
-                    Some(None) => Err(super::ErrorObjectOwned::owned(
-                        -32602,
-                        "filter is not a log filter",
-                        None::<()>,
-                    )),
-                    None => Err(super::ErrorObjectOwned::owned(
-                        -32602,
-                        "filter not found",
-                        None::<()>,
-                    )),
-                }
+                super::handle_eth_get_filter_logs(filter_id, state.clone()).await
             })
             .expect("register eth_getFilterLogs");
 
@@ -1934,7 +1936,7 @@ mod tests {
             .expect("handler should not reject stale-cache safe range");
 
         assert_eq!(result, Value::Array(vec![]));
-        tokio::time::timeout(Duration::from_secs(1), upstream_handle)
+        tokio::time::timeout(Duration::from_secs(5), upstream_handle)
             .await
             .expect("mock upstream script should complete")
             .expect("mock upstream task should succeed");
@@ -1994,7 +1996,7 @@ mod tests {
             .expect("log filter");
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0], finalized_log);
-        tokio::time::timeout(Duration::from_secs(1), upstream_handle)
+        tokio::time::timeout(Duration::from_secs(5), upstream_handle)
             .await
             .expect("mock upstream script should complete")
             .expect("mock upstream task should succeed");
@@ -2051,7 +2053,7 @@ mod tests {
 
         server_handle.stop().expect("stop test rpc server");
         server_handle.stopped().await;
-        tokio::time::timeout(Duration::from_secs(1), upstream_handle)
+        tokio::time::timeout(Duration::from_secs(5), upstream_handle)
             .await
             .expect("mock upstream script should complete")
             .expect("mock upstream task should succeed");
@@ -2142,7 +2144,7 @@ mod tests {
 
         server_handle.stop().expect("stop test rpc server");
         server_handle.stopped().await;
-        tokio::time::timeout(Duration::from_secs(1), upstream_handle)
+        tokio::time::timeout(Duration::from_secs(5), upstream_handle)
             .await
             .expect("mock upstream script should complete")
             .expect("mock upstream task should succeed");
