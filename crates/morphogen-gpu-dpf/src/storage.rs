@@ -137,6 +137,11 @@ impl GpuPageMatrix {
     pub fn as_slice(&self) -> &CudaSlice<u8> {
         &self.data
     }
+
+    /// Access the underlying CUDA device for matrix replacement workflows.
+    pub fn device(&self) -> Arc<CudaDevice> {
+        Arc::clone(&self.device)
+    }
 }
 
 #[cfg(not(feature = "cuda"))]

@@ -30,6 +30,8 @@ use morphogen_gpu_dpf::kernel::MAX_DOMAIN_BITS;
 #[cfg(feature = "network")]
 use morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
 #[cfg(feature = "network")]
+use morphogen_server::epoch::EpochManager;
+#[cfg(feature = "network")]
 use morphogen_server::network::api::{
     page_query_gpu_batch_handler, page_query_gpu_handler, AppState, BatchGpuPageQueryRequest,
     EpochMetadata, GpuPageQueryRequest, MAX_BATCH_SIZE,
@@ -440,7 +442,11 @@ fn build_state(cfg: &BenchConfig) -> LoadedBenchState {
         block_number: 1,
         state_root: [0xAB; 32],
     };
-    let (_tx, rx) = watch::channel(metadata);
+    let (tx, rx) = watch::channel(metadata);
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), DEFAULT_ROW_SIZE_BYTES)
+            .expect("epoch manager should initialize"),
+    );
 
     #[cfg(feature = "cuda")]
     let (gpu_scanner, gpu_matrix) = {
@@ -472,6 +478,16 @@ fn build_state(cfg: &BenchConfig) -> LoadedBenchState {
     LoadedBenchState {
         state: Arc::new(AppState {
             global,
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(tokio::sync::Mutex::new(())),
+            admin_snapshot_token: None,
+            admin_mtls_subject_header: axum::http::HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: vec![],
+            admin_mtls_trust_proxy_headers: false,
+            admin_snapshot_allow_local_paths: false,
+            admin_snapshot_allowed_hosts: vec![],
+            admin_snapshot_max_bytes: 1_073_741_824,
             row_size_bytes: DEFAULT_ROW_SIZE_BYTES,
             num_rows,
             seeds: [0x1234, 0x5678, 0x9ABC],

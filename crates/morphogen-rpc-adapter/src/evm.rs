@@ -37,40 +37,170 @@ struct BlockInfo {
 /// Known named block tags per Ethereum JSON-RPC specification.
 const NAMED_BLOCK_TAGS: &[&str] = &["latest", "earliest", "pending", "safe", "finalized"];
 
-/// Validate block tag: must be a named tag, hex quantity ("0x..."), or null.
-/// Rejects EIP-1898 object forms since PIR state is epoch-based.
-fn validate_block_tag(block_tag: &Value) -> Result<String, String> {
-    if block_tag.is_null() {
-        return Ok("latest".to_string());
-    }
-    let s = block_tag.as_str().ok_or_else(|| {
-        if block_tag.is_object() {
-            "EIP-1898 object form not supported".to_string()
-        } else {
-            "block parameter must be a string or null".to_string()
-        }
-    })?;
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockSpecifier {
+    Tag(String),
+    Hash {
+        hash: String,
+        require_canonical: bool,
+    },
+}
+
+fn validate_named_or_hex_block_tag(s: &str) -> Result<String, String> {
     if NAMED_BLOCK_TAGS.contains(&s) {
         return Ok(s.to_string());
     }
+    validate_hex_block_quantity(s)
+}
+
+fn validate_hex_block_quantity(s: &str) -> Result<String, String> {
     // Must be a hex quantity: "0x" followed by one or more hex digits
-    let hex = s.strip_prefix("0x").ok_or_else(|| {
-        format!(
-            "invalid block tag '{}': expected named tag or hex quantity",
-            s
-        )
-    })?;
+    let hex = s
+        .strip_prefix("0x")
+        .ok_or_else(|| format!("invalid block quantity '{}': expected hex quantity", s))?;
     if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(format!(
-            "invalid block tag '{}': expected named tag or hex quantity",
+            "invalid block quantity '{}': expected hex quantity",
             s
         ));
     }
-    Ok(s.to_string())
+    Ok(format!("0x{}", hex.to_lowercase()))
 }
 
-/// Fetch block header fields from upstream for the EVM block env.
-/// `block_tag` must be a pre-validated tag string (from `validate_block_tag`).
+fn normalize_block_hash(hash: &str) -> Result<String, String> {
+    let hex = hash.strip_prefix("0x").unwrap_or(hash);
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("EIP-1898 'blockHash' must be a 32-byte hex string".to_string());
+    }
+    Ok(format!("0x{}", hex.to_lowercase()))
+}
+
+fn validate_eip_1898_block_tag(block_tag: &Value) -> Result<BlockSpecifier, String> {
+    let obj = block_tag
+        .as_object()
+        .ok_or_else(|| "block parameter must be a string, object, or null".to_string())?;
+    let block_number = obj.get("blockNumber");
+    let block_hash = obj.get("blockHash");
+
+    if block_number.is_some() == block_hash.is_some() {
+        return Err(
+            "EIP-1898 object must include exactly one of 'blockNumber' or 'blockHash'".to_string(),
+        );
+    }
+
+    let require_canonical = match obj.get("requireCanonical") {
+        None => false,
+        Some(v) => v
+            .as_bool()
+            .ok_or_else(|| "EIP-1898 'requireCanonical' must be a boolean".to_string())?,
+    };
+
+    if let Some(number_val) = block_number {
+        if require_canonical {
+            return Err("EIP-1898 'requireCanonical' is only valid with 'blockHash'".to_string());
+        }
+        let number = number_val
+            .as_str()
+            .ok_or_else(|| "EIP-1898 'blockNumber' must be a string".to_string())?;
+        return Ok(BlockSpecifier::Tag(validate_hex_block_quantity(number)?));
+    }
+
+    let hash = block_hash
+        .and_then(Value::as_str)
+        .ok_or_else(|| "EIP-1898 'blockHash' must be a 32-byte hex string".to_string())?;
+    Ok(BlockSpecifier::Hash {
+        hash: normalize_block_hash(hash)?,
+        require_canonical,
+    })
+}
+
+/// Validate block tag: must be a named tag, hex quantity ("0x..."), EIP-1898 object, or null.
+fn validate_block_tag(block_tag: &Value) -> Result<BlockSpecifier, String> {
+    if block_tag.is_null() {
+        return Ok(BlockSpecifier::Tag("latest".to_string()));
+    }
+    if let Some(tag) = block_tag.as_str() {
+        return Ok(BlockSpecifier::Tag(validate_named_or_hex_block_tag(tag)?));
+    }
+    if block_tag.is_object() {
+        return validate_eip_1898_block_tag(block_tag);
+    }
+    Err("block parameter must be a string, object, or null".to_string())
+}
+
+fn parse_block_info_from_result(result: &Value) -> Result<BlockInfo, String> {
+    let parse_hex_u64 = |field: &str| -> Result<u64, String> {
+        let s = result
+            .get(field)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("missing block field '{}'", field))?;
+        let hex = s.strip_prefix("0x").unwrap_or(s);
+        u64::from_str_radix(hex, 16).map_err(|e| format!("invalid block field '{}': {}", field, e))
+    };
+
+    let number = parse_hex_u64("number")?;
+    let timestamp = parse_hex_u64("timestamp")?;
+    let gas_limit = parse_hex_u64("gasLimit")?;
+
+    Ok(BlockInfo {
+        number,
+        timestamp,
+        gas_limit,
+        is_cancun_or_later: infer_is_cancun_or_later(result, number, configured_cancun_block()),
+    })
+}
+
+fn parse_block_hash_from_result(result: &Value) -> Result<String, String> {
+    let hash = result
+        .get("hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "missing block field 'hash'".to_string())?;
+    normalize_block_hash(hash)
+}
+
+async fn fetch_block_result(
+    client: &reqwest::Client,
+    upstream_url: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params
+    });
+
+    let resp = client
+        .post(upstream_url)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|e| format!("Block info fetch: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Block info HTTP {}", resp.status()));
+    }
+
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Block info parse: {}", e))?;
+
+    if let Some(err) = json.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("unknown");
+        return Err(format!("Block info RPC error: {}", msg));
+    }
+
+    json.get("result")
+        .filter(|v| !v.is_null())
+        .cloned()
+        .ok_or_else(|| "No block result from upstream".to_string())
+}
+
 fn parse_u64_env(var_name: &str, raw: &str) -> Option<u64> {
     let parsed = if let Some(hex) = raw.strip_prefix("0x") {
         u64::from_str_radix(hex, 16)
@@ -119,63 +249,50 @@ fn infer_is_cancun_or_later(
 async fn fetch_block_info(
     client: &reqwest::Client,
     upstream_url: &str,
-    block_tag: &str,
+    block_specifier: &BlockSpecifier,
 ) -> Result<BlockInfo, String> {
-    let request = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_getBlockByNumber",
-        "params": [block_tag, false]
-    });
+    match block_specifier {
+        BlockSpecifier::Tag(tag) => {
+            let block = fetch_block_result(
+                client,
+                upstream_url,
+                "eth_getBlockByNumber",
+                serde_json::json!([tag, false]),
+            )
+            .await?;
+            parse_block_info_from_result(&block)
+        }
+        BlockSpecifier::Hash {
+            hash,
+            require_canonical,
+        } => {
+            let block = fetch_block_result(
+                client,
+                upstream_url,
+                "eth_getBlockByHash",
+                serde_json::json!([hash, false]),
+            )
+            .await?;
+            let info = parse_block_info_from_result(&block)?;
 
-    let resp = client
-        .post(upstream_url)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| format!("Block info fetch: {}", e))?;
+            if *require_canonical {
+                let canonical_tag = format!("0x{:x}", info.number);
+                let canonical_block = fetch_block_result(
+                    client,
+                    upstream_url,
+                    "eth_getBlockByNumber",
+                    serde_json::json!([canonical_tag, false]),
+                )
+                .await?;
+                let canonical_hash = parse_block_hash_from_result(&canonical_block)?;
+                if !canonical_hash.eq_ignore_ascii_case(hash) {
+                    return Err("EIP-1898 blockHash is not canonical".to_string());
+                }
+            }
 
-    if !resp.status().is_success() {
-        return Err(format!("Block info HTTP {}", resp.status()));
+            Ok(info)
+        }
     }
-
-    let json: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Block info parse: {}", e))?;
-
-    if let Some(err) = json.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(|m| m.as_str())
-            .unwrap_or("unknown");
-        return Err(format!("Block info RPC error: {}", msg));
-    }
-
-    let result = json
-        .get("result")
-        .filter(|v| !v.is_null())
-        .ok_or("No block result from upstream")?;
-
-    let parse_hex_u64 = |field: &str| -> Result<u64, String> {
-        let s = result
-            .get(field)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("missing block field '{}'", field))?;
-        let hex = s.strip_prefix("0x").unwrap_or(s);
-        u64::from_str_radix(hex, 16).map_err(|e| format!("invalid block field '{}': {}", field, e))
-    };
-
-    let number = parse_hex_u64("number")?;
-    let timestamp = parse_hex_u64("timestamp")?;
-    let gas_limit = parse_hex_u64("gasLimit")?;
-
-    Ok(BlockInfo {
-        number,
-        timestamp,
-        gas_limit,
-        is_cancun_or_later: infer_is_cancun_or_later(result, number, configured_cancun_block()),
-    })
 }
 
 /// Parsed call parameters for EVM execution.
@@ -440,9 +557,9 @@ async fn run_evm(
 ) -> Result<(ExecutionResult, CallParams, bool), EthCallError> {
     let parsed = parse_call_params(call_params)?;
 
-    let validated_tag = validate_block_tag(block_tag).map_err(EthCallError::InvalidParams)?;
+    let block_specifier = validate_block_tag(block_tag).map_err(EthCallError::InvalidParams)?;
 
-    let block_info = fetch_block_info(&upstream_client, &upstream_url, &validated_tag)
+    let block_info = fetch_block_info(&upstream_client, &upstream_url, &block_specifier)
         .await
         .map_err(EthCallError::Internal)?;
 
@@ -810,6 +927,74 @@ mod tests {
     use super::*;
     use revm::context_interface::result::{HaltReason, SuccessReason};
     use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    async fn read_http_request_body(socket: &mut TcpStream) -> Vec<u8> {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        let header_end = loop {
+            let read = socket.read(&mut chunk).await.expect("read request bytes");
+            assert!(read > 0, "request closed before headers were received");
+            buffer.extend_from_slice(&chunk[..read]);
+            if let Some(idx) = buffer.windows(4).position(|window| window == b"\r\n\r\n") {
+                break idx + 4;
+            }
+        };
+
+        let headers = std::str::from_utf8(&buffer[..header_end]).expect("request headers utf8");
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                if name.eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+
+        let mut body = buffer[header_end..].to_vec();
+        while body.len() < content_length {
+            let read = socket
+                .read(&mut chunk)
+                .await
+                .expect("read request body bytes");
+            assert!(read > 0, "request closed before body was fully read");
+            body.extend_from_slice(&chunk[..read]);
+        }
+        body.truncate(content_length);
+        body
+    }
+
+    async fn spawn_mock_upstream(responses: Vec<Value>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock upstream listener");
+        let addr = listener.local_addr().expect("mock listener addr");
+
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.expect("accept mock request");
+                let body = read_http_request_body(&mut socket).await;
+                let _: Value = serde_json::from_slice(&body).expect("json rpc request");
+
+                let response_body = response.to_string();
+                let response_text = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                socket
+                    .write_all(response_text.as_bytes())
+                    .await
+                    .expect("write mock response");
+            }
+        });
+
+        format!("http://{}", addr)
+    }
 
     #[test]
     fn parse_address_with_0x_prefix() {
@@ -905,24 +1090,39 @@ mod tests {
     #[test]
     fn validate_block_tag_named_tags() {
         for tag in &["latest", "earliest", "pending", "safe", "finalized"] {
-            assert_eq!(validate_block_tag(&json!(tag)).unwrap(), *tag);
+            assert_eq!(
+                validate_block_tag(&json!(tag)).unwrap(),
+                BlockSpecifier::Tag((*tag).to_string())
+            );
         }
     }
 
     #[test]
     fn validate_block_tag_hex_quantity() {
-        assert_eq!(validate_block_tag(&json!("0x1")).unwrap(), "0x1");
-        assert_eq!(validate_block_tag(&json!("0xff")).unwrap(), "0xff");
+        assert_eq!(
+            validate_block_tag(&json!("0x1")).unwrap(),
+            BlockSpecifier::Tag("0x1".to_string())
+        );
+        assert_eq!(
+            validate_block_tag(&json!("0xff")).unwrap(),
+            BlockSpecifier::Tag("0xff".to_string())
+        );
     }
 
     #[test]
     fn validate_block_tag_null_defaults_latest() {
-        assert_eq!(validate_block_tag(&json!(null)).unwrap(), "latest");
+        assert_eq!(
+            validate_block_tag(&json!(null)).unwrap(),
+            BlockSpecifier::Tag("latest".to_string())
+        );
     }
 
     #[test]
-    fn validate_block_tag_rejects_object() {
-        assert!(validate_block_tag(&json!({"blockNumber": "0x1"})).is_err());
+    fn validate_block_tag_accepts_eip_1898_block_number() {
+        assert_eq!(
+            validate_block_tag(&json!({"blockNumber": "0x1"})).unwrap(),
+            BlockSpecifier::Tag("0x1".to_string())
+        );
     }
 
     #[test]
@@ -937,6 +1137,165 @@ mod tests {
         assert!(validate_block_tag(&json!(1)).is_err());
         assert!(validate_block_tag(&json!(true)).is_err());
         assert!(validate_block_tag(&json!([1, 2])).is_err());
+    }
+
+    #[test]
+    fn validate_block_tag_accepts_eip_1898_block_hash() {
+        let hash = format!("0x{}", "ab".repeat(32));
+        assert_eq!(
+            validate_block_tag(&json!({"blockHash": hash})).unwrap(),
+            BlockSpecifier::Hash {
+                hash: format!("0x{}", "ab".repeat(32)),
+                require_canonical: false
+            }
+        );
+    }
+
+    #[test]
+    fn validate_block_tag_accepts_require_canonical_for_block_hash() {
+        let hash = format!("0x{}", "cd".repeat(32));
+        assert_eq!(
+            validate_block_tag(&json!({"blockHash": hash, "requireCanonical": true})).unwrap(),
+            BlockSpecifier::Hash {
+                hash: format!("0x{}", "cd".repeat(32)),
+                require_canonical: true
+            }
+        );
+    }
+
+    #[test]
+    fn validate_block_tag_rejects_invalid_eip_1898_objects() {
+        assert!(validate_block_tag(&json!({"blockNumber": "0x1", "blockHash": "0x2"})).is_err());
+        assert!(validate_block_tag(&json!({"requireCanonical": true})).is_err());
+        assert!(
+            validate_block_tag(&json!({"blockNumber": "0x1", "requireCanonical": true})).is_err()
+        );
+        assert!(validate_block_tag(&json!({"blockNumber": "latest"})).is_err());
+        assert!(validate_block_tag(&json!({"blockHash": "0x1234"})).is_err());
+        assert!(validate_block_tag(
+            &json!({"blockHash": format!("0x{}", "aa".repeat(32)), "requireCanonical": "yes"})
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_block_info_require_canonical_accepts_matching_hash() {
+        let hash = format!("0x{}", "11".repeat(32));
+        let upstream = spawn_mock_upstream(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "number": "0x10",
+                    "timestamp": "0x20",
+                    "gasLimit": "0x30",
+                    "hash": hash
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "number": "0x10",
+                    "timestamp": "0x20",
+                    "gasLimit": "0x30",
+                    "hash": format!("0x{}", "11".repeat(32))
+                }
+            }),
+        ])
+        .await;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let info = fetch_block_info(
+            &client,
+            &upstream,
+            &BlockSpecifier::Hash {
+                hash: format!("0x{}", "11".repeat(32)),
+                require_canonical: true,
+            },
+        )
+        .await
+        .expect("canonical hash should resolve");
+
+        assert_eq!(info.number, 16);
+        assert_eq!(info.timestamp, 32);
+        assert_eq!(info.gas_limit, 48);
+    }
+
+    #[tokio::test]
+    async fn fetch_block_info_require_canonical_rejects_mismatch() {
+        let upstream = spawn_mock_upstream(vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "number": "0x10",
+                    "timestamp": "0x20",
+                    "gasLimit": "0x30",
+                    "hash": format!("0x{}", "22".repeat(32))
+                }
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "number": "0x10",
+                    "timestamp": "0x20",
+                    "gasLimit": "0x30",
+                    "hash": format!("0x{}", "33".repeat(32))
+                }
+            }),
+        ])
+        .await;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let err = fetch_block_info(
+            &client,
+            &upstream,
+            &BlockSpecifier::Hash {
+                hash: format!("0x{}", "22".repeat(32)),
+                require_canonical: true,
+            },
+        )
+        .await
+        .err()
+        .expect("mismatched canonical hash should fail");
+
+        assert!(err.contains("not canonical"));
+    }
+
+    #[tokio::test]
+    async fn fetch_block_info_hash_null_result_is_error() {
+        let upstream = spawn_mock_upstream(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": null
+        })])
+        .await;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let err = fetch_block_info(
+            &client,
+            &upstream,
+            &BlockSpecifier::Hash {
+                hash: format!("0x{}", "44".repeat(32)),
+                require_canonical: false,
+            },
+        )
+        .await
+        .err()
+        .expect("null block result should fail");
+
+        assert!(err.contains("No block result from upstream"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use clap::Parser;
 use morphogen_core::{DeltaBuffer, EpochSnapshot, GlobalState};
+use morphogen_server::epoch::EpochManager;
 use morphogen_server::network::{create_router, AppState, EpochMetadata};
 use morphogen_storage::ChunkedMatrix;
 use std::net::SocketAddr;
@@ -60,16 +61,28 @@ async fn main() {
     let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending.clone()));
 
     let seeds = [0x1234, 0x5678, 0x9ABC];
-    let (_epoch_tx, epoch_rx) = watch::channel(EpochMetadata {
+    let (epoch_tx, epoch_rx) = watch::channel(EpochMetadata {
         epoch_id: 1,
         num_rows: num_pages,
         seeds,
         block_number: 1000,
         state_root: [0u8; 32],
     });
+    let epoch_manager =
+        Arc::new(EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager"));
 
     let state = Arc::new(AppState {
         global,
+        epoch_manager,
+        epoch_tx,
+        snapshot_rotation_lock: Arc::new(tokio::sync::Mutex::new(())),
+        admin_snapshot_token: None,
+        admin_mtls_subject_header: axum::http::HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: vec![],
+        admin_mtls_trust_proxy_headers: false,
+        admin_snapshot_allow_local_paths: false,
+        admin_snapshot_allowed_hosts: vec![],
+        admin_snapshot_max_bytes: 1_073_741_824,
         row_size_bytes,
         num_rows: num_pages,
         seeds,
