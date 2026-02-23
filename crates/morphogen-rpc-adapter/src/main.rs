@@ -1362,6 +1362,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::RwLock;
+    use tokio::task::JoinHandle;
     use tokio::time::sleep;
 
     async fn read_http_request_body(socket: &mut TcpStream) -> Vec<u8> {
@@ -1430,13 +1431,15 @@ mod tests {
         format!("http://{}", addr)
     }
 
-    async fn spawn_mock_upstream_script(script: Vec<(&'static str, Value)>) -> String {
+    async fn spawn_mock_upstream_script(
+        script: Vec<(&'static str, Value)>,
+    ) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind scripted mock upstream listener");
         let addr = listener.local_addr().expect("listener addr");
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             for (expected_method, response) in script {
                 let (mut socket, _) = listener.accept().await.expect("accept request");
                 let body = read_http_request_body(&mut socket).await;
@@ -1461,7 +1464,7 @@ mod tests {
             }
         });
 
-        format!("http://{}", addr)
+        (format!("http://{}", addr), handle)
     }
 
     fn make_test_state(upstream: String, fallback_to_upstream: bool) -> Arc<super::AdapterState> {
@@ -1486,6 +1489,56 @@ mod tests {
             block_cache: Arc::new(RwLock::new(super::BlockCache::new())),
             privacy_degraded_fallback_total: AtomicU64::new(0),
         })
+    }
+
+    async fn start_filter_rpc_server(
+        state: Arc<super::AdapterState>,
+    ) -> (String, jsonrpsee::server::ServerHandle) {
+        let server = super::Server::builder()
+            .build(
+                "127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .expect("parse addr"),
+            )
+            .await
+            .expect("build test rpc server");
+        let addr = server.local_addr().expect("server local addr");
+        let mut module = super::RpcModule::from_arc(state);
+
+        module
+            .register_async_method("eth_getLogs", |params, state, _| async move {
+                let raw: Vec<Value> = params.parse()?;
+                super::handle_eth_get_logs(raw, state.clone()).await
+            })
+            .expect("register eth_getLogs");
+        module
+            .register_async_method("eth_newFilter", |params, state, _| async move {
+                let raw: Vec<Value> = params.parse()?;
+                super::handle_eth_new_filter(raw, state.clone()).await
+            })
+            .expect("register eth_newFilter");
+        module
+            .register_async_method("eth_getFilterLogs", |params, state, _| async move {
+                let (filter_id,): (String,) = params.parse()?;
+                let mut cache = state.block_cache.write().await;
+                match cache.get_filter_logs(&filter_id) {
+                    Some(Some(logs)) => Ok::<Value, super::ErrorObjectOwned>(Value::Array(logs)),
+                    Some(None) => Err(super::ErrorObjectOwned::owned(
+                        -32602,
+                        "filter is not a log filter",
+                        None::<()>,
+                    )),
+                    None => Err(super::ErrorObjectOwned::owned(
+                        -32602,
+                        "filter not found",
+                        None::<()>,
+                    )),
+                }
+            })
+            .expect("register eth_getFilterLogs");
+
+        let handle = server.start(module);
+        (format!("http://{}", addr), handle)
     }
 
     #[test]
@@ -1851,7 +1904,7 @@ mod tests {
 
     #[tokio::test]
     async fn eth_get_logs_handler_accepts_stale_cache_safe_range_with_fallback() {
-        let upstream = spawn_mock_upstream_script(vec![
+        let (upstream, upstream_handle) = spawn_mock_upstream_script(vec![
             (
                 "eth_getBlockByNumber",
                 json!({
@@ -1881,11 +1934,15 @@ mod tests {
             .expect("handler should not reject stale-cache safe range");
 
         assert_eq!(result, Value::Array(vec![]));
+        tokio::time::timeout(Duration::from_secs(1), upstream_handle)
+            .await
+            .expect("mock upstream script should complete")
+            .expect("mock upstream task should succeed");
     }
 
     #[tokio::test]
     async fn eth_new_filter_handler_accepts_stale_cache_finalized_latest_range() {
-        let upstream = spawn_mock_upstream_script(vec![(
+        let (upstream, upstream_handle) = spawn_mock_upstream_script(vec![(
             "eth_getBlockByNumber",
             json!({
                 "jsonrpc": "2.0",
@@ -1937,5 +1994,157 @@ mod tests {
             .expect("log filter");
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0], finalized_log);
+        tokio::time::timeout(Duration::from_secs(1), upstream_handle)
+            .await
+            .expect("mock upstream script should complete")
+            .expect("mock upstream task should succeed");
+    }
+
+    #[tokio::test]
+    async fn eth_get_logs_rpc_method_handles_stale_cache_safe_range() {
+        let (upstream, upstream_handle) = spawn_mock_upstream_script(vec![
+            (
+                "eth_getBlockByNumber",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": { "number": "0x78" }
+                }),
+            ),
+            (
+                "eth_getLogs",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "result": []
+                }),
+            ),
+        ])
+        .await;
+        let state = make_test_state(upstream, true);
+        {
+            let mut cache = state.block_cache.write().await;
+            cache.insert_block(100, [0x01; 32], vec![], vec![]);
+        }
+        let (rpc_url, server_handle) = start_filter_rpc_server(state).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+
+        let response: Value = client
+            .post(&rpc_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_getLogs",
+                "params": [{"fromBlock": "safe"}]
+            }))
+            .send()
+            .await
+            .expect("send rpc request")
+            .json()
+            .await
+            .expect("parse rpc response");
+        assert_eq!(response.get("result"), Some(&json!([])));
+        assert!(response.get("error").is_none());
+
+        server_handle.stop().expect("stop test rpc server");
+        server_handle.stopped().await;
+        tokio::time::timeout(Duration::from_secs(1), upstream_handle)
+            .await
+            .expect("mock upstream script should complete")
+            .expect("mock upstream task should succeed");
+    }
+
+    #[tokio::test]
+    async fn eth_new_filter_rpc_method_handles_stale_cache_finalized_latest_range() {
+        let (upstream, upstream_handle) = spawn_mock_upstream_script(vec![(
+            "eth_getBlockByNumber",
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": { "number": "0x82" }
+            }),
+        )])
+        .await;
+        let state = make_test_state(upstream, false);
+        {
+            let mut cache = state.block_cache.write().await;
+            cache.insert_block(100, [0x01; 32], vec![], vec![]);
+        }
+        let (rpc_url, server_handle) = start_filter_rpc_server(state.clone()).await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+
+        let new_filter_response: Value = client
+            .post(&rpc_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_newFilter",
+                "params": [{"fromBlock": "finalized", "toBlock": "latest"}]
+            }))
+            .send()
+            .await
+            .expect("send eth_newFilter")
+            .json()
+            .await
+            .expect("parse eth_newFilter response");
+        let filter_id = new_filter_response
+            .get("result")
+            .and_then(Value::as_str)
+            .expect("filter id result")
+            .to_string();
+
+        let finalized_log = json!({"address": "0x2222", "topics": [], "data": "0x"});
+        {
+            let mut cache = state.block_cache.write().await;
+            cache.insert_block(
+                110,
+                [0x02; 32],
+                vec![],
+                vec![(
+                    [0xAA; 32],
+                    json!({"logs": [{"address": "0x1111", "topics": [], "data": "0x"}]}),
+                )],
+            );
+            cache.insert_block(
+                130,
+                [0x03; 32],
+                vec![],
+                vec![([0xBB; 32], json!({"logs": [finalized_log.clone()]}))],
+            );
+        }
+
+        let filter_logs_response: Value = client
+            .post(&rpc_url)
+            .json(&json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "eth_getFilterLogs",
+                "params": [filter_id]
+            }))
+            .send()
+            .await
+            .expect("send eth_getFilterLogs")
+            .json()
+            .await
+            .expect("parse eth_getFilterLogs response");
+        let logs = filter_logs_response
+            .get("result")
+            .and_then(Value::as_array)
+            .expect("logs array");
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0], finalized_log);
+
+        server_handle.stop().expect("stop test rpc server");
+        server_handle.stopped().await;
+        tokio::time::timeout(Duration::from_secs(1), upstream_handle)
+            .await
+            .expect("mock upstream script should complete")
+            .expect("mock upstream task should succeed");
     }
 }
