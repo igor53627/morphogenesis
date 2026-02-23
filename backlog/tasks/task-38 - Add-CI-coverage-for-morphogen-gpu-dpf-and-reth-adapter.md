@@ -1,9 +1,10 @@
 ---
 id: TASK-38
 title: Add CI coverage for morphogen-gpu-dpf and reth-adapter
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-02-22 10:42'
+updated_date: '2026-02-23 19:49'
 labels:
   - ci
   - gpu
@@ -29,3 +30,9 @@ Production confidence requires at least build/test/lint coverage strategy for th
 - [ ] #2 Add CI coverage for reth-adapter build/tests
 - [ ] #3 Document expected runner capabilities and failure triage workflow for these jobs
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-02-23: Started implementation for CI coverage of morphogen-gpu-dpf and reth-adapter, including runner capability/triage documentation.
+<!-- SECTION:NOTES:END -->
