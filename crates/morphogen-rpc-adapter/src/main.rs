@@ -323,6 +323,24 @@ fn effective_latest_for_filter(
         .max(finalized_height.unwrap_or(0))
 }
 
+async fn parse_log_filter_for_rpc(
+    filter_obj: &Value,
+    cache_latest: u64,
+    client: &reqwest::Client,
+    upstream_url: &str,
+) -> Result<block_cache::LogFilter, ErrorObjectOwned> {
+    let (safe_height, finalized_height) =
+        resolve_filter_finality_heights(filter_obj, client, upstream_url).await?;
+    let effective_latest = effective_latest_for_filter(cache_latest, safe_height, finalized_height);
+    block_cache::parse_log_filter_object(
+        filter_obj,
+        effective_latest,
+        safe_height,
+        finalized_height,
+    )
+    .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -1007,22 +1025,13 @@ async fn main() -> Result<()> {
             }
 
             let cache_latest = state.block_cache.read().await.latest_block();
-            let (safe_height, finalized_height) = resolve_filter_finality_heights(
+            let filter = parse_log_filter_for_rpc(
                 filter_obj,
+                cache_latest,
                 &state.http_client,
                 &state.args.upstream,
             )
             .await?;
-            let effective_latest =
-                effective_latest_for_filter(cache_latest, safe_height, finalized_height);
-
-            let filter = block_cache::parse_log_filter_object(
-                filter_obj,
-                effective_latest,
-                safe_height,
-                finalized_height,
-            )
-            .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
 
             // Check cache coverage
             let cache = state.block_cache.read().await;
@@ -1073,22 +1082,13 @@ async fn main() -> Result<()> {
             let filter_obj = &raw[0];
 
             let cache_latest = state.block_cache.read().await.latest_block();
-            let (safe_height, finalized_height) = resolve_filter_finality_heights(
+            let filter = parse_log_filter_for_rpc(
                 filter_obj,
+                cache_latest,
                 &state.http_client,
                 &state.args.upstream,
             )
             .await?;
-            let effective_latest =
-                effective_latest_for_filter(cache_latest, safe_height, finalized_height);
-
-            let filter = block_cache::parse_log_filter_object(
-                filter_obj,
-                effective_latest,
-                safe_height,
-                finalized_height,
-            )
-            .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))?;
 
             let id = state.block_cache.write().await.create_log_filter(filter);
             info!("Created private log filter {}", id);
@@ -1340,16 +1340,45 @@ fn upstream_invalid_json_error(method: &str) -> ErrorObjectOwned {
 mod tests {
     use super::{
         effective_latest_for_filter, fail_closed_if_fallback_disabled,
-        has_nonempty_state_overrides, next_privacy_degraded_fallback_count, proxy_to_upstream,
-        upstream_invalid_json_error, validate_privacy_fallback_config, AdapterEnvironment, Args,
-        DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS,
+        has_nonempty_state_overrides, next_privacy_degraded_fallback_count,
+        parse_log_filter_for_rpc, proxy_to_upstream, upstream_invalid_json_error,
+        validate_privacy_fallback_config, AdapterEnvironment, Args, DROPPED_METHODS,
+        PASSTHROUGH_METHODS, RELAY_METHODS,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::sleep;
+
+    async fn spawn_mock_upstream(responses: Vec<Value>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock upstream listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.expect("accept request");
+                let mut buf = [0_u8; 4096];
+                let _ = socket.read(&mut buf).await;
+
+                let body = response.to_string();
+                let response_text = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket
+                    .write_all(response_text.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+
+        format!("http://{}", addr)
+    }
 
     #[test]
     fn test_passthrough_methods_exclude_private() {
@@ -1666,5 +1695,49 @@ mod tests {
         .expect("explicit latest should resolve to effective latest");
         assert_eq!(filter.from_block, 120);
         assert_eq!(filter.to_block, 120);
+    }
+
+    #[tokio::test]
+    async fn parse_log_filter_for_rpc_handles_stale_cache_for_safe_tag() {
+        let upstream = spawn_mock_upstream(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "number": "0x78" } // 120
+        })])
+        .await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let filter_obj = json!({ "fromBlock": "safe" });
+
+        let filter = parse_log_filter_for_rpc(&filter_obj, 100, &client, &upstream)
+            .await
+            .expect("safe filter should parse with effective latest");
+
+        assert_eq!(filter.from_block, 120);
+        assert_eq!(filter.to_block, 120);
+    }
+
+    #[tokio::test]
+    async fn parse_log_filter_for_rpc_handles_stale_cache_for_finalized_and_latest() {
+        let upstream = spawn_mock_upstream(vec![json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": { "number": "0x82" } // 130
+        })])
+        .await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build client");
+        let filter_obj = json!({ "fromBlock": "finalized", "toBlock": "latest" });
+
+        let filter = parse_log_filter_for_rpc(&filter_obj, 100, &client, &upstream)
+            .await
+            .expect("finalized/latest filter should parse with effective latest");
+
+        assert_eq!(filter.from_block, 130);
+        assert_eq!(filter.to_block, 130);
     }
 }
