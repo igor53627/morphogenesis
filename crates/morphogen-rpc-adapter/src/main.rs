@@ -313,6 +313,16 @@ async fn resolve_filter_finality_heights(
     Ok((safe_height, finalized_height))
 }
 
+fn effective_latest_for_filter(
+    cache_latest: u64,
+    safe_height: Option<u64>,
+    finalized_height: Option<u64>,
+) -> u64 {
+    cache_latest
+        .max(safe_height.unwrap_or(0))
+        .max(finalized_height.unwrap_or(0))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -996,17 +1006,19 @@ async fn main() -> Result<()> {
                 .await;
             }
 
-            let latest = state.block_cache.read().await.latest_block();
+            let cache_latest = state.block_cache.read().await.latest_block();
             let (safe_height, finalized_height) = resolve_filter_finality_heights(
                 filter_obj,
                 &state.http_client,
                 &state.args.upstream,
             )
             .await?;
+            let effective_latest =
+                effective_latest_for_filter(cache_latest, safe_height, finalized_height);
 
             let filter = block_cache::parse_log_filter_object(
                 filter_obj,
-                latest,
+                effective_latest,
                 safe_height,
                 finalized_height,
             )
@@ -1060,17 +1072,19 @@ async fn main() -> Result<()> {
             }
             let filter_obj = &raw[0];
 
-            let latest = state.block_cache.read().await.latest_block();
+            let cache_latest = state.block_cache.read().await.latest_block();
             let (safe_height, finalized_height) = resolve_filter_finality_heights(
                 filter_obj,
                 &state.http_client,
                 &state.args.upstream,
             )
             .await?;
+            let effective_latest =
+                effective_latest_for_filter(cache_latest, safe_height, finalized_height);
 
             let filter = block_cache::parse_log_filter_object(
                 filter_obj,
-                latest,
+                effective_latest,
                 safe_height,
                 finalized_height,
             )
@@ -1325,10 +1339,10 @@ fn upstream_invalid_json_error(method: &str) -> ErrorObjectOwned {
 #[cfg(test)]
 mod tests {
     use super::{
-        fail_closed_if_fallback_disabled, has_nonempty_state_overrides,
-        next_privacy_degraded_fallback_count, proxy_to_upstream, upstream_invalid_json_error,
-        validate_privacy_fallback_config, AdapterEnvironment, Args, DROPPED_METHODS,
-        PASSTHROUGH_METHODS, RELAY_METHODS,
+        effective_latest_for_filter, fail_closed_if_fallback_disabled,
+        has_nonempty_state_overrides, next_privacy_degraded_fallback_count, proxy_to_upstream,
+        upstream_invalid_json_error, validate_privacy_fallback_config, AdapterEnvironment, Args,
+        DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS,
     };
     use serde_json::json;
     use std::sync::atomic::AtomicU64;
@@ -1599,5 +1613,28 @@ mod tests {
         let err = has_nonempty_state_overrides(&[json!({}), json!("latest"), json!(42)])
             .expect_err("non-object state overrides should fail");
         assert_eq!(err.code(), -32602);
+    }
+
+    #[test]
+    fn effective_latest_includes_resolved_finality_heights() {
+        assert_eq!(effective_latest_for_filter(100, None, None), 100);
+        assert_eq!(effective_latest_for_filter(100, Some(120), None), 120);
+        assert_eq!(effective_latest_for_filter(100, None, Some(130)), 130);
+        assert_eq!(effective_latest_for_filter(100, Some(120), Some(130)), 130);
+    }
+
+    #[test]
+    fn stale_cache_latest_does_not_invalidate_safe_default_range() {
+        let filter_obj = json!({ "fromBlock": "safe" });
+        let effective_latest = effective_latest_for_filter(100, Some(120), None);
+        let filter = crate::block_cache::parse_log_filter_object(
+            &filter_obj,
+            effective_latest,
+            Some(120),
+            None,
+        )
+        .expect("safe range should remain valid when cache latest lags");
+        assert_eq!(filter.from_block, 120);
+        assert_eq!(filter.to_block, 120);
     }
 }
