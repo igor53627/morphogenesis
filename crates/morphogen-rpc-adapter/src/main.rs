@@ -1637,4 +1637,34 @@ mod tests {
         assert_eq!(filter.from_block, 120);
         assert_eq!(filter.to_block, 120);
     }
+
+    #[test]
+    fn stale_cache_latest_does_not_invalidate_finalized_default_range() {
+        let filter_obj = json!({ "fromBlock": "finalized" });
+        let effective_latest = effective_latest_for_filter(100, None, Some(130));
+        let filter = crate::block_cache::parse_log_filter_object(
+            &filter_obj,
+            effective_latest,
+            None,
+            Some(130),
+        )
+        .expect("finalized range should remain valid when cache latest lags");
+        assert_eq!(filter.from_block, 130);
+        assert_eq!(filter.to_block, 130);
+    }
+
+    #[test]
+    fn explicit_latest_to_block_uses_effective_latest_when_safe_is_higher() {
+        let filter_obj = json!({ "fromBlock": "safe", "toBlock": "latest" });
+        let effective_latest = effective_latest_for_filter(100, Some(120), None);
+        let filter = crate::block_cache::parse_log_filter_object(
+            &filter_obj,
+            effective_latest,
+            Some(120),
+            None,
+        )
+        .expect("explicit latest should resolve to effective latest");
+        assert_eq!(filter.from_block, 120);
+        assert_eq!(filter.to_block, 120);
+    }
 }
