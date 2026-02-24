@@ -375,6 +375,10 @@ impl EpochManager {
     }
 
     pub fn submit_update(&self, row_idx: usize, diff: Vec<u8>) -> Result<(), UpdateError> {
+        let _guard = self
+            .merge_lock
+            .lock()
+            .map_err(|_| UpdateError::LockPoisoned)?;
         let num_rows = self.num_rows();
         if row_idx >= num_rows {
             return Err(UpdateError::RowIndexOutOfBounds { row_idx, num_rows });
@@ -1273,6 +1277,30 @@ mod tests {
             }
             _ => panic!("expected SizeMismatch"),
         }
+    }
+
+    #[test]
+    fn epoch_manager_submit_update_returns_lock_poisoned_when_merge_lock_is_poisoned() {
+        use super::UpdateError;
+        let global = make_global_state(0, 4);
+        let manager = Arc::new(EpochManager::new(global, 4).unwrap());
+
+        let manager_for_poison = Arc::clone(&manager);
+        let _ = std::thread::spawn(move || {
+            let _guard = manager_for_poison
+                .merge_lock
+                .lock()
+                .expect("poison thread should acquire merge lock");
+            panic!("intentional poison for test");
+        })
+        .join();
+
+        let result = manager.submit_update(0, vec![1, 2, 3, 4]);
+        assert!(
+            matches!(result, Err(UpdateError::LockPoisoned)),
+            "submit_update should map merge-lock poisoning to UpdateError::LockPoisoned, got {:?}",
+            result
+        );
     }
 
     #[test]

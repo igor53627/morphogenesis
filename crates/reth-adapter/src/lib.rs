@@ -3,9 +3,9 @@ use morphogen_core::cuckoo::CuckooTable;
 use morphogen_storage::ChunkedMatrix;
 
 #[cfg(feature = "reth")]
-use alloy_primitives::Address;
+use reth_db::{cursor::DbCursorRO, transaction::DbTx, Database, DatabaseEnv};
 #[cfg(feature = "reth")]
-use reth_db::{cursor::DbCursorRO, tables, transaction::DbTx, Database, DatabaseEnv};
+use std::sync::Arc;
 
 pub struct Account {
     pub address: [u8; 20],
@@ -205,14 +205,8 @@ impl RethSource {
             .cursor_read::<reth_db::tables::PlainAccountState>()
             .expect("Cursor failed");
         let mut checked = 0;
-        let mut max_balance: u128 = 0;
 
         while let Some((addr, acc)) = cursor.next().unwrap() {
-            let balance = acc.balance.to::<u128>(); // This clamps to u128 if it fits?
-                                                    // Wait, reth U256 .to::<u128>() might panic or truncate?
-                                                    // Alloy U256::to() is generic.
-                                                    // Let's check bits manually.
-
             if acc.balance.bit_len() > 128 {
                 println!(
                     "CRITICAL: Account {:?} has balance bits {} > 128! Value: {}",
@@ -237,7 +231,6 @@ impl RethSource {
 
     pub fn estimate_proof_sizes(&self, sample_size: usize) {
         use alloy_primitives::keccak256;
-        use alloy_rlp::Encodable;
         use reth_db::cursor::DbCursorRO;
         use reth_db::tables::AccountsTrie;
         use reth_trie::{Nibbles, StoredNibbles};
@@ -458,7 +451,12 @@ pub fn dump_reth_to_matrix(
         let mut found_any = false;
 
         let mut it: Box<
-            dyn Iterator<Item = Result<(<AccTable as Table>::Key, <AccTable as Table>::Value), _>>,
+            dyn Iterator<
+                Item = Result<
+                    (<AccTable as Table>::Key, <AccTable as Table>::Value),
+                    reth_db::DatabaseError,
+                >,
+            >,
         > = if let Some(last) = last_addr {
             Box::new(acc_cursor.walk_range(last..).expect("Walk failed"))
         } else {
@@ -801,7 +799,7 @@ pub fn extract_code_from_dict(
                     std::fs::create_dir_all(&shard_dir).expect("Failed to create shard dir");
                 }
                 let mut f = std::fs::File::create(path).unwrap();
-                f.write_all(code.original_bytes().as_ref()).unwrap();
+                f.write_all(code.original_byte_slice()).unwrap();
             }
             found += 1;
         }

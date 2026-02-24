@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,6 +50,57 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --exclude morphogen-gpu-dpf --exclude reth-adapter
+
+  gpu-dpf:
+    name: GPU DPF (CPU path)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: RUSTFLAGS='-Dwarnings' cargo check -p morphogen-gpu-dpf
+      - run: RUSTFLAGS='-Dwarnings' cargo test -p morphogen-gpu-dpf --lib
+      - run: RUSTFLAGS='-Dwarnings' cargo test -p morphogen-gpu-dpf --tests
+
+  reth-adapter:
+    name: Reth Adapter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: RUSTFLAGS='-Dwarnings' cargo build -p reth-adapter
+      - run: RUSTFLAGS='-Dwarnings' cargo test -p reth-adapter
+      - run: RUSTFLAGS='-Dwarnings' cargo check -p reth-adapter --features reth
+      - run: RUSTFLAGS='-Dwarnings' cargo test -p reth-adapter --features reth --lib
+      - run: RUSTFLAGS='-Dwarnings' cargo test -p reth-adapter --features reth --tests
+
+  # Runner requirements and triage are documented in docs/CI_RETH_GPU_COVERAGE.md.
+  gpu-dpf-cuda:
+    name: GPU DPF (CUDA path, self-hosted)
+    if: >-
+      ${{
+        vars.ENABLE_GPU_CI == 'true' &&
+        (
+          github.event_name == 'push' ||
+          github.event_name == 'workflow_dispatch' ||
+          (
+            github.event_name == 'pull_request' &&
+            github.event.pull_request.head.repo.full_name == github.repository
+          )
+        )
+      }}
+    runs-on: [self-hosted, linux, x64, gpu, cuda]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: nvidia-smi
+      - run: nvcc --version
+      - run: RUSTFLAGS='-Dwarnings' cargo check -p morphogen-gpu-dpf --features cuda
+      - run: RUSTFLAGS='-Dwarnings' cargo test -p morphogen-gpu-dpf --features cuda --lib
+      - run: RUSTFLAGS='-Dwarnings' cargo test -p morphogen-gpu-dpf --features cuda --tests
 
   rpc-adapter:
     name: RPC Adapter Build
