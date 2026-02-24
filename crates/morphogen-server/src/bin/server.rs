@@ -409,6 +409,7 @@ impl RuntimeConfig {
         )
         .unwrap_or(false);
 
+        #[cfg(feature = "cuda")]
         if !disable_page_pir {
             let page_size_bytes = morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
             if row_size_bytes > page_size_bytes {
@@ -1257,6 +1258,7 @@ mod runtime_config_tests {
         assert!(resolved.bind_addr_is_default);
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn resolve_config_rejects_row_size_larger_than_gpu_page_size() {
         use morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
@@ -1273,6 +1275,24 @@ mod runtime_config_tests {
         assert!(err.to_string().contains("PAGE_SIZE_BYTES"));
     }
 
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn resolve_config_allows_row_size_equal_to_gpu_page_size() {
+        use morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
+
+        let mut cli = CliArgs::default_for_tests();
+        cli.environment = Some("dev".to_string());
+        cli.allow_synthetic_matrix = true;
+        cli.row_size_bytes = Some(PAGE_SIZE_BYTES);
+        cli.chunk_size_bytes = Some(PAGE_SIZE_BYTES * 2);
+        cli.matrix_size_bytes = Some(PAGE_SIZE_BYTES * 8);
+
+        RuntimeConfig::resolve(cli, EnvConfig::default_for_tests(), None).expect(
+            "row_size_bytes == PAGE_SIZE_BYTES should be accepted when page PIR is enabled",
+        );
+    }
+
+    #[cfg(feature = "cuda")]
     #[test]
     fn resolve_config_allows_large_row_size_when_page_pir_disabled() {
         use morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
@@ -1285,8 +1305,9 @@ mod runtime_config_tests {
         cli.chunk_size_bytes = Some((PAGE_SIZE_BYTES + 1) * 2);
         cli.matrix_size_bytes = Some((PAGE_SIZE_BYTES + 1) * 8);
 
-        let resolved = RuntimeConfig::resolve(cli, EnvConfig::default_for_tests(), None)
-            .expect("row size larger than PAGE_SIZE_BYTES should be allowed when page PIR is disabled");
+        let resolved = RuntimeConfig::resolve(cli, EnvConfig::default_for_tests(), None).expect(
+            "row size larger than PAGE_SIZE_BYTES should be allowed when page PIR is disabled",
+        );
         assert!(
             resolved.page_config.is_none(),
             "page PIR should be disabled in resolved runtime config"
