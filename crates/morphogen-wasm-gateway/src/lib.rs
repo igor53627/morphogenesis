@@ -836,6 +836,73 @@ mod tests {
 
     #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
     #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    async fn high_impact_unsupported_methods_are_rejected() {
+        let (gateway, log) = build_gateway(None);
+
+        let test_cases = [
+            // send*
+            (
+                "eth_sendTransaction",
+                serde_json::json!([{
+                    "from": sample_address(),
+                    "to": sample_address(),
+                    "value": "0x1",
+                }]),
+            ),
+            ("eth_sendRawTransaction", serde_json::json!(["0xdeadbeef"])),
+            // sign*
+            (
+                "eth_sign",
+                serde_json::json!([sample_address(), "0xdeadbeef"]),
+            ),
+            (
+                "eth_signTypedData_v4",
+                serde_json::json!([
+                    sample_address(),
+                    "{\"types\":{\"EIP712Domain\":[]},\"domain\":{},\"primaryType\":\"EIP712Domain\",\"message\":{}}"
+                ]),
+            ),
+            (
+                "personal_sign",
+                serde_json::json!(["0xdeadbeef", sample_address()]),
+            ),
+            // accounts
+            ("eth_accounts", serde_json::json!([])),
+            ("eth_requestAccounts", serde_json::json!([])),
+            // subscription state
+            ("eth_subscribe", serde_json::json!(["newHeads"])),
+            ("eth_unsubscribe", serde_json::json!(["0x1"])),
+            // filter state
+            (
+                "eth_newFilter",
+                serde_json::json!([{
+                    "fromBlock": "latest",
+                }]),
+            ),
+            ("eth_getFilterChanges", serde_json::json!(["0x1"])),
+            ("eth_uninstallFilter", serde_json::json!(["0x1"])),
+            // submit*
+            (
+                "eth_submitHashrate",
+                serde_json::json!(["0x1", "0x1234567890abcdef"]),
+            ),
+        ];
+
+        for (method, params) in test_cases {
+            let err = gateway
+                .request_json(method, params)
+                .await
+                .expect_err("unsupported high-impact methods must be rejected");
+            assert_eq!(err.code, -32601);
+            assert_eq!(err.message, format!("Unsupported method: {method}"));
+        }
+
+        assert!(log.private.borrow().is_empty());
+        assert!(log.upstream.borrow().is_empty());
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
     async fn non_latest_private_block_tag_is_rejected() {
         let (gateway, log) = build_gateway(None);
         let err = gateway
