@@ -100,6 +100,7 @@ For browser-first EIP-1193 integration (without a localhost proxy), see the expe
 - [Paper (LaTeX)](docs/paper/morphogenesis.pdf) - Academic paper
 - [Performance](docs/PERFORMANCE.md) - Benchmark results and analysis
 - [WASM Gateway](docs/WASM_GATEWAY.md) - Experimental support tier, compatibility matrix, browser setup, and CORS requirements
+- [Production Ops](ops/README.md) - Deployment artifacts, env/secret handling, health checks, and runbooks
 - [Profiling Guide](docs/PROFILING_GUIDE.md) - How to profile scan engines
 - [Cryptography](docs/CRYPTOGRAPHY.md) - Fused kernel and DPF internals
 - [Crypto Analysis](docs/CRYPTO_ANALYSIS.md) - ChaCha8 vs AES on GPUs

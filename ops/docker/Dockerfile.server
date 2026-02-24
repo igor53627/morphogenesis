@@ -1,0 +1,22 @@
+FROM rust:1.86-bookworm@sha256:300ec56abce8cc9448ddea2172747d048ed902a3090e6b57babb2bf19f754081 AS builder
+WORKDIR /workspace
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN cargo build --locked --release -p morphogen-server --features network --bin server
+
+FROM debian:bookworm-slim@sha256:98f4b71de414932439ac6ac690d7060df1f27161073c5036a7553723881bffbe
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && groupadd --system --gid 10001 morphogen \
+    && useradd --system --uid 10001 --gid morphogen --home-dir /srv/morphogen --create-home --shell /usr/sbin/nologin morphogen \
+    && install -d -o morphogen -g morphogen /var/lib/morphogen \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /srv/morphogen
+COPY --from=builder /workspace/target/release/server /usr/local/bin/morphogen-server
+
+EXPOSE 3000
+USER morphogen:morphogen
+ENTRYPOINT ["morphogen-server"]
