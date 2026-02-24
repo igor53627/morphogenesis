@@ -189,6 +189,65 @@ pub fn sanitize_url_for_telemetry(url: &str) -> String {
     }
 }
 
+fn should_redact_path_segment(segment: &str) -> bool {
+    segment.len() >= 16
+        && segment
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Redact URL for operator-facing diagnostics while preserving endpoint structure.
+/// Keeps scheme/host/port and path shape; redacts credentials and query values.
+pub fn redact_url_for_effective_config(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut parsed) => {
+            if !parsed.username().is_empty() {
+                let _ = parsed.set_username("REDACTED");
+            }
+            if parsed.password().is_some() {
+                let _ = parsed.set_password(Some("REDACTED"));
+            }
+
+            let redacted_path = parsed
+                .path()
+                .split('/')
+                .map(|segment| {
+                    if should_redact_path_segment(segment) {
+                        "REDACTED"
+                    } else {
+                        segment
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            parsed.set_path(&redacted_path);
+
+            if parsed.query().is_some() {
+                let pairs = parsed
+                    .query_pairs()
+                    .map(|(k, _)| (k.into_owned(), "REDACTED".to_string()))
+                    .collect::<Vec<_>>();
+                if pairs.is_empty() {
+                    parsed.set_query(None);
+                } else {
+                    let mut query_pairs = parsed.query_pairs_mut();
+                    query_pairs.clear();
+                    for (key, value) in pairs {
+                        query_pairs.append_pair(&key, &value);
+                    }
+                }
+            }
+            parsed.set_fragment(None);
+            let mut rendered = parsed.to_string();
+            if parsed.path() == "/" && parsed.query().is_none() && rendered.ends_with('/') {
+                rendered.pop();
+            }
+            rendered
+        }
+        Err(_) => "<invalid-url>".to_string(),
+    }
+}
+
 pub fn normalize_otlp_endpoint(raw: &str) -> Result<String> {
     let candidate = if raw.contains("://") {
         raw.to_string()
@@ -278,7 +337,7 @@ pub fn init_tracing(otel: OtelSettings) -> Result<TelemetryGuard> {
 mod tests {
     use super::{
         capture_trace_context, default_otel_settings, has_remote_parent, normalize_otlp_endpoint,
-        sanitize_url_for_telemetry,
+        redact_url_for_effective_config, sanitize_url_for_telemetry,
     };
     use http::{Extensions, HeaderMap, HeaderValue};
     use opentelemetry::global;
@@ -385,6 +444,32 @@ mod tests {
         assert_eq!(
             sanitize_url_for_telemetry("not-a-valid-url"),
             "<invalid-url>"
+        );
+    }
+
+    #[test]
+    fn redact_url_for_effective_config_preserves_path_and_redacts_sensitive_parts() {
+        assert_eq!(
+            redact_url_for_effective_config(
+                "https://user:pass@api.example.com/v2/abcd1234abcd1234?token=secret&network=mainnet"
+            ),
+            "https://REDACTED:REDACTED@api.example.com/v2/REDACTED?token=REDACTED&network=REDACTED"
+        );
+        assert_eq!(
+            redact_url_for_effective_config("http://localhost:8080/mainnet_compact.dict"),
+            "http://localhost:8080/mainnet_compact.dict"
+        );
+        assert_eq!(
+            redact_url_for_effective_config("not-a-valid-url"),
+            "<invalid-url>"
+        );
+    }
+
+    #[test]
+    fn redact_url_for_effective_config_handles_empty_query() {
+        assert_eq!(
+            redact_url_for_effective_config("https://api.example.com/path?"),
+            "https://api.example.com/path"
         );
     }
 }

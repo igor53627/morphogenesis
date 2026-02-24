@@ -15,6 +15,9 @@ const MAX_CACHED_BLOCKS: usize = 64;
 /// Block polling interval in seconds.
 const POLL_INTERVAL_SECS: u64 = 2;
 
+/// Max in-flight receipt requests when falling back to per-tx lookups.
+const RECEIPT_FALLBACK_MAX_IN_FLIGHT: usize = 8;
+
 /// Per-block tracking for reliable eviction of both txs and receipts.
 struct CachedBlock {
     number: u64,
@@ -169,12 +172,20 @@ impl BlockCache {
     /// Return all logs in [filter.from_block, filter.to_block] matching the filter.
     /// Only iterates over cached blocks (O(64) max) to avoid DoS from large ranges.
     pub fn get_logs(&self, filter: &LogFilter) -> Vec<Value> {
+        self.get_logs_in_range(filter, filter.from_block, filter.to_block)
+    }
+
+    fn get_logs_in_range(&self, filter: &LogFilter, from_block: u64, to_block: u64) -> Vec<Value> {
+        if from_block > to_block {
+            return Vec::new();
+        }
+
         let mut result = Vec::new();
         for block in &self.cached_blocks {
-            if block.number < filter.from_block {
+            if block.number < from_block {
                 continue;
             }
-            if block.number > filter.to_block {
+            if block.number > to_block {
                 break;
             }
             if let Some(block_logs) = self.logs.get(&block.number) {
@@ -213,7 +224,8 @@ impl BlockCache {
     pub fn create_log_filter(&mut self, filter: LogFilter) -> String {
         self.cleanup_expired_filters();
         let hex_id = self.generate_filter_id();
-        let cursor = filter.from_block.saturating_sub(1);
+        // Use a sentinel for from_block=0 so the first poll can include block 0.
+        let cursor = filter.from_block.checked_sub(1).unwrap_or(u64::MAX);
         self.filters.insert(
             hex_id.clone(),
             StoredFilter {
@@ -259,43 +271,77 @@ impl BlockCache {
     /// Returns None if the filter ID doesn't exist.
     pub fn get_filter_changes(&mut self, id: &str) -> Option<Vec<Value>> {
         self.cleanup_expired_filters();
-        let filter = self.filters.get_mut(id)?;
-        filter.last_accessed = Instant::now();
-        let from_exclusive = filter.last_polled_block;
 
-        match &filter.kind {
-            FilterKind::Log(log_filter) => {
-                let to_inclusive = self.latest_block.min(log_filter.to_block);
-                // Only advance cursor forward (never backwards)
-                if to_inclusive <= from_exclusive {
-                    return Some(vec![]);
+        enum PollAction {
+            Log {
+                from_inclusive: u64,
+                to_inclusive: u64,
+            },
+            Block {
+                from_exclusive: u64,
+                to_inclusive: u64,
+            },
+            PendingTransaction,
+        }
+
+        let action = {
+            let filter = self.filters.get_mut(id)?;
+            filter.last_accessed = Instant::now();
+            let from_exclusive = filter.last_polled_block;
+
+            match &filter.kind {
+                FilterKind::Log(log_filter) => {
+                    let to_inclusive = self.latest_block.min(log_filter.to_block);
+                    let from_inclusive = if from_exclusive == u64::MAX {
+                        log_filter.from_block
+                    } else {
+                        from_exclusive.saturating_add(1)
+                    };
+                    // Only advance cursor forward (never backwards)
+                    if to_inclusive < from_inclusive {
+                        return Some(vec![]);
+                    }
+                    filter.last_polled_block = to_inclusive;
+                    PollAction::Log {
+                        from_inclusive,
+                        to_inclusive,
+                    }
                 }
-                filter.last_polled_block = to_inclusive;
-                let scan_filter = LogFilter {
-                    from_block: from_exclusive.saturating_add(1),
-                    to_block: to_inclusive,
-                    addresses: log_filter.addresses.clone(),
-                    topics: log_filter
-                        .topics
-                        .iter()
-                        .map(|t| match t {
-                            TopicFilter::Any => TopicFilter::Any,
-                            TopicFilter::Exact(s) => TopicFilter::Exact(s.clone()),
-                            TopicFilter::OneOf(v) => TopicFilter::OneOf(v.clone()),
-                        })
-                        .collect(),
+                FilterKind::Block => {
+                    let to_inclusive = self.latest_block;
+                    filter.last_polled_block = to_inclusive;
+                    PollAction::Block {
+                        from_exclusive,
+                        to_inclusive,
+                    }
+                }
+                FilterKind::PendingTransaction => {
+                    filter.last_polled_block = self.latest_block;
+                    PollAction::PendingTransaction
+                }
+            }
+        };
+
+        match action {
+            PollAction::Log {
+                from_inclusive,
+                to_inclusive,
+            } => {
+                let log_filter = match self.filters.get(id)? {
+                    StoredFilter {
+                        kind: FilterKind::Log(log_filter),
+                        ..
+                    } => log_filter,
+                    // Preserve "filter exists" semantics even if kind unexpectedly diverges.
+                    _ => return Some(vec![]),
                 };
-                Some(self.get_logs(&scan_filter))
+                Some(self.get_logs_in_range(log_filter, from_inclusive, to_inclusive))
             }
-            FilterKind::Block => {
-                let to_inclusive = self.latest_block;
-                filter.last_polled_block = to_inclusive;
-                Some(self.get_block_hashes_in_range(from_exclusive, to_inclusive))
-            }
-            FilterKind::PendingTransaction => {
-                filter.last_polled_block = self.latest_block;
-                Some(vec![])
-            }
+            PollAction::Block {
+                from_exclusive,
+                to_inclusive,
+            } => Some(self.get_block_hashes_in_range(from_exclusive, to_inclusive)),
+            PollAction::PendingTransaction => Some(vec![]),
         }
     }
 
@@ -305,29 +351,31 @@ impl BlockCache {
     /// Returns Some(Some(logs)) with matching logs.
     pub fn get_filter_logs(&mut self, id: &str) -> Option<Option<Vec<Value>>> {
         self.cleanup_expired_filters();
-        let filter = self.filters.get_mut(id)?;
-        filter.last_accessed = Instant::now();
+        let (from_block, to_block) = {
+            let filter = self.filters.get_mut(id)?;
+            filter.last_accessed = Instant::now();
 
-        match &filter.kind {
-            FilterKind::Log(log_filter) => {
-                let scan_filter = LogFilter {
-                    from_block: log_filter.from_block,
-                    to_block: self.latest_block.min(log_filter.to_block),
-                    addresses: log_filter.addresses.clone(),
-                    topics: log_filter
-                        .topics
-                        .iter()
-                        .map(|t| match t {
-                            TopicFilter::Any => TopicFilter::Any,
-                            TopicFilter::Exact(s) => TopicFilter::Exact(s.clone()),
-                            TopicFilter::OneOf(v) => TopicFilter::OneOf(v.clone()),
-                        })
-                        .collect(),
-                };
-                Some(Some(self.get_logs(&scan_filter)))
+            match &filter.kind {
+                FilterKind::Log(log_filter) => (
+                    log_filter.from_block,
+                    self.latest_block.min(log_filter.to_block),
+                ),
+                _ => return Some(None),
             }
-            _ => Some(None),
-        }
+        };
+
+        let log_filter = match self.filters.get(id)? {
+            StoredFilter {
+                kind: FilterKind::Log(log_filter),
+                ..
+            } => log_filter,
+            // Preserve contract: existing non-log filters map to Some(None), not None.
+            _ => return Some(None),
+        };
+
+        Some(Some(
+            self.get_logs_in_range(log_filter, from_block, to_block),
+        ))
     }
 
     /// Remove a filter. Returns true if it existed.
@@ -766,6 +814,9 @@ async fn poll_new_blocks(
     Ok(new_blocks)
 }
 
+type ReceiptFetchFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, String>> + Send>>;
+
 /// Fetch receipts for a block. Tries eth_getBlockReceipts first,
 /// falls back to individual eth_getTransactionReceipt calls.
 async fn fetch_receipts(
@@ -809,27 +860,78 @@ async fn fetch_receipts(
     }
 
     // Fallback: fetch receipts individually
-    let mut receipts = Vec::with_capacity(tx_hashes.len());
-    for hash in tx_hashes {
-        let hash_hex = format!("0x{}", hex::encode(hash));
-        match rpc_call(
-            client,
-            upstream_url,
-            "eth_getTransactionReceipt",
-            serde_json::json!([hash_hex]),
-        )
-        .await
-        {
-            Ok(receipt) if !receipt.is_null() => {
-                receipts.push((*hash, receipt));
+    let upstream_url = Arc::<str>::from(upstream_url);
+    let client = client.clone();
+    let fetcher: Arc<dyn Fn([u8; 32]) -> ReceiptFetchFuture + Send + Sync> =
+        Arc::new(move |hash: [u8; 32]| {
+            let client = client.clone();
+            let upstream_url = upstream_url.clone();
+            Box::pin(async move {
+                let hash_hex = format!("0x{}", hex::encode(hash));
+                rpc_call(
+                    &client,
+                    upstream_url.as_ref(),
+                    "eth_getTransactionReceipt",
+                    serde_json::json!([hash_hex]),
+                )
+                .await
+            })
+        });
+
+    Ok(fetch_receipts_fallback_bounded(tx_hashes, fetcher).await)
+}
+
+async fn fetch_receipts_fallback_bounded(
+    tx_hashes: &[[u8; 32]],
+    fetcher: Arc<dyn Fn([u8; 32]) -> ReceiptFetchFuture + Send + Sync>,
+) -> Vec<([u8; 32], Value)> {
+    if tx_hashes.is_empty() {
+        return Vec::new();
+    }
+
+    let max_in_flight = RECEIPT_FALLBACK_MAX_IN_FLIGHT.clamp(1, tx_hashes.len());
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut next_index = 0usize;
+    let mut ordered_receipts: Vec<Option<([u8; 32], Value)>> = vec![None; tx_hashes.len()];
+
+    while next_index < max_in_flight {
+        let index = next_index;
+        let hash = tx_hashes[index];
+        let fetcher = fetcher.clone();
+        join_set.spawn(async move {
+            let result = fetcher(hash).await;
+            (index, hash, result)
+        });
+        next_index += 1;
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok((index, hash, Ok(receipt))) if !receipt.is_null() => {
+                ordered_receipts[index] = Some((hash, receipt));
             }
-            Ok(_) => {} // null receipt, skip
+            Ok((_index, _hash, Ok(_))) => {}
+            Ok((_index, hash, Err(e))) => {
+                warn!("Failed to fetch receipt for 0x{}: {}", hex::encode(hash), e);
+            }
             Err(e) => {
-                warn!("Failed to fetch receipt for {}: {}", hash_hex, e);
+                warn!("Receipt fetch task failed: {}", e);
             }
         }
+
+        if next_index < tx_hashes.len() {
+            let index = next_index;
+            let hash = tx_hashes[index];
+            let fetcher = fetcher.clone();
+            join_set.spawn(async move {
+                let result = fetcher(hash).await;
+                (index, hash, result)
+            });
+            next_index += 1;
+        }
     }
-    Ok(receipts)
+
+    ordered_receipts.into_iter().flatten().collect()
 }
 
 /// Make a JSON-RPC call and return the result field.
@@ -876,6 +978,26 @@ async fn rpc_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    fn observe_max_in_flight(max_in_flight: &AtomicUsize, concurrent_now: usize) {
+        loop {
+            let previous = max_in_flight.load(Ordering::SeqCst);
+            if concurrent_now <= previous {
+                break;
+            }
+            if max_in_flight
+                .compare_exchange(previous, concurrent_now, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
 
     #[test]
     fn block_cache_insert_and_get() {
@@ -1336,6 +1458,33 @@ mod tests {
     }
 
     #[test]
+    fn filter_log_get_changes_includes_block_zero_for_from_block_zero() {
+        let mut cache = BlockCache::new();
+
+        let log0 = make_log("0xaaa", &["0xevent0"]);
+        let r0 = make_receipt_with_logs(
+            "0xaa00000000000000000000000000000000000000000000000000000000000000",
+            vec![log0],
+        );
+        cache.insert_block(0, [0x01; 32], vec![], vec![([0xAA; 32], r0)]);
+
+        let filter = LogFilter {
+            from_block: 0,
+            to_block: u64::MAX,
+            addresses: Some(vec!["0xaaa".to_string()]),
+            topics: vec![],
+        };
+        let id = cache.create_log_filter(filter);
+
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["address"].as_str().unwrap(), "0xaaa");
+
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert!(changes.is_empty());
+    }
+
+    #[test]
     fn filter_block_get_changes() {
         let mut cache = BlockCache::new();
         cache.insert_block(100, [0x01; 32], vec![], vec![]);
@@ -1624,5 +1773,116 @@ mod tests {
 
         let obj = serde_json::json!({"toBlock": "finalized"});
         assert!(parse_log_filter_object(&obj, 100, Some(95), None).is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_receipts_fallback_is_bounded_and_preserves_order() {
+        let mut tx_hashes = Vec::new();
+        for i in 0..12u8 {
+            let mut hash = [0u8; 32];
+            hash[31] = i;
+            tx_hashes.push(hash);
+        }
+
+        let in_flight_requests = Arc::new(AtomicUsize::new(0));
+        let max_in_flight_requests = Arc::new(AtomicUsize::new(0));
+        let fetcher: Arc<dyn Fn([u8; 32]) -> ReceiptFetchFuture + Send + Sync> = Arc::new({
+            let in_flight_requests = in_flight_requests.clone();
+            let max_in_flight_requests = max_in_flight_requests.clone();
+            move |hash: [u8; 32]| {
+                let in_flight_requests = in_flight_requests.clone();
+                let max_in_flight_requests = max_in_flight_requests.clone();
+                Box::pin(async move {
+                    let concurrent_now = in_flight_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                    observe_max_in_flight(&max_in_flight_requests, concurrent_now);
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    in_flight_requests.fetch_sub(1, Ordering::SeqCst);
+                    Ok(json!({
+                        "transactionHash": format!("0x{}", hex::encode(hash)),
+                        "status": "0x1",
+                        "logs": [],
+                    }))
+                })
+            }
+        });
+        let receipts = fetch_receipts_fallback_bounded(&tx_hashes, fetcher).await;
+
+        assert_eq!(receipts.len(), tx_hashes.len());
+        let returned_hashes: Vec<[u8; 32]> = receipts.iter().map(|(hash, _)| *hash).collect();
+        assert_eq!(returned_hashes, tx_hashes);
+
+        let observed_max = max_in_flight_requests.load(Ordering::SeqCst);
+        assert!(
+            observed_max > 1,
+            "expected concurrent receipt fallback requests, observed {}",
+            observed_max
+        );
+        assert!(
+            observed_max <= RECEIPT_FALLBACK_MAX_IN_FLIGHT,
+            "expected at most {} concurrent requests, observed {}",
+            RECEIPT_FALLBACK_MAX_IN_FLIGHT,
+            observed_max
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_receipts_fallback_skips_nulls_and_errors_preserving_order() {
+        let mut tx_hashes = Vec::new();
+        for i in 0..8u8 {
+            let mut hash = [0u8; 32];
+            hash[31] = i;
+            tx_hashes.push(hash);
+        }
+
+        let in_flight_requests = Arc::new(AtomicUsize::new(0));
+        let max_in_flight_requests = Arc::new(AtomicUsize::new(0));
+        let fetcher: Arc<dyn Fn([u8; 32]) -> ReceiptFetchFuture + Send + Sync> = Arc::new({
+            let in_flight_requests = in_flight_requests.clone();
+            let max_in_flight_requests = max_in_flight_requests.clone();
+            move |hash: [u8; 32]| {
+                let in_flight_requests = in_flight_requests.clone();
+                let max_in_flight_requests = max_in_flight_requests.clone();
+                Box::pin(async move {
+                    let concurrent_now = in_flight_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                    observe_max_in_flight(&max_in_flight_requests, concurrent_now);
+
+                    let delay_ms = 5 + ((hash[31] as u64) % 3) * 10;
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    in_flight_requests.fetch_sub(1, Ordering::SeqCst);
+
+                    match hash[31] {
+                        1 | 5 => Ok(Value::Null),
+                        3 | 6 => Err(format!("simulated upstream error for {}", hash[31])),
+                        _ => Ok(json!({
+                            "transactionHash": format!("0x{}", hex::encode(hash)),
+                            "status": "0x1",
+                            "logs": [],
+                        })),
+                    }
+                })
+            }
+        });
+
+        let receipts = fetch_receipts_fallback_bounded(&tx_hashes, fetcher).await;
+        let returned_hashes: Vec<[u8; 32]> = receipts.iter().map(|(hash, _)| *hash).collect();
+        let expected_hashes: Vec<[u8; 32]> = tx_hashes
+            .iter()
+            .copied()
+            .filter(|hash| !matches!(hash[31], 1 | 3 | 5 | 6))
+            .collect();
+        assert_eq!(returned_hashes, expected_hashes);
+
+        let observed_max = max_in_flight_requests.load(Ordering::SeqCst);
+        assert!(
+            observed_max > 1,
+            "expected concurrent receipt fallback requests, observed {}",
+            observed_max
+        );
+        assert!(
+            observed_max <= RECEIPT_FALLBACK_MAX_IN_FLIGHT,
+            "expected at most {} concurrent requests, observed {}",
+            RECEIPT_FALLBACK_MAX_IN_FLIGHT,
+            observed_max
+        );
     }
 }

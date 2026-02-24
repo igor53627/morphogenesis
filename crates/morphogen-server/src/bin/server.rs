@@ -239,7 +239,11 @@ impl EnvConfig {
             matrix_seed: parse_env_u64("MORPHOGEN_SERVER_MATRIX_SEED")?,
             allow_synthetic_matrix: parse_env_bool("MORPHOGEN_SERVER_ALLOW_SYNTHETIC_MATRIX")?,
             merge_interval_ms: parse_env_u64("MORPHOGEN_SERVER_MERGE_INTERVAL_MS")?,
-            max_concurrent_scans: parse_env_usize("MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS")?,
+            max_concurrent_scans: parse_env_usize_any(&[
+                "MORPHOGEN_SERVER_A_MAX_CONCURRENT_SCANS",
+                "MORPHOGEN_SERVER_B_MAX_CONCURRENT_SCANS",
+                "MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS",
+            ])?,
             seeds: env_var("MORPHOGEN_SERVER_SEEDS"),
             block_number: parse_env_u64("MORPHOGEN_SERVER_BLOCK_NUMBER")?,
             state_root: env_var("MORPHOGEN_SERVER_STATE_ROOT"),
@@ -832,6 +836,37 @@ fn parse_env_usize(key: &str) -> Result<Option<usize>, StartupError> {
     raw.parse::<usize>()
         .map(Some)
         .map_err(|e| StartupError::new(format!("invalid {} value '{}': {}", key, raw, e)))
+}
+
+fn parse_env_usize_any(keys: &[&str]) -> Result<Option<usize>, StartupError> {
+    if keys.is_empty() {
+        return Ok(None);
+    }
+
+    let fallback_index = keys.len() - 1;
+    let mut preferred: Option<(&str, usize)> = None;
+
+    for &key in &keys[..fallback_index] {
+        let Some(value) = parse_env_usize(key)? else {
+            continue;
+        };
+        if let Some((existing_key, existing_value)) = preferred {
+            if existing_value != value {
+                return Err(StartupError::new(format!(
+                    "conflicting values for {} ({}) and {} ({})",
+                    existing_key, existing_value, key, value
+                )));
+            }
+        } else {
+            preferred = Some((key, value));
+        }
+    }
+
+    if let Some((_, value)) = preferred {
+        return Ok(Some(value));
+    }
+
+    parse_env_usize(keys[fallback_index])
 }
 
 fn parse_env_u64(key: &str) -> Result<Option<u64>, StartupError> {
@@ -1533,6 +1568,96 @@ mod runtime_config_tests {
             next_ctrl_c_retry_delay_ms(CTRL_C_MAX_RETRY_DELAY_MS / 2),
             CTRL_C_MAX_RETRY_DELAY_MS
         );
+    }
+
+    #[test]
+    fn parse_env_usize_any_prefers_prefixed_and_falls_back_to_legacy() {
+        let key_a = "MORPHOGEN_SERVER_A_MAX_CONCURRENT_SCANS_TEST";
+        let key_b = "MORPHOGEN_SERVER_B_MAX_CONCURRENT_SCANS_TEST";
+        let key_legacy = "MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS_TEST";
+        std::env::remove_var(key_a);
+        std::env::remove_var(key_b);
+        std::env::remove_var(key_legacy);
+
+        std::env::set_var(key_legacy, "19");
+        let only_legacy =
+            parse_env_usize_any(&[key_a, key_b, key_legacy]).expect("legacy parse should succeed");
+        assert_eq!(only_legacy, Some(19));
+
+        std::env::set_var(key_b, "23");
+        let with_prefixed_b = parse_env_usize_any(&[key_a, key_b, key_legacy])
+            .expect("prefixed parse should succeed");
+        assert_eq!(with_prefixed_b, Some(23));
+
+        std::env::remove_var(key_b);
+        std::env::set_var(key_a, "29");
+        let with_prefixed_a = parse_env_usize_any(&[key_a, key_b, key_legacy])
+            .expect("prefixed parse should succeed");
+        assert_eq!(with_prefixed_a, Some(29));
+
+        std::env::remove_var(key_a);
+        std::env::remove_var(key_b);
+        std::env::remove_var(key_legacy);
+    }
+
+    #[test]
+    fn parse_env_usize_any_rejects_conflicting_values() {
+        let key_a = "MORPHOGEN_SERVER_A_MAX_CONCURRENT_SCANS_CONFLICT";
+        let key_b = "MORPHOGEN_SERVER_B_MAX_CONCURRENT_SCANS_CONFLICT";
+        let key_legacy = "MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS_CONFLICT";
+        std::env::remove_var(key_a);
+        std::env::remove_var(key_b);
+        std::env::remove_var(key_legacy);
+
+        std::env::set_var(key_a, "21");
+        std::env::set_var(key_b, "34");
+        let err =
+            parse_env_usize_any(&[key_a, key_b, key_legacy]).expect_err("conflict should fail");
+        assert!(err.to_string().contains("conflicting values"));
+
+        std::env::remove_var(key_a);
+        std::env::remove_var(key_b);
+        std::env::remove_var(key_legacy);
+    }
+
+    #[test]
+    fn parse_env_usize_any_ignores_malformed_legacy_when_prefixed_present() {
+        let key_a = "MORPHOGEN_SERVER_A_MAX_CONCURRENT_SCANS_MALFORMED_LEGACY";
+        let key_b = "MORPHOGEN_SERVER_B_MAX_CONCURRENT_SCANS_MALFORMED_LEGACY";
+        let key_legacy = "MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS_MALFORMED_LEGACY";
+        std::env::remove_var(key_a);
+        std::env::remove_var(key_b);
+        std::env::remove_var(key_legacy);
+
+        std::env::set_var(key_a, "29");
+        std::env::set_var(key_legacy, "not-a-number");
+        let parsed = parse_env_usize_any(&[key_a, key_b, key_legacy])
+            .expect("prefixed value should win when legacy fallback is malformed");
+        assert_eq!(parsed, Some(29));
+
+        std::env::remove_var(key_a);
+        std::env::remove_var(key_b);
+        std::env::remove_var(key_legacy);
+    }
+
+    #[test]
+    fn parse_env_usize_any_rejects_malformed_preferred_even_with_legacy() {
+        let key_a = "MORPHOGEN_SERVER_A_MAX_CONCURRENT_SCANS_MALFORMED_PREFERRED";
+        let key_b = "MORPHOGEN_SERVER_B_MAX_CONCURRENT_SCANS_MALFORMED_PREFERRED";
+        let key_legacy = "MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS_MALFORMED_PREFERRED";
+        std::env::remove_var(key_a);
+        std::env::remove_var(key_b);
+        std::env::remove_var(key_legacy);
+
+        std::env::set_var(key_a, "not-a-number");
+        std::env::set_var(key_legacy, "19");
+        let err = parse_env_usize_any(&[key_a, key_b, key_legacy])
+            .expect_err("malformed preferred key should fail startup");
+        assert!(err.to_string().contains(key_a));
+
+        std::env::remove_var(key_a);
+        std::env::remove_var(key_b);
+        std::env::remove_var(key_legacy);
     }
 
     fn expected_ctrl_c_retry_durations(retry_count: u32) -> Vec<Duration> {

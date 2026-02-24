@@ -18,8 +18,9 @@
 ## Capacity and Performance Checks
 
 1. Monitor scan concurrency and queueing pressure.
-2. Tune `MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS` conservatively.
-3. Validate adapter upstream timeout settings and retry pressure.
+2. Tune `MORPHOGEN_SERVER_A_MAX_CONCURRENT_SCANS` and `MORPHOGEN_SERVER_B_MAX_CONCURRENT_SCANS` conservatively.
+3. Legacy fallback remains available via `MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS` if A/B-prefixed values are not set.
+4. Validate adapter upstream timeout settings and retry pressure.
 
 ## Backup and Restore Drill
 

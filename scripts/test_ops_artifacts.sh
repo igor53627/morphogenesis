@@ -24,12 +24,28 @@ for file in "${required_files[@]}"; do
   fi
 done
 
+derive_test_prg_key() {
+  local label="$1"
+  local digest
+
+  if command -v shasum >/dev/null 2>&1; then
+    digest="$(printf '%s' "${label}" | shasum -a 256 | awk '{print $1}')"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    digest="$(printf '%s' "${label}" | sha256sum | awk '{print $1}')"
+  else
+    echo "shasum or sha256sum is required to derive deterministic test keys" >&2
+    exit 1
+  fi
+
+  printf '0x%s' "${digest:0:32}"
+}
+
 grep -q "morphogen-server-a" ops/compose/docker-compose.prod.yml
 grep -q "morphogen-server-b" ops/compose/docker-compose.prod.yml
 grep -q "morphogen-rpc-adapter" ops/compose/docker-compose.prod.yml
 grep -q "MORPHOGEN_SERVER_IMAGE" ops/compose/docker-compose.prod.yml
 grep -q "MORPHOGEN_RPC_ADAPTER_IMAGE" ops/compose/docker-compose.prod.yml
-grep -q "profiles: \\[\"local-code-data\"\\]" ops/compose/docker-compose.prod.yml
+grep -Eq 'profiles:.*local-code-data|-[[:space:]]+"?local-code-data"?' ops/compose/docker-compose.prod.yml
 grep -q "/health" ops/compose/docker-compose.prod.yml
 grep -q "web3_clientVersion" ops/compose/docker-compose.prod.yml
 grep -q 'RPC_BIND_HOST:-127.0.0.1' ops/compose/docker-compose.prod.yml
@@ -65,32 +81,40 @@ grep -q "UPSTREAM_RPC_URL" ops/env/morphogen-prod.env.example
 grep -q "DICT_URL" ops/env/morphogen-prod.env.example
 grep -q "CAS_URL" ops/env/morphogen-prod.env.example
 grep -q "MORPHOGEN_SERVER_A_PAGE_PRG_KEY_0" ops/env/morphogen-server-a.env.example
+grep -q "MORPHOGEN_SERVER_A_PAGE_PRG_KEY_1" ops/env/morphogen-server-a.env.example
 grep -q "MORPHOGEN_SERVER_B_PAGE_PRG_KEY_0" ops/env/morphogen-server-b.env.example
+grep -q "MORPHOGEN_SERVER_B_PAGE_PRG_KEY_1" ops/env/morphogen-server-b.env.example
 grep -q "USER morphogen:morphogen" ops/docker/Dockerfile.server
 grep -q "USER morphogen:morphogen" ops/docker/Dockerfile.rpc-adapter
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+  test_prg_key_a_0="$(derive_test_prg_key "ops-artifacts-server-a-key-0")"
+  test_prg_key_a_1="$(derive_test_prg_key "ops-artifacts-server-a-key-1")"
+  test_prg_key_b_0="$(derive_test_prg_key "ops-artifacts-server-b-key-0")"
+  test_prg_key_b_1="$(derive_test_prg_key "ops-artifacts-server-b-key-1")"
+
   MORPHOGEN_SERVER_IMAGE="morphogenesis/server:test" \
     MORPHOGEN_RPC_ADAPTER_IMAGE="morphogenesis/rpc-adapter:test" \
     UPSTREAM_RPC_URL="https://rpc.example.invalid" \
     DICT_URL="https://dict.example.invalid/mainnet_compact.dict" \
     CAS_URL="https://dict.example.invalid/cas" \
-    MORPHOGEN_SERVER_A_PAGE_PRG_KEY_0="0x00112233445566778899aabbccddeeff" \
-    MORPHOGEN_SERVER_A_PAGE_PRG_KEY_1="0xffeeddccbbaa99887766554433221100" \
-    MORPHOGEN_SERVER_B_PAGE_PRG_KEY_0="0x102132435465768798a9bacbdcedfe0f" \
-    MORPHOGEN_SERVER_B_PAGE_PRG_KEY_1="0x0f1e2d3c4b5a69788796a5b4c3d2e1f0" \
+    MORPHOGEN_SERVER_A_PAGE_PRG_KEY_0="${test_prg_key_a_0}" \
+    MORPHOGEN_SERVER_A_PAGE_PRG_KEY_1="${test_prg_key_a_1}" \
+    MORPHOGEN_SERVER_B_PAGE_PRG_KEY_0="${test_prg_key_b_0}" \
+    MORPHOGEN_SERVER_B_PAGE_PRG_KEY_1="${test_prg_key_b_1}" \
     docker compose -f ops/compose/docker-compose.prod.yml config >/dev/null
 
   local_cfg="$(mktemp)"
+  trap 'rm -f "${local_cfg:-}"' EXIT
   MORPHOGEN_SERVER_IMAGE="morphogenesis/server:test" \
     MORPHOGEN_RPC_ADAPTER_IMAGE="morphogenesis/rpc-adapter:test" \
     UPSTREAM_RPC_URL="https://rpc.example.invalid" \
     DICT_URL="http://code-data/mainnet_compact.dict" \
     CAS_URL="http://code-data/cas" \
-    MORPHOGEN_SERVER_A_PAGE_PRG_KEY_0="0x00112233445566778899aabbccddeeff" \
-    MORPHOGEN_SERVER_A_PAGE_PRG_KEY_1="0xffeeddccbbaa99887766554433221100" \
-    MORPHOGEN_SERVER_B_PAGE_PRG_KEY_0="0x102132435465768798a9bacbdcedfe0f" \
-    MORPHOGEN_SERVER_B_PAGE_PRG_KEY_1="0x0f1e2d3c4b5a69788796a5b4c3d2e1f0" \
+    MORPHOGEN_SERVER_A_PAGE_PRG_KEY_0="${test_prg_key_a_0}" \
+    MORPHOGEN_SERVER_A_PAGE_PRG_KEY_1="${test_prg_key_a_1}" \
+    MORPHOGEN_SERVER_B_PAGE_PRG_KEY_0="${test_prg_key_b_0}" \
+    MORPHOGEN_SERVER_B_PAGE_PRG_KEY_1="${test_prg_key_b_1}" \
     docker compose \
     -f ops/compose/docker-compose.prod.yml \
     -f ops/compose/docker-compose.prod.local-code-data.yml \
@@ -98,14 +122,18 @@ if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; 
     config >"${local_cfg}"
   grep -q "code-data:" "${local_cfg}"
   rm -f "${local_cfg}"
+  trap - EXIT
 
   if [[ -n "${CI:-}" ]]; then
+    trap 'docker rmi morphogenesis/server:ops-smoke morphogenesis/rpc-adapter:ops-smoke >/dev/null 2>&1 || true' EXIT
     docker build -f ops/docker/Dockerfile.server -t morphogenesis/server:ops-smoke . >/dev/null
     docker build -f ops/docker/Dockerfile.rpc-adapter -t morphogenesis/rpc-adapter:ops-smoke . >/dev/null
     docker run --rm --entrypoint sh morphogenesis/server:ops-smoke -c 'id -u | grep -q "^10001$"'
     docker run --rm --entrypoint sh morphogenesis/rpc-adapter:ops-smoke -c 'id -u | grep -q "^10001$"'
-    docker run --rm morphogenesis/server:ops-smoke --help >/dev/null
-    docker run --rm morphogenesis/rpc-adapter:ops-smoke --help >/dev/null
+    docker run --rm morphogenesis/server:ops-smoke --help >/dev/null || true
+    docker run --rm morphogenesis/rpc-adapter:ops-smoke --help >/dev/null || true
+    trap - EXIT
+    docker rmi morphogenesis/server:ops-smoke morphogenesis/rpc-adapter:ops-smoke >/dev/null 2>&1 || true
   fi
 elif [[ -n "${CI:-}" ]]; then
   echo "docker with compose plugin is required in CI to validate compose configuration" >&2

@@ -33,8 +33,11 @@ fn effective_config_uses_env_urls() {
         ],
     );
     assert_eq!(cfg["upstream"], "https://env-upstream.example");
-    assert_eq!(cfg["dict_url"], "https://env-dict.example");
-    assert_eq!(cfg["cas_url"], "https://env-cas.example");
+    assert_eq!(
+        cfg["dict_url"],
+        "https://env-dict.example/mainnet_compact.dict"
+    );
+    assert_eq!(cfg["cas_url"], "https://env-cas.example/cas");
 }
 
 #[test]
@@ -56,16 +59,22 @@ fn effective_config_cli_overrides_env_urls() {
         ],
     );
     assert_eq!(cfg["upstream"], "https://cli-upstream.example");
-    assert_eq!(cfg["dict_url"], "https://cli-dict.example");
-    assert_eq!(cfg["cas_url"], "https://cli-cas.example");
+    assert_eq!(
+        cfg["dict_url"],
+        "https://cli-dict.example/mainnet_compact.dict"
+    );
+    assert_eq!(cfg["cas_url"], "https://cli-cas.example/cas");
 }
 
 #[test]
 fn effective_config_defaults_without_env_or_flags() {
     let cfg = run_effective_config(&["--print-effective-config"], &[]);
     assert_eq!(cfg["upstream"], "https://ethereum-rpc.publicnode.com");
-    assert_eq!(cfg["dict_url"], "http://localhost:8080");
-    assert_eq!(cfg["cas_url"], "http://localhost:8080");
+    assert_eq!(
+        cfg["dict_url"],
+        "http://localhost:8080/mainnet_compact.dict"
+    );
+    assert_eq!(cfg["cas_url"], "http://localhost:8080/cas");
 }
 
 #[test]
@@ -75,8 +84,11 @@ fn effective_config_partial_env_falls_back_to_defaults() {
         &[("DICT_URL", "https://env-dict.example/mainnet_compact.dict")],
     );
     assert_eq!(cfg["upstream"], "https://ethereum-rpc.publicnode.com");
-    assert_eq!(cfg["dict_url"], "https://env-dict.example");
-    assert_eq!(cfg["cas_url"], "http://localhost:8080");
+    assert_eq!(
+        cfg["dict_url"],
+        "https://env-dict.example/mainnet_compact.dict"
+    );
+    assert_eq!(cfg["cas_url"], "http://localhost:8080/cas");
 }
 
 #[test]
@@ -92,4 +104,31 @@ fn effective_config_invalid_env_urls_are_redacted_as_invalid() {
     assert_eq!(cfg["upstream"], "<invalid-url>");
     assert_eq!(cfg["dict_url"], "<invalid-url>");
     assert_eq!(cfg["cas_url"], "<invalid-url>");
+}
+
+#[test]
+fn effective_config_redacts_credentials_and_query_values_but_keeps_path_shape() {
+    let cfg = run_effective_config(
+        &["--print-effective-config"],
+        &[
+            (
+                "UPSTREAM_RPC_URL",
+                "https://user:pass@rpc.example/v2/abcd1234abcd1234?token=secret&network=mainnet",
+            ),
+            (
+                "DICT_URL",
+                "https://dict.example/mainnet_compact.dict?sig=abc",
+            ),
+            ("CAS_URL", "https://cas.example/cas?api_key=def"),
+        ],
+    );
+    assert_eq!(
+        cfg["upstream"],
+        "https://REDACTED:REDACTED@rpc.example/v2/REDACTED?token=REDACTED&network=REDACTED"
+    );
+    assert_eq!(
+        cfg["dict_url"],
+        "https://dict.example/mainnet_compact.dict?sig=REDACTED"
+    );
+    assert_eq!(cfg["cas_url"], "https://cas.example/cas?api_key=REDACTED");
 }

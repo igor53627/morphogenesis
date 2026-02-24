@@ -625,9 +625,9 @@ async fn main() -> Result<()> {
         println!(
             "{}",
             serde_json::json!({
-                "upstream": telemetry::sanitize_url_for_telemetry(&args.upstream),
-                "dict_url": telemetry::sanitize_url_for_telemetry(&args.dict_url),
-                "cas_url": telemetry::sanitize_url_for_telemetry(&args.cas_url),
+                "upstream": telemetry::redact_url_for_effective_config(&args.upstream),
+                "dict_url": telemetry::redact_url_for_effective_config(&args.dict_url),
+                "cas_url": telemetry::redact_url_for_effective_config(&args.cas_url),
             })
         );
         return Ok(());
@@ -1393,7 +1393,10 @@ mod tests {
             "https://cli-dict.example/cas",
         ]);
         assert_eq!(args.upstream, "https://cli-upstream.example");
-        assert_eq!(args.dict_url, "https://cli-dict.example/mainnet_compact.dict");
+        assert_eq!(
+            args.dict_url,
+            "https://cli-dict.example/mainnet_compact.dict"
+        );
         assert_eq!(args.cas_url, "https://cli-dict.example/cas");
     }
 
