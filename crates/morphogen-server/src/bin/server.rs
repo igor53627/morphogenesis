@@ -839,34 +839,41 @@ fn parse_env_usize(key: &str) -> Result<Option<usize>, StartupError> {
 }
 
 fn parse_env_usize_any(keys: &[&str]) -> Result<Option<usize>, StartupError> {
-    if keys.is_empty() {
+    let Some((legacy_key, preferred_keys)) = keys.split_last() else {
         return Ok(None);
+    };
+
+    if preferred_keys.is_empty() {
+        return parse_env_usize(legacy_key);
     }
 
-    let fallback_index = keys.len() - 1;
-    let mut preferred: Option<(&str, usize)> = None;
-
-    for &key in &keys[..fallback_index] {
-        let Some(value) = parse_env_usize(key)? else {
+    let mut selected: Option<(&str, usize)> = None;
+    for &key in preferred_keys {
+        let Some(raw) = env_var(key) else {
             continue;
         };
-        if let Some((existing_key, existing_value)) = preferred {
-            if existing_value != value {
+
+        let value = raw
+            .parse::<usize>()
+            .map_err(|e| StartupError::new(format!("invalid {} value '{}': {}", key, raw, e)))?;
+
+        if let Some((selected_key, selected_value)) = selected {
+            if value != selected_value {
                 return Err(StartupError::new(format!(
-                    "conflicting values for {} ({}) and {} ({})",
-                    existing_key, existing_value, key, value
+                    "conflicting {} ({}) and {} ({}) values; set only one or align them",
+                    selected_key, selected_value, key, value
                 )));
             }
         } else {
-            preferred = Some((key, value));
+            selected = Some((key, value));
         }
     }
 
-    if let Some((_, value)) = preferred {
+    if let Some((_, value)) = selected {
         return Ok(Some(value));
     }
 
-    parse_env_usize(keys[fallback_index])
+    parse_env_usize(legacy_key)
 }
 
 fn parse_env_u64(key: &str) -> Result<Option<u64>, StartupError> {
@@ -1601,7 +1608,7 @@ mod runtime_config_tests {
     }
 
     #[test]
-    fn parse_env_usize_any_rejects_conflicting_values() {
+    fn parse_env_usize_any_rejects_conflicting_prefixed_values() {
         let key_a = "MORPHOGEN_SERVER_A_MAX_CONCURRENT_SCANS_CONFLICT";
         let key_b = "MORPHOGEN_SERVER_B_MAX_CONCURRENT_SCANS_CONFLICT";
         let key_legacy = "MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS_CONFLICT";
@@ -1611,9 +1618,32 @@ mod runtime_config_tests {
 
         std::env::set_var(key_a, "21");
         std::env::set_var(key_b, "34");
-        let err =
-            parse_env_usize_any(&[key_a, key_b, key_legacy]).expect_err("conflict should fail");
-        assert!(err.to_string().contains("conflicting values"));
+        let err = parse_env_usize_any(&[key_a, key_b, key_legacy])
+            .expect_err("conflicting prefixed values should fail startup");
+        let err_text = err.to_string();
+        assert!(err_text.contains("conflicting"));
+        assert!(err_text.contains(key_a));
+        assert!(err_text.contains(key_b));
+
+        std::env::remove_var(key_a);
+        std::env::remove_var(key_b);
+        std::env::remove_var(key_legacy);
+    }
+
+    #[test]
+    fn parse_env_usize_any_prefixed_wins_when_legacy_conflicts() {
+        let key_a = "MORPHOGEN_SERVER_A_MAX_CONCURRENT_SCANS_LEGACY_CONFLICT";
+        let key_b = "MORPHOGEN_SERVER_B_MAX_CONCURRENT_SCANS_LEGACY_CONFLICT";
+        let key_legacy = "MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS_LEGACY_CONFLICT";
+        std::env::remove_var(key_a);
+        std::env::remove_var(key_b);
+        std::env::remove_var(key_legacy);
+
+        std::env::set_var(key_b, "31");
+        std::env::set_var(key_legacy, "19");
+        let parsed = parse_env_usize_any(&[key_a, key_b, key_legacy])
+            .expect("prefixed value should take precedence over legacy");
+        assert_eq!(parsed, Some(31));
 
         std::env::remove_var(key_a);
         std::env::remove_var(key_b);

@@ -132,3 +132,24 @@ fn effective_config_redacts_credentials_and_query_values_but_keeps_path_shape() 
     );
     assert_eq!(cfg["cas_url"], "https://cas.example/cas?api_key=REDACTED");
 }
+
+#[test]
+fn effective_config_redacts_short_sensitive_path_segments() {
+    let cfg = run_effective_config(
+        &["--print-effective-config"],
+        &[
+            (
+                "UPSTREAM_RPC_URL",
+                "https://rpc.example/v2/abc123?token=secret",
+            ),
+            ("DICT_URL", "https://dict.example/mainnet_compact.dict"),
+            ("CAS_URL", "https://cas.example/cas"),
+        ],
+    );
+    assert_eq!(
+        cfg["upstream"],
+        "https://rpc.example/v2/REDACTED?token=REDACTED"
+    );
+    assert_eq!(cfg["dict_url"], "https://dict.example/mainnet_compact.dict");
+    assert_eq!(cfg["cas_url"], "https://cas.example/cas");
+}

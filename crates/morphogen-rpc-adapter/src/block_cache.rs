@@ -30,6 +30,7 @@ struct CachedBlock {
 pub struct StoredFilter {
     kind: FilterKind,
     last_polled_block: u64,
+    pending_block_zero: bool,
     last_accessed: Instant,
 }
 
@@ -186,7 +187,7 @@ impl BlockCache {
                 continue;
             }
             if block.number > to_block {
-                break;
+                continue;
             }
             if let Some(block_logs) = self.logs.get(&block.number) {
                 for log in block_logs {
@@ -231,6 +232,7 @@ impl BlockCache {
             StoredFilter {
                 kind: FilterKind::Log(filter),
                 last_polled_block: cursor,
+                pending_block_zero: cursor == u64::MAX,
                 last_accessed: Instant::now(),
             },
         );
@@ -246,6 +248,7 @@ impl BlockCache {
             StoredFilter {
                 kind: FilterKind::Block,
                 last_polled_block: self.latest_block,
+                pending_block_zero: false,
                 last_accessed: Instant::now(),
             },
         );
@@ -261,6 +264,7 @@ impl BlockCache {
             StoredFilter {
                 kind: FilterKind::PendingTransaction,
                 last_polled_block: self.latest_block,
+                pending_block_zero: false,
                 last_accessed: Instant::now(),
             },
         );
@@ -271,11 +275,13 @@ impl BlockCache {
     /// Returns None if the filter ID doesn't exist.
     pub fn get_filter_changes(&mut self, id: &str) -> Option<Vec<Value>> {
         self.cleanup_expired_filters();
+        let has_cached_block_zero = self.cached_blocks.iter().any(|block| block.number == 0);
 
         enum PollAction {
             Log {
                 from_inclusive: u64,
                 to_inclusive: u64,
+                include_block_zero: bool,
             },
             Block {
                 from_exclusive: u64,
@@ -292,19 +298,32 @@ impl BlockCache {
             match &filter.kind {
                 FilterKind::Log(log_filter) => {
                     let to_inclusive = self.latest_block.min(log_filter.to_block);
-                    let from_inclusive = if from_exclusive == u64::MAX {
+                    let mut from_inclusive = if from_exclusive == u64::MAX {
                         log_filter.from_block
                     } else {
                         from_exclusive.saturating_add(1)
                     };
-                    // Only advance cursor forward (never backwards)
-                    if to_inclusive < from_inclusive {
-                        return Some(vec![]);
+                    let mut include_block_zero = false;
+
+                    if filter.pending_block_zero {
+                        if has_cached_block_zero {
+                            // If the cursor has advanced past 0, include block 0 once
+                            // separately so late insertion is not lost.
+                            include_block_zero = from_inclusive > 0;
+                            filter.pending_block_zero = false;
+                        } else if from_inclusive == 0 {
+                            // Keep block 0 pending, but still allow logs from higher blocks.
+                            from_inclusive = 1;
+                        }
                     }
-                    filter.last_polled_block = to_inclusive;
+
+                    if to_inclusive >= from_inclusive {
+                        filter.last_polled_block = to_inclusive;
+                    }
                     PollAction::Log {
                         from_inclusive,
                         to_inclusive,
+                        include_block_zero,
                     }
                 }
                 FilterKind::Block => {
@@ -326,6 +345,7 @@ impl BlockCache {
             PollAction::Log {
                 from_inclusive,
                 to_inclusive,
+                include_block_zero,
             } => {
                 let log_filter = match self.filters.get(id)? {
                     StoredFilter {
@@ -335,7 +355,15 @@ impl BlockCache {
                     // Preserve "filter exists" semantics even if kind unexpectedly diverges.
                     _ => return Some(vec![]),
                 };
-                Some(self.get_logs_in_range(log_filter, from_inclusive, to_inclusive))
+                let mut logs = if include_block_zero {
+                    self.get_logs_in_range(log_filter, 0, 0)
+                } else {
+                    Vec::new()
+                };
+                if to_inclusive >= from_inclusive {
+                    logs.extend(self.get_logs_in_range(log_filter, from_inclusive, to_inclusive));
+                }
+                Some(logs)
             }
             PollAction::Block {
                 from_exclusive,
@@ -1482,6 +1510,155 @@ mod tests {
 
         let changes = cache.get_filter_changes(&id).unwrap();
         assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn filter_log_get_changes_includes_block_zero_after_empty_initial_poll() {
+        let mut cache = BlockCache::new();
+
+        let filter = LogFilter {
+            from_block: 0,
+            to_block: u64::MAX,
+            addresses: Some(vec!["0xaaa".to_string()]),
+            topics: vec![],
+        };
+        let id = cache.create_log_filter(filter);
+
+        // First poll happens before block 0 is available.
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert!(changes.is_empty());
+
+        let log0 = make_log("0xaaa", &["0xevent0"]);
+        let r0 = make_receipt_with_logs(
+            "0xaa00000000000000000000000000000000000000000000000000000000000000",
+            vec![log0],
+        );
+        cache.insert_block(0, [0x01; 32], vec![], vec![([0xAA; 32], r0)]);
+
+        // Polling again should still return block 0.
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["address"].as_str().unwrap(), "0xaaa");
+    }
+
+    #[test]
+    fn filter_log_get_changes_includes_block_zero_after_latest_advances_before_cache_warmup() {
+        let mut cache = BlockCache::new();
+
+        let filter = LogFilter {
+            from_block: 0,
+            to_block: u64::MAX,
+            addresses: Some(vec!["0xaaa".to_string()]),
+            topics: vec![],
+        };
+        let id = cache.create_log_filter(filter);
+
+        // Simulate startup state where head height is known before block 0 is cached.
+        cache.latest_block = 5;
+
+        // Initial poll should not consume the block-0 sentinel cursor.
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert!(changes.is_empty());
+
+        let log0 = make_log("0xaaa", &["0xevent0"]);
+        let r0 = make_receipt_with_logs(
+            "0xaa00000000000000000000000000000000000000000000000000000000000000",
+            vec![log0],
+        );
+        cache.insert_block(0, [0x01; 32], vec![], vec![([0xAA; 32], r0)]);
+
+        // Polling again should still return block 0.
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["address"].as_str().unwrap(), "0xaaa");
+    }
+
+    #[test]
+    fn filter_log_get_changes_returns_higher_blocks_while_block_zero_pending() {
+        let mut cache = BlockCache::new();
+
+        let filter = LogFilter {
+            from_block: 0,
+            to_block: u64::MAX,
+            addresses: Some(vec!["0xaaa".to_string()]),
+            topics: vec![],
+        };
+        let id = cache.create_log_filter(filter);
+
+        let log1 = make_log("0xaaa", &["0xevent1"]);
+        let r1 = make_receipt_with_logs(
+            "0xbb00000000000000000000000000000000000000000000000000000000000000",
+            vec![log1],
+        );
+        cache.insert_block(1, [0x02; 32], vec![], vec![([0xBB; 32], r1)]);
+
+        // Polling should still return block 1 logs even though block 0 is absent.
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["topics"][0].as_str().unwrap(), "0xevent1");
+
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert!(changes.is_empty());
+
+        let log0 = make_log("0xaaa", &["0xevent0"]);
+        let r0 = make_receipt_with_logs(
+            "0xaa00000000000000000000000000000000000000000000000000000000000000",
+            vec![log0],
+        );
+        cache.insert_block(0, [0x01; 32], vec![], vec![([0xAA; 32], r0)]);
+
+        // Once block 0 arrives late, it should still be emitted exactly once.
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["topics"][0].as_str().unwrap(), "0xevent0");
+
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn filter_log_get_changes_keeps_block_zero_before_newer_logs_when_returned_together() {
+        let mut cache = BlockCache::new();
+
+        let filter = LogFilter {
+            from_block: 0,
+            to_block: u64::MAX,
+            addresses: Some(vec!["0xaaa".to_string()]),
+            topics: vec![],
+        };
+        let id = cache.create_log_filter(filter);
+
+        let log1 = make_log("0xaaa", &["0xevent1"]);
+        let r1 = make_receipt_with_logs(
+            "0xbb00000000000000000000000000000000000000000000000000000000000000",
+            vec![log1],
+        );
+        cache.insert_block(1, [0x02; 32], vec![], vec![([0xBB; 32], r1)]);
+
+        // Consume block 1 so the cursor advances while block 0 is still pending.
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0]["topics"][0].as_str().unwrap(), "0xevent1");
+
+        let log2 = make_log("0xaaa", &["0xevent2"]);
+        let r2 = make_receipt_with_logs(
+            "0xcc00000000000000000000000000000000000000000000000000000000000000",
+            vec![log2],
+        );
+        cache.insert_block(2, [0x03; 32], vec![], vec![([0xCC; 32], r2)]);
+
+        let log0 = make_log("0xaaa", &["0xevent0"]);
+        let r0 = make_receipt_with_logs(
+            "0xaa00000000000000000000000000000000000000000000000000000000000000",
+            vec![log0],
+        );
+        cache.insert_block(0, [0x01; 32], vec![], vec![([0xAA; 32], r0)]);
+
+        // When late block 0 and newer logs are emitted together, keep chronological order.
+        let changes = cache.get_filter_changes(&id).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0]["topics"][0].as_str().unwrap(), "0xevent0");
+        assert_eq!(changes[1]["topics"][0].as_str().unwrap(), "0xevent2");
     }
 
     #[test]

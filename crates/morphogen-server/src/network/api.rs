@@ -1227,7 +1227,9 @@ pub async fn ws_epoch_handler(
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     let epoch_rx = state.epoch_rx.clone();
-    ws.on_upgrade(move |socket| handle_ws_epoch(socket, epoch_rx))
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_ws_epoch(socket, epoch_rx))
 }
 
 async fn handle_ws_epoch(mut socket: WebSocket, mut epoch_rx: watch::Receiver<EpochMetadata>) {
@@ -1258,7 +1260,9 @@ pub async fn ws_query_handler(
     State(state): State<Arc<AppState>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_query(socket, state))
+    ws.max_message_size(MAX_WS_MESSAGE_BYTES)
+        .max_frame_size(MAX_WS_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_ws_query(socket, state))
 }
 
 #[cfg_attr(feature = "tracing", instrument(skip(state, request)))]
@@ -1684,7 +1688,7 @@ async fn handle_ws_single_query(state: &AppState, request: QueryRequest) -> Stri
 
 async fn handle_ws_batch_query(state: &AppState, request: BatchQueryRequest) -> String {
     use crate::scan::scan_consistent;
-    use morphogen_dpf::{AesDpfKey, DpfKey};
+    use morphogen_dpf::AesDpfKey;
 
     let n = request.queries.len();
     if n == 0 || n > MAX_BATCH_SIZE {
@@ -1780,18 +1784,7 @@ async fn handle_ws_batch_query(state: &AppState, request: BatchQueryRequest) -> 
         let mut results = Vec::with_capacity(n);
         for keys in &all_keys {
             let mut payloads = crate::scan::scan_main_matrix(matrix.as_ref(), keys, row_size_bytes);
-            for entry in &entries {
-                for (k, key) in keys.iter().enumerate() {
-                    if key.eval_bit(entry.row_idx) {
-                        if entry.diff.len() != payloads[k].len() {
-                            return Err(());
-                        }
-                        for (d, s) in payloads[k].iter_mut().zip(entry.diff.iter()) {
-                            *d ^= s;
-                        }
-                    }
-                }
-            }
+            apply_delta_entries_to_payloads(&mut payloads, keys, &entries).map_err(|_| ())?;
             results.push(BatchQueryResult {
                 payloads: payload_array_into_vec(payloads),
             });
@@ -1813,27 +1806,83 @@ async fn handle_ws_batch_query(state: &AppState, request: BatchQueryRequest) -> 
 }
 
 async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
-    while let Some(Ok(msg)) = socket.recv().await {
-        if let Message::Text(text) = msg {
-            if text.len() > MAX_WS_MESSAGE_BYTES {
-                let error = ws_error_json("message too large", "message_too_large");
-                let _ = socket.send(Message::Text(error.into())).await;
-                continue;
-            }
+    use std::collections::VecDeque;
 
-            // Try batch request first (has "queries" field), fall back to single query
-            let response = if let Ok(batch) = serde_json::from_str::<BatchQueryRequest>(&text) {
-                handle_ws_batch_query(&state, batch).await
+    let mut queued_text_messages: VecDeque<String> = VecDeque::new();
+
+    loop {
+        let text = if let Some(queued) = queued_text_messages.pop_front() {
+            queued
+        } else {
+            let Some(Ok(msg)) = socket.recv().await else {
+                break;
+            };
+            match msg {
+                Message::Text(text) => text.to_string(),
+                Message::Close(_) => break,
+                _ => continue,
+            }
+        };
+
+        if text.len() > MAX_WS_MESSAGE_BYTES {
+            let error = ws_error_json("message too large", "message_too_large");
+            let _ = socket.send(Message::Text(error.into())).await;
+            continue;
+        }
+
+        let handler_state = Arc::clone(&state);
+        let request_text = text;
+        let mut response_task = tokio::spawn(async move {
+            // Try batch request first (has "queries" field), fall back to single query.
+            if let Ok(batch) = serde_json::from_str::<BatchQueryRequest>(&request_text) {
+                handle_ws_batch_query(&handler_state, batch).await
             } else {
-                match serde_json::from_str::<QueryRequest>(&text) {
-                    Ok(request) => handle_ws_single_query(&state, request).await,
+                match serde_json::from_str::<QueryRequest>(&request_text) {
+                    Ok(request) => handle_ws_single_query(&handler_state, request).await,
                     Err(e) => ws_error_json(&e.to_string(), "bad_request"),
                 }
-            };
-
-            if socket.send(Message::Text(response.into())).await.is_err() {
-                break;
             }
+        });
+
+        let response = loop {
+            tokio::select! {
+                result = &mut response_task => {
+                    break match result {
+                        Ok(response) => response,
+                        Err(_) => ws_error_json("internal error", "internal_error"),
+                    };
+                }
+                incoming = socket.recv() => {
+                    match incoming {
+                        Some(Ok(Message::Text(next_text))) => {
+                            let next_text = next_text.to_string();
+                            if next_text.len() > MAX_WS_MESSAGE_BYTES {
+                                let error = ws_error_json("message too large", "message_too_large");
+                                let _ = socket.send(Message::Text(error.into())).await;
+                                continue;
+                            }
+                            if queued_text_messages.len() >= MAX_WS_QUEUED_MESSAGES {
+                                let error = ws_error_json(
+                                    "too many queued websocket messages",
+                                    "too_many_messages",
+                                );
+                                let _ = socket.send(Message::Text(error.into())).await;
+                                continue;
+                            }
+                            queued_text_messages.push_back(next_text);
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+                            response_task.abort();
+                            return;
+                        }
+                        Some(Ok(_)) => {}
+                    }
+                }
+            }
+        };
+
+        if socket.send(Message::Text(response.into())).await.is_err() {
+            break;
         }
     }
 }
@@ -1845,6 +1894,9 @@ pub const MAX_REQUEST_BODY_SIZE: usize = 64 * 1024;
 
 /// Maximum WebSocket message size (same limit as HTTP body)
 pub const MAX_WS_MESSAGE_BYTES: usize = MAX_REQUEST_BODY_SIZE;
+
+/// Maximum number of queued websocket text messages while one request is in-flight.
+pub const MAX_WS_QUEUED_MESSAGES: usize = 32;
 
 /// Maximum concurrent PIR scans (query + page query endpoints)
 /// Limits CPU usage under load; additional requests get 503
@@ -2345,6 +2397,92 @@ mod tests {
         churn_task
             .await
             .expect("epoch churn task should complete cleanly");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_single_query_retry_backoff_does_not_starve_runtime_timers() {
+        use morphogen_dpf::AesDpfKey;
+        use std::time::Duration;
+
+        let state = test_state();
+        let current_epoch = state.global.load().epoch_id;
+        state
+            .global
+            .store_pending(Arc::new(DeltaBuffer::new_with_epoch(
+                state.row_size_bytes,
+                current_epoch.saturating_add(1),
+            )));
+
+        let mut rng = rand::thread_rng();
+        let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let key = k0.to_bytes().to_vec();
+        let request = QueryRequest {
+            keys: vec![key.clone(), key.clone(), key],
+        };
+
+        let timer = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        let handler_state = Arc::clone(&state);
+        let handler =
+            tokio::spawn(async move { handle_ws_single_query(&handler_state, request).await });
+
+        tokio::time::timeout(Duration::from_millis(500), timer)
+            .await
+            .expect("timer task should complete without runtime starvation")
+            .expect("timer task join should succeed");
+
+        let response = tokio::time::timeout(Duration::from_secs(3), handler)
+            .await
+            .expect("ws single query handler should complete")
+            .expect("ws single query handler task should join");
+        let body: serde_json::Value =
+            serde_json::from_str(&response).expect("response should be valid JSON");
+        assert_eq!(body["code"], "too_many_retries");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ws_batch_query_retry_backoff_does_not_starve_runtime_timers() {
+        use morphogen_dpf::AesDpfKey;
+        use std::time::Duration;
+
+        let state = test_state();
+        let current_epoch = state.global.load().epoch_id;
+        state
+            .global
+            .store_pending(Arc::new(DeltaBuffer::new_with_epoch(
+                state.row_size_bytes,
+                current_epoch.saturating_add(1),
+            )));
+
+        let mut rng = rand::thread_rng();
+        let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let key = k0.to_bytes().to_vec();
+        let request = BatchQueryRequest {
+            queries: vec![QueryRequest {
+                keys: vec![key.clone(), key.clone(), key],
+            }],
+        };
+
+        let timer = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        let handler_state = Arc::clone(&state);
+        let handler =
+            tokio::spawn(async move { handle_ws_batch_query(&handler_state, request).await });
+
+        tokio::time::timeout(Duration::from_millis(500), timer)
+            .await
+            .expect("timer task should complete without runtime starvation")
+            .expect("timer task join should succeed");
+
+        let response = tokio::time::timeout(Duration::from_secs(3), handler)
+            .await
+            .expect("ws batch query handler should complete")
+            .expect("ws batch query handler task should join");
+        let body: serde_json::Value =
+            serde_json::from_str(&response).expect("response should be valid JSON");
+        assert_eq!(body["code"], "too_many_retries");
     }
 
     #[tokio::test]
