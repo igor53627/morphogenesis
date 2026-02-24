@@ -82,7 +82,7 @@ The adapter runs on `:8545` as a drop-in replacement for standard Ethereum RPC p
 
 ## Browser WASM Gateway
 
-For browser-first EIP-1193 integration (without a localhost proxy), see:
+For browser-first EIP-1193 integration (without a localhost proxy), see the experimental WASM gateway docs:
 
 - [WASM Gateway Guide](docs/WASM_GATEWAY.md)
 - [WASM Demo Integration](examples/wasm-gateway/README.md)
@@ -99,7 +99,7 @@ For browser-first EIP-1193 integration (without a localhost proxy), see:
 - [Protocol & Architecture](docs/morphogenesis_protocol.md) - v5.0
 - [Paper (LaTeX)](docs/paper/morphogenesis.pdf) - Academic paper
 - [Performance](docs/PERFORMANCE.md) - Benchmark results and analysis
-- [WASM Gateway](docs/WASM_GATEWAY.md) - Browser setup, method matrix, CORS, and MVP limits
+- [WASM Gateway](docs/WASM_GATEWAY.md) - Experimental support tier, compatibility matrix, browser setup, and CORS requirements
 - [Profiling Guide](docs/PROFILING_GUIDE.md) - How to profile scan engines
 - [Cryptography](docs/CRYPTOGRAPHY.md) - Fused kernel and DPF internals
 - [Crypto Analysis](docs/CRYPTO_ANALYSIS.md) - ChaCha8 vs AES on GPUs

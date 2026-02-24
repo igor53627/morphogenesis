@@ -1,7 +1,34 @@
-# WASM Gateway (MVP)
+# WASM Gateway (Experimental)
 
 `morphogen-wasm-gateway` is an EIP-1193-compatible browser facade exported via `wasm-bindgen`.
 It routes private reads to PIR/CAS and safe reads to upstream RPC.
+
+## Support Tier
+
+Current tier: **Experimental**.
+
+- Not production-supported yet (no SLA/backward-compatibility guarantees).
+- Intended for evaluation, demos, and controlled internal rollouts.
+- Production wallet deployments should use `morphogen-rpc-adapter` until this tier is raised.
+
+## Compatibility Matrix
+
+### Runtime Compatibility
+
+| Runtime | Status | Notes |
+|---|---|---|
+| Browser (extension/page, EIP-1193 provider bridge) | Experimental | Main target surface |
+| Node test harness (`wasm-pack test --node`) | Experimental | Validation harness only |
+| Native Rust tests (`cargo test -p morphogen-wasm-gateway`) | Supported for dev checks | Logic parity checks |
+
+### RPC Compatibility
+
+| Category | Methods | Behavior |
+|---|---|---|
+| Private read (PIR) | `eth_getBalance`, `eth_getTransactionCount`, `eth_getStorageAt`, `eth_getCode` | Private path only, no upstream fallback; block tag currently restricted to `latest` |
+| Safe read passthrough | Explicit allowlist in `SAFE_READ_ONLY_PASSTHROUGH_METHODS` (for example `eth_chainId`, `eth_blockNumber`, `eth_call`, `eth_estimateGas`, `eth_getLogs`) | Forwarded upstream |
+| High-impact stateful/write/sign | `eth_send*`, `eth_sign*`, `personal_sign`, `eth_accounts`, `eth_requestAccounts`, `eth_submit*`, filter/subscription state methods | **Hard rejected** with `-32601` |
+| Unknown/unlisted methods | Any method not in private or safe allowlists | Rejected with `-32601` |
 
 ## Build & Test
 
@@ -15,6 +42,16 @@ cargo build -p morphogen-wasm-gateway --target wasm32-unknown-unknown
 # wasm test harness (Node via wasm-pack)
 wasm-pack test --node crates/morphogen-wasm-gateway
 ```
+
+## CI / Release Checks (Experimental Tier)
+
+The experimental tier is guarded by CI checks that validate:
+
+- crate logic/tests (`cargo test -p morphogen-wasm-gateway`)
+- wasm target buildability (`cargo build -p morphogen-wasm-gateway --target wasm32-unknown-unknown`)
+- wasm runtime harness via Node (`wasm-pack test --node crates/morphogen-wasm-gateway`)
+
+These checks run in the `WASM Gateway (experimental)` CI job.
 
 ## JavaScript API
 
@@ -43,7 +80,7 @@ const balance = await gateway.request({
 { "code": -32602, "message": "...", "data": null }
 ```
 
-## Method Routing Matrix (MVP)
+## Method Routing Matrix
 
 | Method | Route | Notes |
 |---|---|---|
@@ -73,7 +110,7 @@ For browser usage, all endpoints must allow your extension/page origin.
 - Upstream RPC endpoint:
   - `POST` with `Content-Type: application/json`
 
-## MVP Non-Goals
+## Experimental Non-Goals
 
 - No in-browser JSON-RPC HTTP server
 - No local EVM execution for `eth_call` / `eth_estimateGas`
