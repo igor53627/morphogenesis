@@ -1,0 +1,9 @@
+services:
+  morphogen-rpc-adapter:
+    depends_on:
+      code-data:
+        condition: service_healthy
+      morphogen-server-a:
+        condition: service_healthy
+      morphogen-server-b:
+        condition: service_healthy

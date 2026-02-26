@@ -1,0 +1,89 @@
+services:
+  code-data:
+    profiles: ["local-code-data"]
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
+    restart: unless-stopped
+    volumes:
+      - ./data/code:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /usr/share/nginx/html/mainnet_compact.dict && test -d /usr/share/nginx/html/cas && find /usr/share/nginx/html/cas -mindepth 1 -print -quit | grep -q ."]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  morphogen-server-a:
+    image: ${MORPHOGEN_SERVER_IMAGE:?set immutable morphogen-server image ref (tag or digest)}
+    restart: unless-stopped
+    environment:
+      MORPHOGEN_SERVER_ENV: ${MORPHOGEN_SERVER_A_ENV:-prod}
+      MORPHOGEN_SERVER_BIND_ADDR: ${MORPHOGEN_SERVER_A_BIND_ADDR:-0.0.0.0:3000}
+      MORPHOGEN_SERVER_MATRIX_FILE: ${MORPHOGEN_SERVER_A_MATRIX_FILE:-/var/lib/morphogen/matrix.bin}
+      MORPHOGEN_SERVER_PAGE_PRG_KEY_0: ${MORPHOGEN_SERVER_A_PAGE_PRG_KEY_0:?set a non-zero 16-byte hex key}
+      MORPHOGEN_SERVER_PAGE_PRG_KEY_1: ${MORPHOGEN_SERVER_A_PAGE_PRG_KEY_1:?set a non-zero 16-byte hex key}
+      MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS: ${MORPHOGEN_SERVER_A_MAX_CONCURRENT_SCANS:-${MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS:-32}}
+      MORPHOGEN_SERVER_MERGE_INTERVAL_MS: ${MORPHOGEN_SERVER_A_MERGE_INTERVAL_MS:-1000}
+    volumes:
+      - ./state/server-a:/var/lib/morphogen
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3000/health | tr -d '[:space:]' | grep -q '\"status\":\"ok\"'"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+
+  morphogen-server-b:
+    image: ${MORPHOGEN_SERVER_IMAGE:?set immutable morphogen-server image ref (tag or digest)}
+    restart: unless-stopped
+    environment:
+      MORPHOGEN_SERVER_ENV: ${MORPHOGEN_SERVER_B_ENV:-prod}
+      MORPHOGEN_SERVER_BIND_ADDR: ${MORPHOGEN_SERVER_B_BIND_ADDR:-0.0.0.0:3000}
+      MORPHOGEN_SERVER_MATRIX_FILE: ${MORPHOGEN_SERVER_B_MATRIX_FILE:-/var/lib/morphogen/matrix.bin}
+      MORPHOGEN_SERVER_PAGE_PRG_KEY_0: ${MORPHOGEN_SERVER_B_PAGE_PRG_KEY_0:?set a non-zero 16-byte hex key}
+      MORPHOGEN_SERVER_PAGE_PRG_KEY_1: ${MORPHOGEN_SERVER_B_PAGE_PRG_KEY_1:?set a non-zero 16-byte hex key}
+      MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS: ${MORPHOGEN_SERVER_B_MAX_CONCURRENT_SCANS:-${MORPHOGEN_SERVER_MAX_CONCURRENT_SCANS:-32}}
+      MORPHOGEN_SERVER_MERGE_INTERVAL_MS: ${MORPHOGEN_SERVER_B_MERGE_INTERVAL_MS:-1000}
+    volumes:
+      - ./state/server-b:/var/lib/morphogen
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3000/health | tr -d '[:space:]' | grep -q '\"status\":\"ok\"'"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 20s
+
+  morphogen-rpc-adapter:
+    image: ${MORPHOGEN_RPC_ADAPTER_IMAGE:?set immutable morphogen-rpc-adapter image ref (tag or digest)}
+    restart: unless-stopped
+    depends_on:
+      morphogen-server-a:
+        condition: service_healthy
+      morphogen-server-b:
+        condition: service_healthy
+    environment:
+      UPSTREAM_RPC_URL: ${UPSTREAM_RPC_URL:?set upstream rpc url}
+      DICT_URL: ${DICT_URL:?set DICT_URL (use http://code-data/mainnet_compact.dict with --profile local-code-data)}
+      CAS_URL: ${CAS_URL:?set CAS_URL (use http://code-data/cas with --profile local-code-data)}
+    command:
+      - --port
+      - "8545"
+      - --pir-server-a
+      - http://morphogen-server-a:3000
+      - --pir-server-b
+      - http://morphogen-server-b:3000
+      - --environment
+      - prod
+      - --otel-env
+      - production
+    ports:
+      - "${RPC_BIND_HOST:-127.0.0.1}:8545:8545"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS -H 'content-type: application/json' --data '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"web3_clientVersion\",\"params\":[]}' http://127.0.0.1:8545 | tr -d '[:space:]' | grep -q '\"result\":'",
+        ]
+      interval: 10s
+      timeout: 4s
+      retries: 8
+      start_period: 30s

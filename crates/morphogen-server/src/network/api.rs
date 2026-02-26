@@ -669,6 +669,10 @@ fn scan_error_to_status(e: crate::scan::ScanError) -> StatusCode {
     }
 }
 
+fn payload_array_into_vec(payloads: [Vec<u8>; 3]) -> Vec<Vec<u8>> {
+    Vec::from(payloads)
+}
+
 fn apply_delta_entries_to_payloads<K: morphogen_dpf::DpfKey>(
     payloads: &mut [Vec<u8>; 3],
     keys: &[K; 3],
@@ -697,13 +701,12 @@ fn scan_batch_results_from_snapshot<K: morphogen_dpf::DpfKey>(
 ) -> Result<Vec<BatchQueryResult>, StatusCode> {
     #[cfg(feature = "fused-batch-scan")]
     {
-        let mut payload_sets =
-            crate::scan::scan_main_matrix_multi(matrix, all_keys, row_size_bytes);
+        let payload_sets = crate::scan::scan_main_matrix_multi(matrix, all_keys, row_size_bytes);
         let mut results = Vec::with_capacity(all_keys.len());
-        for (keys, payloads) in all_keys.iter().zip(payload_sets.iter_mut()) {
-            apply_delta_entries_to_payloads(payloads, keys, entries)?;
+        for (keys, mut payloads) in all_keys.iter().zip(payload_sets.into_iter()) {
+            apply_delta_entries_to_payloads(&mut payloads, keys, entries)?;
             results.push(BatchQueryResult {
-                payloads: payloads.to_vec(),
+                payloads: payload_array_into_vec(payloads),
             });
         }
         return Ok(results);
@@ -716,7 +719,7 @@ fn scan_batch_results_from_snapshot<K: morphogen_dpf::DpfKey>(
             let mut payloads = crate::scan::scan_main_matrix(matrix, keys, row_size_bytes);
             apply_delta_entries_to_payloads(&mut payloads, keys, entries)?;
             results.push(BatchQueryResult {
-                payloads: payloads.to_vec(),
+                payloads: payload_array_into_vec(payloads),
             });
         }
         Ok(results)
@@ -1111,17 +1114,19 @@ pub async fn query_handler(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
-    let (results, epoch_id) = scan_consistent(
-        state.global.as_ref(),
-        state.global.load_pending().as_ref(),
-        &keys,
-        state.row_size_bytes,
-    )
+    let global = Arc::clone(&state.global);
+    let row_size_bytes = state.row_size_bytes;
+    let (results, epoch_id) = tokio::task::spawn_blocking(move || {
+        let pending = global.load_pending();
+        scan_consistent(global.as_ref(), pending.as_ref(), &keys, row_size_bytes)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .map_err(scan_error_to_status)?;
 
     Ok(Json(QueryResponse {
         epoch_id,
-        payloads: results.to_vec(),
+        payloads: payload_array_into_vec(results),
     }))
 }
 
@@ -1170,13 +1175,22 @@ pub async fn batch_query_handler(
         // Epoch changed during snapshot — fall back to per-query scan_consistent
         let mut results = Vec::with_capacity(n);
         let mut batch_epoch: Option<u64> = None;
+        let global = Arc::clone(&state.global);
+        let row_size_bytes = state.row_size_bytes;
         for keys in &all_keys {
-            let (payloads, query_epoch) = crate::scan::scan_consistent(
-                state.global.as_ref(),
-                state.global.load_pending().as_ref(),
-                keys,
-                state.row_size_bytes,
-            )
+            let keys = keys.clone();
+            let global_for_scan = Arc::clone(&global);
+            let (payloads, query_epoch) = tokio::task::spawn_blocking(move || {
+                let pending_for_scan = global_for_scan.load_pending();
+                crate::scan::scan_consistent(
+                    global_for_scan.as_ref(),
+                    pending_for_scan.as_ref(),
+                    &keys,
+                    row_size_bytes,
+                )
+            })
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .map_err(scan_error_to_status)?;
             match batch_epoch {
                 None => batch_epoch = Some(query_epoch),
@@ -1186,7 +1200,7 @@ pub async fn batch_query_handler(
                 _ => {}
             }
             results.push(BatchQueryResult {
-                payloads: payloads.to_vec(),
+                payloads: payload_array_into_vec(payloads),
             });
         }
         let epoch_id = batch_epoch.unwrap_or_else(|| state.global.load().epoch_id);
@@ -1194,12 +1208,13 @@ pub async fn batch_query_handler(
     }
 
     // All queries share the same consistent snapshot
-    let results = scan_batch_results_from_snapshot(
-        snapshot1.matrix.as_ref(),
-        &all_keys,
-        &entries,
-        state.row_size_bytes,
-    )?;
+    let matrix = Arc::clone(&snapshot1.matrix);
+    let row_size_bytes = state.row_size_bytes;
+    let results = tokio::task::spawn_blocking(move || {
+        scan_batch_results_from_snapshot(matrix.as_ref(), &all_keys, &entries, row_size_bytes)
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)??;
 
     Ok(Json(BatchQueryResponse {
         epoch_id: epoch1,
@@ -1288,17 +1303,22 @@ pub async fn page_query_handler(
         _ => return Err(StatusCode::BAD_REQUEST),
     };
 
-    let (results, epoch_id) = scan_pages_consistent(
-        state.global.as_ref(),
-        &keys,
-        PAGE_SIZE_BYTES,
-        OPTIMAL_DPF_CHUNK_SIZE,
-    )
+    let global = Arc::clone(&state.global);
+    let (results, epoch_id) = tokio::task::spawn_blocking(move || {
+        scan_pages_consistent(
+            global.as_ref(),
+            &keys,
+            PAGE_SIZE_BYTES,
+            OPTIMAL_DPF_CHUNK_SIZE,
+        )
+    })
+    .await
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     .map_err(scan_error_to_status)?;
 
     Ok(Json(PageQueryResponse {
         epoch_id,
-        pages: results.to_vec(),
+        pages: payload_array_into_vec(results),
         #[cfg(feature = "verifiable-pir")]
         proof: None,
     }))
@@ -1611,7 +1631,7 @@ fn ws_error_json(error: &str, code: &str) -> String {
     .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string())
 }
 
-fn handle_ws_single_query(state: &AppState, request: QueryRequest) -> String {
+async fn handle_ws_single_query(state: &AppState, request: QueryRequest) -> String {
     use crate::scan::scan_consistent;
     use morphogen_dpf::AesDpfKey;
 
@@ -1628,15 +1648,22 @@ fn handle_ws_single_query(state: &AppState, request: QueryRequest) -> String {
     match keys_result {
         (Ok(k0), Ok(k1), Ok(k2)) => {
             let keys = [k0, k1, k2];
-            match scan_consistent(
-                state.global.as_ref(),
-                state.global.load_pending().as_ref(),
-                &keys,
-                state.row_size_bytes,
-            ) {
+            let global = Arc::clone(&state.global);
+            let row_size_bytes = state.row_size_bytes;
+            let scan_result = match tokio::task::spawn_blocking(move || {
+                let pending = global.load_pending();
+                scan_consistent(global.as_ref(), pending.as_ref(), &keys, row_size_bytes)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => return ws_error_json("internal error", "internal_error"),
+            };
+
+            match scan_result {
                 Ok((results, epoch_id)) => serde_json::to_string(&QueryResponse {
                     epoch_id,
-                    payloads: results.to_vec(),
+                    payloads: payload_array_into_vec(results),
                 })
                 .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string()),
                 Err(e) => {
@@ -1655,7 +1682,7 @@ fn handle_ws_single_query(state: &AppState, request: QueryRequest) -> String {
     }
 }
 
-fn handle_ws_batch_query(state: &AppState, request: BatchQueryRequest) -> String {
+async fn handle_ws_batch_query(state: &AppState, request: BatchQueryRequest) -> String {
     use crate::scan::scan_consistent;
     use morphogen_dpf::{AesDpfKey, DpfKey};
 
@@ -1694,13 +1721,27 @@ fn handle_ws_batch_query(state: &AppState, request: BatchQueryRequest) -> String
         // Fallback: per-query scan_consistent, tracking epoch consistency
         let mut results = Vec::with_capacity(n);
         let mut batch_epoch: Option<u64> = None;
+        let global = Arc::clone(&state.global);
+        let row_size_bytes = state.row_size_bytes;
         for keys in &all_keys {
-            match scan_consistent(
-                state.global.as_ref(),
-                state.global.load_pending().as_ref(),
-                keys,
-                state.row_size_bytes,
-            ) {
+            let keys = keys.clone();
+            let global_for_scan = Arc::clone(&global);
+            let scan_result = match tokio::task::spawn_blocking(move || {
+                let pending_for_scan = global_for_scan.load_pending();
+                scan_consistent(
+                    global_for_scan.as_ref(),
+                    pending_for_scan.as_ref(),
+                    &keys,
+                    row_size_bytes,
+                )
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => return ws_error_json("internal error", "internal_error"),
+            };
+
+            match scan_result {
                 Ok((payloads, query_epoch)) => {
                     match batch_epoch {
                         None => batch_epoch = Some(query_epoch),
@@ -1713,7 +1754,7 @@ fn handle_ws_batch_query(state: &AppState, request: BatchQueryRequest) -> String
                         _ => {}
                     }
                     results.push(BatchQueryResult {
-                        payloads: payloads.to_vec(),
+                        payloads: payload_array_into_vec(payloads),
                     });
                 }
                 Err(e) => {
@@ -1733,26 +1774,36 @@ fn handle_ws_batch_query(state: &AppState, request: BatchQueryRequest) -> String
             .unwrap_or_else(|_| WS_INTERNAL_ERROR.to_string());
     }
 
-    let mut results = Vec::with_capacity(n);
-    for keys in &all_keys {
-        let mut payloads =
-            crate::scan::scan_main_matrix(snapshot1.matrix.as_ref(), keys, state.row_size_bytes);
-        for entry in &entries {
-            for (k, key) in keys.iter().enumerate() {
-                if key.eval_bit(entry.row_idx) {
-                    if entry.diff.len() != payloads[k].len() {
-                        return ws_error_json("delta length mismatch", "internal_error");
-                    }
-                    for (d, s) in payloads[k].iter_mut().zip(entry.diff.iter()) {
-                        *d ^= s;
+    let matrix = Arc::clone(&snapshot1.matrix);
+    let row_size_bytes = state.row_size_bytes;
+    let results = match tokio::task::spawn_blocking(move || {
+        let mut results = Vec::with_capacity(n);
+        for keys in &all_keys {
+            let mut payloads = crate::scan::scan_main_matrix(matrix.as_ref(), keys, row_size_bytes);
+            for entry in &entries {
+                for (k, key) in keys.iter().enumerate() {
+                    if key.eval_bit(entry.row_idx) {
+                        if entry.diff.len() != payloads[k].len() {
+                            return Err(());
+                        }
+                        for (d, s) in payloads[k].iter_mut().zip(entry.diff.iter()) {
+                            *d ^= s;
+                        }
                     }
                 }
             }
+            results.push(BatchQueryResult {
+                payloads: payload_array_into_vec(payloads),
+            });
         }
-        results.push(BatchQueryResult {
-            payloads: payloads.to_vec(),
-        });
-    }
+        Ok(results)
+    })
+    .await
+    {
+        Ok(Ok(results)) => results,
+        Ok(Err(())) => return ws_error_json("delta length mismatch", "internal_error"),
+        Err(_) => return ws_error_json("internal error", "internal_error"),
+    };
 
     serde_json::to_string(&BatchQueryResponse {
         epoch_id: epoch1,
@@ -1772,10 +1823,10 @@ async fn handle_ws_query(mut socket: WebSocket, state: Arc<AppState>) {
 
             // Try batch request first (has "queries" field), fall back to single query
             let response = if let Ok(batch) = serde_json::from_str::<BatchQueryRequest>(&text) {
-                handle_ws_batch_query(&state, batch)
+                handle_ws_batch_query(&state, batch).await
             } else {
                 match serde_json::from_str::<QueryRequest>(&text) {
-                    Ok(request) => handle_ws_single_query(&state, request),
+                    Ok(request) => handle_ws_single_query(&state, request).await,
                     Err(e) => ws_error_json(&e.to_string(), "bad_request"),
                 }
             };
@@ -1853,6 +1904,7 @@ mod tests {
     use morphogen_storage::ChunkedMatrix;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     fn test_state() -> Arc<AppState> {
         let row_size_bytes = 256;
@@ -2000,6 +2052,20 @@ mod tests {
     }
 
     #[test]
+    fn payload_array_into_vec_moves_without_copying() {
+        let payloads = [vec![0xAA, 0xBB], vec![0xCC], vec![0xDD, 0xEE, 0xFF]];
+        let ptr0 = payloads[0].as_ptr() as usize;
+        let ptr1 = payloads[1].as_ptr() as usize;
+        let ptr2 = payloads[2].as_ptr() as usize;
+
+        let moved = payload_array_into_vec(payloads);
+        assert_eq!(moved.len(), 3);
+        assert_eq!(moved[0].as_ptr() as usize, ptr0);
+        assert_eq!(moved[1].as_ptr() as usize, ptr1);
+        assert_eq!(moved[2].as_ptr() as usize, ptr2);
+    }
+
+    #[test]
     fn admin_token_eq_constant_time_compares_values_and_lengths() {
         assert!(admin_token_eq_constant_time(
             "test-admin-token",
@@ -2091,6 +2157,194 @@ mod tests {
         let result = batch_query_handler(State(state), Json(request)).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_handler_retry_backoff_does_not_starve_runtime_timers() {
+        use morphogen_dpf::AesDpfKey;
+        use std::time::Duration;
+
+        let state = test_state();
+        let current_epoch = state.global.load().epoch_id;
+        state
+            .global
+            .store_pending(Arc::new(DeltaBuffer::new_with_epoch(
+                state.row_size_bytes,
+                current_epoch.saturating_add(1),
+            )));
+
+        let mut rng = rand::thread_rng();
+        let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let key = k0.to_bytes().to_vec();
+        let request = QueryRequest {
+            keys: vec![key.clone(), key.clone(), key],
+        };
+
+        let timer = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        let handler = tokio::spawn(query_handler(State(state), Json(request)));
+
+        tokio::time::timeout(Duration::from_millis(500), timer)
+            .await
+            .expect("timer task should complete without runtime starvation")
+            .expect("timer task join should succeed");
+
+        let handler_result = tokio::time::timeout(Duration::from_secs(3), handler)
+            .await
+            .expect("query handler should complete")
+            .expect("query handler task should join");
+        match handler_result {
+            Ok(_) => panic!("mismatched pending epoch should fail after retries"),
+            Err(status) => assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn batch_query_handler_retry_backoff_does_not_starve_runtime_timers() {
+        use morphogen_dpf::AesDpfKey;
+        use std::time::Duration;
+
+        let state = test_state();
+        let current_epoch = state.global.load().epoch_id;
+        state
+            .global
+            .store_pending(Arc::new(DeltaBuffer::new_with_epoch(
+                state.row_size_bytes,
+                current_epoch.saturating_add(1),
+            )));
+
+        let mut rng = rand::thread_rng();
+        let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+        let key = k0.to_bytes().to_vec();
+        let request = BatchQueryRequest {
+            queries: vec![QueryRequest {
+                keys: vec![key.clone(), key.clone(), key],
+            }],
+        };
+
+        let timer = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        let handler = tokio::spawn(batch_query_handler(State(state), Json(request)));
+
+        tokio::time::timeout(Duration::from_millis(500), timer)
+            .await
+            .expect("timer task should complete without runtime starvation")
+            .expect("timer task join should succeed");
+
+        let handler_result = tokio::time::timeout(Duration::from_secs(3), handler)
+            .await
+            .expect("batch query handler should complete")
+            .expect("batch query handler task should join");
+        match handler_result {
+            Ok(_) => panic!("mismatched pending epoch should fail after retries"),
+            Err(status) => assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_query_handler_spawn_blocking_does_not_starve_runtime_timers() {
+        use morphogen_dpf::page::{
+            generate_page_dpf_keys, PageDpfParams, PAGE_SIZE_BYTES, ROWS_PER_PAGE,
+        };
+        use std::time::Duration;
+
+        let row_size_bytes = 256;
+        let num_rows = ROWS_PER_PAGE * 2;
+        let matrix = Arc::new(ChunkedMatrix::new(
+            row_size_bytes * num_rows,
+            PAGE_SIZE_BYTES,
+        ));
+        let global = Arc::new(GlobalState::new(
+            Arc::new(EpochSnapshot {
+                epoch_id: 42,
+                matrix: Arc::clone(&matrix),
+            }),
+            Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42)),
+        ));
+        let initial = EpochMetadata {
+            epoch_id: 42,
+            num_rows,
+            seeds: [0x1234, 0x5678, 0x9ABC],
+            block_number: 12345678,
+            state_root: [0xAB; 32],
+        };
+        let (tx, rx) = watch::channel(initial);
+        let epoch_manager = Arc::new(
+            EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+        );
+
+        let params = PageDpfParams::new(2).expect("page dpf params should be valid");
+        let state = Arc::new(AppState {
+            global: Arc::clone(&global),
+            epoch_manager,
+            epoch_tx: tx,
+            snapshot_rotation_lock: Arc::new(Mutex::new(())),
+            admin_snapshot_token: Some("test-admin-token".to_string()),
+            admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+            admin_mtls_allowed_subjects: Vec::new(),
+            admin_mtls_trust_proxy_headers: false,
+            admin_snapshot_allow_local_paths: true,
+            admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+            admin_snapshot_max_bytes: 16 * 1024 * 1024,
+            row_size_bytes,
+            num_rows,
+            seeds: [0x1234, 0x5678, 0x9ABC],
+            block_number: 12345678,
+            state_root: [0xAB; 32],
+            epoch_rx: rx,
+            page_config: Some(PagePirConfig {
+                domain_bits: params.domain_bits,
+                rows_per_page: ROWS_PER_PAGE,
+                prg_keys: params.prg_keys,
+            }),
+            #[cfg(feature = "cuda")]
+            gpu_scanner: None,
+            #[cfg(feature = "cuda")]
+            gpu_matrix: None,
+        });
+
+        let (k0, _) = generate_page_dpf_keys(&params, 0).expect("key generation should succeed");
+        let key = k0.to_bytes().to_vec();
+        let request = PageQueryRequest {
+            keys: vec![key.clone(), key.clone(), key],
+        };
+
+        let churn_global = Arc::clone(&global);
+        let churn_matrix = Arc::clone(&matrix);
+        let churn_task = tokio::spawn(async move {
+            for i in 0..2_000u64 {
+                churn_global.store(Arc::new(EpochSnapshot {
+                    epoch_id: 42 + (i & 1),
+                    matrix: Arc::clone(&churn_matrix),
+                }));
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let timer = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        let handler = tokio::spawn(page_query_handler(State(state), Json(request)));
+
+        tokio::time::timeout(Duration::from_millis(500), timer)
+            .await
+            .expect("timer task should complete without runtime starvation")
+            .expect("timer task join should succeed");
+
+        let handler_result = tokio::time::timeout(Duration::from_secs(3), handler)
+            .await
+            .expect("page query handler should complete")
+            .expect("page query handler task should join");
+        match handler_result {
+            Ok(response) => assert_eq!(response.0.pages.len(), 3),
+            Err(status) => assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE),
+        }
+
+        churn_task
+            .await
+            .expect("epoch churn task should complete cleanly");
     }
 
     #[tokio::test]

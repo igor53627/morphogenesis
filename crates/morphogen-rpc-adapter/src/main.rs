@@ -37,7 +37,12 @@ struct Args {
     port: u16,
 
     /// Upstream Ethereum RPC URL
-    #[arg(short, long, default_value = "https://ethereum-rpc.publicnode.com")]
+    #[arg(
+        short,
+        long,
+        env = "UPSTREAM_RPC_URL",
+        default_value = "https://ethereum-rpc.publicnode.com"
+    )]
     upstream: String,
 
     /// PIR Server A URL
@@ -49,12 +54,20 @@ struct Args {
     pir_server_b: String,
 
     /// Dictionary URL for CodeID resolution
-    #[arg(long, default_value = "http://localhost:8080/mainnet_compact.dict")]
+    #[arg(
+        long,
+        env = "DICT_URL",
+        default_value = "http://localhost:8080/mainnet_compact.dict"
+    )]
     dict_url: String,
 
     /// CAS Base URL for bytecode fetching
-    #[arg(long, default_value = "http://localhost:8080/cas")]
+    #[arg(long, env = "CAS_URL", default_value = "http://localhost:8080/cas")]
     cas_url: String,
+
+    /// Print effective URL config and exit (internal diagnostics/test hook)
+    #[arg(long, hide = true, default_value_t = false)]
+    print_effective_config: bool,
 
     /// Required allowlist root for local file:// dictionary/CAS URLs
     #[arg(long)]
@@ -119,6 +132,7 @@ impl Args {
             pir_server_b: "http://localhost:3001".to_string(),
             dict_url: "http://localhost:8080/mainnet_compact.dict".to_string(),
             cas_url: "http://localhost:8080/cas".to_string(),
+            print_effective_config: false,
             file_url_root: None,
             refresh_interval: 12,
             upstream_timeout: 15,
@@ -607,6 +621,17 @@ async fn handle_eth_get_filter_logs(
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.print_effective_config {
+        println!(
+            "{}",
+            serde_json::json!({
+                "upstream": telemetry::redact_url_for_effective_config(&args.upstream),
+                "dict_url": telemetry::redact_url_for_effective_config(&args.dict_url),
+                "cas_url": telemetry::redact_url_for_effective_config(&args.cas_url),
+            })
+        );
+        return Ok(());
+    }
     let otel = telemetry::OtelSettings {
         enabled: args.otel_traces,
         endpoint: args.otel_endpoint.clone(),
@@ -1345,6 +1370,7 @@ mod tests {
         validate_privacy_fallback_config, AdapterEnvironment, Args, DROPPED_METHODS,
         PASSTHROUGH_METHODS, RELAY_METHODS,
     };
+    use clap::Parser;
     use serde_json::{json, Value};
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
@@ -1354,6 +1380,25 @@ mod tests {
     use tokio::sync::RwLock;
     use tokio::task::JoinHandle;
     use tokio::time::sleep;
+
+    #[test]
+    fn args_parse_explicit_url_flags() {
+        let args = Args::parse_from([
+            "morphogen-rpc-adapter",
+            "--upstream",
+            "https://cli-upstream.example",
+            "--dict-url",
+            "https://cli-dict.example/mainnet_compact.dict",
+            "--cas-url",
+            "https://cli-dict.example/cas",
+        ]);
+        assert_eq!(args.upstream, "https://cli-upstream.example");
+        assert_eq!(
+            args.dict_url,
+            "https://cli-dict.example/mainnet_compact.dict"
+        );
+        assert_eq!(args.cas_url, "https://cli-dict.example/cas");
+    }
 
     async fn read_http_request_body(socket: &mut TcpStream) -> Vec<u8> {
         let mut buffer = Vec::new();
