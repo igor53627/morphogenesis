@@ -189,11 +189,16 @@ pub fn sanitize_url_for_telemetry(url: &str) -> String {
     }
 }
 
-fn should_redact_path_segment(segment: &str) -> bool {
-    segment.len() >= 16
-        && segment
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+fn should_preserve_path_segment(segment: &str) -> bool {
+    if segment.is_empty() {
+        return true;
+    }
+
+    let lowered = segment.to_ascii_lowercase();
+    matches!(
+        lowered.as_str(),
+        "v1" | "v2" | "v3" | "cas" | "mainnet_compact.dict"
+    )
 }
 
 /// Redact URL for operator-facing diagnostics while preserving endpoint structure.
@@ -212,10 +217,10 @@ pub fn redact_url_for_effective_config(url: &str) -> String {
                 .path()
                 .split('/')
                 .map(|segment| {
-                    if should_redact_path_segment(segment) {
-                        "REDACTED"
-                    } else {
+                    if should_preserve_path_segment(segment) {
                         segment
+                    } else {
+                        "REDACTED"
                     }
                 })
                 .collect::<Vec<_>>()
@@ -469,7 +474,23 @@ mod tests {
     fn redact_url_for_effective_config_handles_empty_query() {
         assert_eq!(
             redact_url_for_effective_config("https://api.example.com/path?"),
-            "https://api.example.com/path"
+            "https://api.example.com/REDACTED"
+        );
+    }
+
+    #[test]
+    fn redact_url_for_effective_config_redacts_short_non_static_path_segments() {
+        assert_eq!(
+            redact_url_for_effective_config("https://api.example.com/v2/abc123?token=secret"),
+            "https://api.example.com/v2/REDACTED?token=REDACTED"
+        );
+        assert_eq!(
+            redact_url_for_effective_config("https://api.example.com/path/to/resource"),
+            "https://api.example.com/REDACTED/REDACTED/REDACTED"
+        );
+        assert_eq!(
+            redact_url_for_effective_config("https://api.example.com/tenant-secret.dict"),
+            "https://api.example.com/REDACTED"
         );
     }
 }

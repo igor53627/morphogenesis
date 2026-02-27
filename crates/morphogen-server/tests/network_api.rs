@@ -1261,6 +1261,32 @@ mod websocket_query {
     use std::future::IntoFuture;
     use std::net::{Ipv4Addr, SocketAddr};
     use tokio_tungstenite::tungstenite;
+    use tokio_tungstenite::tungstenite::Error;
+
+    fn assert_oversized_rejected(
+        outcome: Option<Result<tungstenite::Message, Error>>,
+        context: &str,
+    ) {
+        match outcome {
+            Some(Ok(tungstenite::Message::Text(text))) => {
+                let json: serde_json::Value = serde_json::from_str(&text).expect(context);
+                let code = json["code"].as_str();
+                let message = json["error"].as_str().unwrap_or_default();
+                assert!(
+                    code == Some("message_too_large") || message.contains("too large"),
+                    "{context}: expected oversized-message error payload, got {json}"
+                );
+            }
+            Some(Ok(tungstenite::Message::Close(_)))
+            | Some(Err(Error::ConnectionClosed))
+            | Some(Err(Error::AlreadyClosed))
+            | Some(Err(Error::Protocol(_)))
+            | Some(Err(Error::Io(_)))
+            | None => {}
+            Some(Ok(other)) => panic!("{context}: expected text/close, got {:?}", other),
+            Some(Err(other)) => panic!("{context}: unexpected websocket error {:?}", other),
+        }
+    }
 
     #[tokio::test]
     async fn ws_query_connects_successfully() {
@@ -1414,18 +1440,8 @@ mod websocket_query {
 
         let msg = tokio::time::timeout(std::time::Duration::from_secs(1), socket.next())
             .await
-            .expect("timeout")
-            .expect("stream ended")
-            .expect("websocket error");
-
-        let text = match msg {
-            tungstenite::Message::Text(t) => t,
-            tungstenite::Message::Close(_) => return, // Also acceptable
-            other => panic!("expected text or close, got {:?}", other),
-        };
-
-        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-        assert!(json["error"].as_str().unwrap().contains("too large"));
+            .expect("timeout");
+        assert_oversized_rejected(msg, "oversized message should be rejected");
     }
 
     #[tokio::test]
@@ -1464,6 +1480,115 @@ mod websocket_query {
         assert!(json["error"].is_string(), "should have error field");
         assert!(json["code"].is_string(), "should have code field");
         assert_eq!(json["code"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn ws_query_rejects_unbounded_queue_growth() {
+        use morphogen_server::network::MAX_WS_QUEUED_MESSAGES;
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = test_state();
+
+        // Force scans into retry/backoff so queueing pressure can build.
+        let current_epoch = state.global.load().epoch_id;
+        state
+            .global
+            .store_pending(Arc::new(DeltaBuffer::new_with_epoch(
+                state.row_size_bytes,
+                current_epoch.saturating_add(1),
+            )));
+
+        let app = create_router(state);
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/query"))
+            .await
+            .unwrap();
+
+        let (_keys, request) = test_dpf_keys();
+        for _ in 0..(MAX_WS_QUEUED_MESSAGES + 8) {
+            if socket
+                .send(tungstenite::Message::text(request.clone()))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("timeout")
+            .expect("stream ended")
+            .expect("websocket error");
+
+        let text = match msg {
+            tungstenite::Message::Text(text) => text,
+            other => panic!("expected text message, got {:?}", other),
+        };
+        let json: serde_json::Value = serde_json::from_str(&text).expect("json response");
+        assert_eq!(json["code"], "too_many_messages");
+
+        // Connection should stay usable after the overflow error.
+        let follow_up = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("timeout")
+            .expect("stream ended")
+            .expect("websocket error");
+        match follow_up {
+            tungstenite::Message::Text(_) => {}
+            other => panic!("expected follow-up text response, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_query_rejects_oversized_message_while_request_in_flight() {
+        use morphogen_server::network::MAX_WS_MESSAGE_BYTES;
+
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = test_state();
+
+        // Force scans into retry/backoff so queueing path is exercised.
+        let current_epoch = state.global.load().epoch_id;
+        state
+            .global
+            .store_pending(Arc::new(DeltaBuffer::new_with_epoch(
+                state.row_size_bytes,
+                current_epoch.saturating_add(1),
+            )));
+
+        let app = create_router(state);
+        tokio::spawn(axum::serve(listener, app).into_future());
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws/query"))
+            .await
+            .unwrap();
+
+        let (_keys, request) = test_dpf_keys();
+        socket
+            .send(tungstenite::Message::text(request))
+            .await
+            .unwrap();
+
+        let oversized = "x".repeat(MAX_WS_MESSAGE_BYTES + 1);
+        socket
+            .send(tungstenite::Message::text(oversized))
+            .await
+            .unwrap();
+
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(2), socket.next())
+            .await
+            .expect("timeout");
+        assert_oversized_rejected(
+            msg,
+            "oversized in-flight message should reject at protocol or app layer",
+        );
     }
 }
 

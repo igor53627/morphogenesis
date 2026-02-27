@@ -52,13 +52,17 @@ based on Distributed Point Functions (DPF) for the Ethereum state.
 The system allows a client to query the balance, nonce, bytecode, or storage
 of any Ethereum address without revealing the target to the server.
 A linearized Cuckoo hash table ($2^{32}$ domain, 85\% load factor,
-2.15~billion rows) is stored in GPU VRAM and scanned via a fused AES$\oplus$XOR
-CUDA kernel achieving 2,143~GB/s throughput and 32.1~ms latency on NVIDIA H100.
+2.15~billion rows) is stored in GPU VRAM and scanned via a fused
+ChaCha8-DPF$\oplus$XOR CUDA kernel achieving 2,143~GB/s throughput and
+32.1~ms latency on NVIDIA H100.
 Epoch-Based Delta-PIR provides wait-free snapshot isolation for live updates
 with $O(1)$ amortized cost.
 An RPC adapter proxy implements 20+ Ethereum JSON-RPC methods privately,
 serving as a drop-in replacement for standard providers.
 Privacy is Information-Theoretic under the 2-server semi-honest model.
+The production deployment path is the server plus RPC adapter; the browser
+WASM gateway remains experimental, and end-to-end verifiable proofs are
+currently iceboxed.
 \end{abstract}
 
 %------------------------------------------------------------------------------
@@ -80,7 +84,7 @@ Ethereum state. A client queries the balance, nonce, code, or storage of
 \end{itemize}
 
 \paragraph{Workspace.}
-The implementation is organized as a Rust workspace with eight crates
+The implementation is organized as a Rust workspace with nine crates
 (Table~\ref{tab:crates}).
 
 \begin{table}[h]
@@ -101,6 +105,7 @@ The implementation is organized as a Rust workspace with eight crates
                                  benchmarks \\
 \texttt{morphogen-client}      & PIR client with network layer, caching,
                                  and batch aggregation \\
+\texttt{morphogen-wasm-gateway}& Browser EIP-1193 facade (experimental) \\
 \texttt{morphogen-rpc-adapter} & JSON-RPC proxy: private methods via PIR,
                                  passthrough to upstream \\
 \texttt{reth-adapter}          & Reth integration for mainnet snapshot ETL \\
@@ -269,7 +274,8 @@ Clients only need the epoch's hash seeds and table size.
         indices.
   \item \textbf{Request:} Client sends keys to 2 non-colluding servers.
   \item \textbf{Scan:} Servers scan the entire matrix using a fused
-        AES$\oplus$XOR kernel.
+        DPF-evaluation$\oplus$XOR kernel (backend-specific scan-step; CUDA/AVX
+        implementation shown).
   \item \textbf{Response:} Servers return 3 encrypted blocks.
   \item \textbf{Reconstruction:} Client XORs the responses to recover the
         row.
@@ -517,7 +523,7 @@ pointer advances atomically.
 \subsection{GPU (CUDA)}
 
 \begin{itemize}
-  \item Fused AES$\oplus$XOR kernel on H100 VRAM (68.8\,GB).
+  \item Fused ChaCha8-DPF$\oplus$XOR kernel on H100 VRAM (68.8\,GB).
   \item \textbf{Throughput:} 1,300\,GB/s (raw), 2,143\,GB/s
         (subtree-optimized).
   \item \textbf{Latency:} 32.1\,ms (subtree), 53\,ms (raw).
