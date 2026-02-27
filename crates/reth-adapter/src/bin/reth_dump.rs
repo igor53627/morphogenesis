@@ -126,6 +126,11 @@ fn main() {
         return;
     }
 
+    if args.trustless {
+        eprintln!("Error: --trustless is not implemented yet.");
+        std::process::exit(2);
+    }
+
     println!("Mode: EXTRACT");
     println!("Output: {:?}", args.output);
     println!("Scheme: {:?}", args.scheme);

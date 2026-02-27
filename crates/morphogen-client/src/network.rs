@@ -675,6 +675,20 @@ impl PirClient {
         Ok((json_a.epoch_id, aggregated))
     }
 
+    fn collect_batch_results(
+        results: Vec<Option<[Vec<u8>; QUERIES_PER_REQUEST]>>,
+    ) -> Result<Vec<[Vec<u8>; QUERIES_PER_REQUEST]>> {
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(index, maybe_row)| {
+                maybe_row.ok_or_else(|| {
+                    anyhow!("internal batch reconstruction error: missing result at index {index}")
+                })
+            })
+            .collect()
+    }
+
     /// Execute a batch of PIR queries with caching and retry logic.
     /// Checks cache for each key; only queries misses over the network.
     /// Chunks requests to respect server's MAX_BATCH_SIZE (32).
@@ -717,7 +731,7 @@ impl PirClient {
             }
 
             if miss_keys.is_empty() {
-                return Ok(results.into_iter().map(|r| r.unwrap()).collect());
+                return Self::collect_batch_results(results);
             }
 
             // Chunk misses into batches of MAX_BATCH_SIZE to respect server limits
@@ -761,7 +775,7 @@ impl PirClient {
             for (j, miss_idx) in miss_indices.iter().enumerate() {
                 results[*miss_idx] = Some(all_batch_results[j].clone());
             }
-            return Ok(results.into_iter().map(|r| r.unwrap()).collect());
+            return Self::collect_batch_results(results);
         }
 
         Err(anyhow!(
@@ -1053,6 +1067,23 @@ mod tests {
         }
         .is_retryable());
         assert!(!PirQueryError::Permanent("bad data".into()).is_retryable());
+    }
+
+    #[test]
+    fn collect_batch_results_rejects_missing_entries() {
+        let payloads = make_payloads();
+        let err = PirClient::collect_batch_results(vec![Some(payloads), None])
+            .expect_err("missing rows must return an internal reconstruction error");
+        assert!(err.to_string().contains("missing result at index 1"));
+    }
+
+    #[test]
+    fn collect_batch_results_accepts_complete_entries() {
+        let payloads = make_payloads();
+        let results =
+            PirClient::collect_batch_results(vec![Some(payloads.clone()), Some(payloads)])
+                .expect("complete rows should collect");
+        assert_eq!(results.len(), 2);
     }
 
     #[tokio::test]

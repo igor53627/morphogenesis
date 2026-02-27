@@ -759,8 +759,7 @@ fn gpu_micro_batch_ranges(total_queries: usize) -> Vec<(usize, usize)> {
     if total_queries == 0 {
         return Vec::new();
     }
-    let mut ranges =
-        Vec::with_capacity((total_queries + GPU_MICRO_BATCH_SIZE - 1) / GPU_MICRO_BATCH_SIZE);
+    let mut ranges = Vec::with_capacity(total_queries.div_ceil(GPU_MICRO_BATCH_SIZE));
     let mut start = 0usize;
     while start < total_queries {
         let end = (start + GPU_MICRO_BATCH_SIZE).min(total_queries);
