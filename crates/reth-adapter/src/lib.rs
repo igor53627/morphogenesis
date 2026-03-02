@@ -35,6 +35,23 @@ pub trait AccountSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionError {
+    TrustlessModeUnimplemented,
+}
+
+impl std::fmt::Display for ExtractionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TrustlessModeUnimplemented => write!(f, "trustless mode is not implemented"),
+        }
+    }
+}
+
+impl std::error::Error for ExtractionError {}
+
+pub type ExtractionResult<T> = Result<T, ExtractionError>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,7 +93,7 @@ mod tests {
         let mut storage_key = [0u8; 52];
         storage_key[0..20].copy_from_slice(&STORAGE_ADDRESS);
         storage_key[20..52].copy_from_slice(&STORAGE_SLOT);
-        let expected_hash = keccak256(&storage_key);
+        let expected_hash = keccak256(storage_key);
         let expected_tag: [u8; 8] = expected_hash[0..8].try_into().unwrap();
         assert_eq!(short_key.as_slice(), &expected_tag);
     }
@@ -85,7 +102,7 @@ mod tests {
     fn build_matrix_uses_8_byte_key_for_optimized48_storage() {
         let mut source = SingleStorageSource::new();
         let (matrix, manifest, _indexer) =
-            build_matrix(&mut source, 1024, RowScheme::Optimized48, false);
+            build_matrix(&mut source, 1024, RowScheme::Optimized48, false).expect("build matrix");
         assert_eq!(manifest.item_count, 1);
 
         let expected_key = cuckoo_key_for_storage(&STORAGE_ADDRESS, &STORAGE_SLOT);
@@ -99,7 +116,7 @@ mod tests {
 
         let mut expected_payload = vec![0u8; 48];
         expected_payload[0..32].copy_from_slice(&STORAGE_VALUE);
-        let tag_hash = keccak256(&storage_key);
+        let tag_hash = keccak256(storage_key);
         expected_payload[32..40].copy_from_slice(&tag_hash[0..8]);
 
         let chunk = matrix.chunk(0);
@@ -126,6 +143,31 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn build_matrix_trustless_mode_returns_error_until_implemented() {
+        let mut source = SingleStorageSource::new();
+        let err = match build_matrix(&mut source, 1024, RowScheme::Optimized48, true) {
+            Ok(_) => panic!("trustless mode must return explicit error"),
+            Err(err) => err,
+        };
+        assert_eq!(err, ExtractionError::TrustlessModeUnimplemented);
+    }
+
+    #[cfg(feature = "reth")]
+    #[test]
+    fn dump_reth_to_matrix_trustless_mode_returns_error_until_implemented() {
+        let err = match dump_reth_to_matrix(
+            "/tmp/nonexistent-reth-db",
+            1024,
+            RowScheme::Optimized48,
+            true,
+        ) {
+            Ok(_) => panic!("trustless mode must return explicit error"),
+            Err(err) => err,
+        };
+        assert_eq!(err, ExtractionError::TrustlessModeUnimplemented);
+    }
 }
 
 /// Compute the 8-byte Cuckoo key for a storage entry.
@@ -134,7 +176,7 @@ pub fn cuckoo_key_for_storage(address: &[u8; 20], slot: &[u8; 32]) -> Vec<u8> {
     let mut k = [0u8; 52];
     k[0..20].copy_from_slice(address);
     k[20..52].copy_from_slice(slot);
-    let tag_hash = keccak256(&k);
+    let tag_hash = keccak256(k);
     tag_hash[0..8].to_vec()
 }
 
@@ -354,6 +396,12 @@ impl CodeIndexer {
     }
 }
 
+impl Default for CodeIndexer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn serialize_account(
     acc: &Account,
     scheme: RowScheme,
@@ -415,8 +463,12 @@ pub fn dump_reth_to_matrix(
     db_path: &str,
     num_rows: usize,
     scheme: RowScheme,
-    _trustless: bool,
-) -> (ChunkedMatrix, Manifest, CodeIndexer) {
+    trustless: bool,
+) -> ExtractionResult<(ChunkedMatrix, Manifest, CodeIndexer)> {
+    if trustless {
+        return Err(ExtractionError::TrustlessModeUnimplemented);
+    }
+
     use reth_db::cursor::DbCursorRO;
     use reth_db::table::Table;
     use reth_db::Database;
@@ -584,7 +636,7 @@ pub fn dump_reth_to_matrix(
         cuckoo_seeds: seeds,
     };
 
-    (matrix, manifest, indexer)
+    Ok((matrix, manifest, indexer))
 }
 
 // ... SyntheticSource ...
@@ -612,7 +664,7 @@ impl AccountSource for SyntheticSource {
         self.count += 1;
 
         // Demo: Every 5th item is storage
-        if self.count % 5 == 0 {
+        if self.count.is_multiple_of(5) {
             Some(UbtItem::Storage {
                 address: addr,
                 key: [0xAA; 32],
@@ -629,11 +681,7 @@ impl AccountSource for SyntheticSource {
     }
 
     fn count_all(&mut self) -> usize {
-        if self.count >= self.total {
-            0
-        } else {
-            self.total - self.count
-        }
+        self.total.saturating_sub(self.count)
     }
 }
 
@@ -658,7 +706,11 @@ pub fn build_matrix(
     num_rows: usize,
     scheme: RowScheme,
     trustless: bool,
-) -> (ChunkedMatrix, Manifest, CodeIndexer) {
+) -> ExtractionResult<(ChunkedMatrix, Manifest, CodeIndexer)> {
+    if trustless {
+        return Err(ExtractionError::TrustlessModeUnimplemented);
+    }
+
     let mut indexer = CodeIndexer::new();
     let row_size = match scheme {
         RowScheme::Compact => 32,
@@ -672,46 +724,42 @@ pub fn build_matrix(
 
     // 2. Insert Items
     while let Some(item) = source.next_item() {
-        if trustless {
-            // TODO: Implementation for trustless mode (2KB rows)
-        } else {
-            let (key, payload) = match item {
-                UbtItem::Account(acc) => {
-                    let p = serialize_account(&acc, scheme, &mut indexer);
-                    (acc.address.to_vec(), p)
-                }
-                UbtItem::Storage {
-                    address,
-                    key: slot,
-                    value,
-                } => {
-                    let mut full_key = Vec::with_capacity(52);
-                    full_key.extend_from_slice(&address);
-                    full_key.extend_from_slice(&slot);
+        let (key, payload) = match item {
+            UbtItem::Account(acc) => {
+                let p = serialize_account(&acc, scheme, &mut indexer);
+                (acc.address.to_vec(), p)
+            }
+            UbtItem::Storage {
+                address,
+                key: slot,
+                value,
+            } => {
+                let mut full_key = Vec::with_capacity(52);
+                full_key.extend_from_slice(&address);
+                full_key.extend_from_slice(&slot);
 
-                    let mut p = vec![0u8; row_size];
+                let mut p = vec![0u8; row_size];
 
-                    match scheme {
-                        RowScheme::Optimized48 => {
-                            // [Value (32) | Tag (8) | Pad (8)]
-                            // Tag = keccak(address || slot)[0..8]
-                            let cuckoo_key = cuckoo_key_for_storage(&address, &slot);
-                            p[0..32].copy_from_slice(&value);
-                            p[32..40].copy_from_slice(&cuckoo_key);
-                            (cuckoo_key, p)
-                        }
-                        _ => {
-                            // Legacy logic (Compact/Full): keep full 52-byte key
-                            p[0..32].copy_from_slice(&value);
-                            (full_key, p)
-                        }
+                match scheme {
+                    RowScheme::Optimized48 => {
+                        // [Value (32) | Tag (8) | Pad (8)]
+                        // Tag = keccak(address || slot)[0..8]
+                        let cuckoo_key = cuckoo_key_for_storage(&address, &slot);
+                        p[0..32].copy_from_slice(&value);
+                        p[32..40].copy_from_slice(&cuckoo_key);
+                        (cuckoo_key, p)
+                    }
+                    _ => {
+                        // Legacy logic (Compact/Full): keep full 52-byte key
+                        p[0..32].copy_from_slice(&value);
+                        (full_key, p)
                     }
                 }
-            };
-
-            if let Err(_) = table.insert(key, payload) {
-                break;
             }
+        };
+
+        if table.insert(key, payload).is_err() {
+            break;
         }
     }
 
@@ -732,7 +780,7 @@ pub fn build_matrix(
         cuckoo_seeds: seeds,
     };
 
-    (matrix, manifest, indexer)
+    Ok((matrix, manifest, indexer))
 }
 
 #[cfg(feature = "reth")]

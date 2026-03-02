@@ -1711,14 +1711,8 @@ mod runtime_config_tests {
         let attempts = Arc::new(AtomicUsize::new(0));
         let sleep_durations = Arc::new(Mutex::new(Vec::new()));
         let outcomes = Arc::new(Mutex::new(VecDeque::from(vec![
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "transient ctrl-c stream failure 1",
-            )),
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "transient ctrl-c stream failure 2",
-            )),
+            Err(std::io::Error::other("transient ctrl-c stream failure 1")),
+            Err(std::io::Error::other("transient ctrl-c stream failure 2")),
             Ok(()),
         ])));
 
@@ -1775,12 +1769,7 @@ mod runtime_config_tests {
                 let attempts = Arc::clone(&attempts);
                 move || {
                     attempts.fetch_add(1, Ordering::Relaxed);
-                    async {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "persistent ctrl-c stream failure",
-                        ))
-                    }
+                    async { Err(std::io::Error::other("persistent ctrl-c stream failure")) }
                 }
             },
             {
@@ -1824,12 +1813,7 @@ mod runtime_config_tests {
                 let attempts = Arc::clone(&attempts);
                 move || {
                     attempts.fetch_add(1, Ordering::Relaxed);
-                    async {
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            "persistent ctrl-c stream failure",
-                        ))
-                    }
+                    async { Err(std::io::Error::other("persistent ctrl-c stream failure")) }
                 }
             },
             {

@@ -133,12 +133,18 @@ fn main() {
 
     #[cfg(feature = "reth")]
     {
-        let (matrix, manifest, indexer) = reth_adapter::dump_reth_to_matrix(
+        let (matrix, manifest, indexer) = match reth_adapter::dump_reth_to_matrix(
             args.db.to_str().unwrap(),
             args.rows,
             args.scheme,
             args.trustless,
-        );
+        ) {
+            Ok(output) => output,
+            Err(err) => {
+                eprintln!("Error: {err}");
+                std::process::exit(2);
+            }
+        };
         println!("Saving matrix to {:?}...", args.output);
         matrix.write_to_file(&args.output).unwrap();
 
@@ -170,7 +176,13 @@ fn main() {
         println!("Running with SyntheticSource for demo...");
         let mut source = reth_adapter::SyntheticSource::new((args.rows as f64 * 0.8) as usize);
         let (_matrix, manifest, _indexer) =
-            build_matrix(&mut source, args.rows, args.scheme, args.trustless);
+            match build_matrix(&mut source, args.rows, args.scheme, args.trustless) {
+                Ok(output) => output,
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    std::process::exit(2);
+                }
+            };
 
         let manifest_path = args.output.with_extension("json");
         println!("Writing manifest to {:?}", manifest_path);
