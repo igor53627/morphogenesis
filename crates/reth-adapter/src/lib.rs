@@ -35,6 +35,23 @@ pub trait AccountSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractionError {
+    TrustlessModeUnimplemented,
+}
+
+impl std::fmt::Display for ExtractionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TrustlessModeUnimplemented => write!(f, "trustless mode is not implemented"),
+        }
+    }
+}
+
+impl std::error::Error for ExtractionError {}
+
+pub type ExtractionResult<T> = Result<T, ExtractionError>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,7 +102,7 @@ mod tests {
     fn build_matrix_uses_8_byte_key_for_optimized48_storage() {
         let mut source = SingleStorageSource::new();
         let (matrix, manifest, _indexer) =
-            build_matrix(&mut source, 1024, RowScheme::Optimized48, false);
+            build_matrix(&mut source, 1024, RowScheme::Optimized48, false).expect("build matrix");
         assert_eq!(manifest.item_count, 1);
 
         let expected_key = cuckoo_key_for_storage(&STORAGE_ADDRESS, &STORAGE_SLOT);
@@ -128,10 +145,28 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "trustless mode is not implemented")]
-    fn build_matrix_trustless_mode_panics_until_implemented() {
+    fn build_matrix_trustless_mode_returns_error_until_implemented() {
         let mut source = SingleStorageSource::new();
-        let _ = build_matrix(&mut source, 1024, RowScheme::Optimized48, true);
+        let err = match build_matrix(&mut source, 1024, RowScheme::Optimized48, true) {
+            Ok(_) => panic!("trustless mode must return explicit error"),
+            Err(err) => err,
+        };
+        assert_eq!(err, ExtractionError::TrustlessModeUnimplemented);
+    }
+
+    #[cfg(feature = "reth")]
+    #[test]
+    fn dump_reth_to_matrix_trustless_mode_returns_error_until_implemented() {
+        let err = match dump_reth_to_matrix(
+            "/tmp/nonexistent-reth-db",
+            1024,
+            RowScheme::Optimized48,
+            true,
+        ) {
+            Ok(_) => panic!("trustless mode must return explicit error"),
+            Err(err) => err,
+        };
+        assert_eq!(err, ExtractionError::TrustlessModeUnimplemented);
     }
 }
 
@@ -429,8 +464,10 @@ pub fn dump_reth_to_matrix(
     num_rows: usize,
     scheme: RowScheme,
     trustless: bool,
-) -> (ChunkedMatrix, Manifest, CodeIndexer) {
-    assert!(!trustless, "trustless mode is not implemented");
+) -> ExtractionResult<(ChunkedMatrix, Manifest, CodeIndexer)> {
+    if trustless {
+        return Err(ExtractionError::TrustlessModeUnimplemented);
+    }
 
     use reth_db::cursor::DbCursorRO;
     use reth_db::table::Table;
@@ -599,7 +636,7 @@ pub fn dump_reth_to_matrix(
         cuckoo_seeds: seeds,
     };
 
-    (matrix, manifest, indexer)
+    Ok((matrix, manifest, indexer))
 }
 
 // ... SyntheticSource ...
@@ -669,8 +706,10 @@ pub fn build_matrix(
     num_rows: usize,
     scheme: RowScheme,
     trustless: bool,
-) -> (ChunkedMatrix, Manifest, CodeIndexer) {
-    assert!(!trustless, "trustless mode is not implemented");
+) -> ExtractionResult<(ChunkedMatrix, Manifest, CodeIndexer)> {
+    if trustless {
+        return Err(ExtractionError::TrustlessModeUnimplemented);
+    }
 
     let mut indexer = CodeIndexer::new();
     let row_size = match scheme {
@@ -741,7 +780,7 @@ pub fn build_matrix(
         cuckoo_seeds: seeds,
     };
 
-    (matrix, manifest, indexer)
+    Ok((matrix, manifest, indexer))
 }
 
 #[cfg(feature = "reth")]
