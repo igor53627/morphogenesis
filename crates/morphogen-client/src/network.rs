@@ -649,7 +649,7 @@ impl PirClient {
 
         // XOR corresponding payloads
         let mut aggregated = Vec::with_capacity(n);
-        for (result_a, result_b) in json_a.results.into_iter().zip(json_b.results.into_iter()) {
+        for (result_a, result_b) in json_a.results.into_iter().zip(json_b.results) {
             let payloads_a = parse_payloads(result_a.payloads)?;
             let payloads_b = parse_payloads(result_b.payloads)?;
 
