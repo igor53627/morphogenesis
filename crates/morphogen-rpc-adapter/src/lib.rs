@@ -2,6 +2,7 @@ mod block_cache;
 mod code_resolver;
 mod config;
 mod evm;
+mod filters;
 mod pir_db;
 mod proxy;
 mod telemetry;
@@ -11,6 +12,7 @@ use block_cache::BlockCache;
 use clap::Parser;
 use code_resolver::CodeResolver;
 use config::{validate_privacy_fallback_config, Args};
+use filters::parse_log_filter_for_rpc;
 use jsonrpsee::server::{RpcModule, Server};
 use jsonrpsee::types::ErrorObjectOwned;
 use morphogen_client::network::PirClient;
@@ -255,107 +257,6 @@ fn register_eth_create_access_list_method(module: &mut RpcModule<AdapterState>) 
         .instrument(request_span)
     })?;
     Ok(())
-}
-
-fn filter_uses_tag(filter_obj: &Value, tag: &str) -> bool {
-    ["fromBlock", "toBlock"].iter().any(|field| {
-        filter_obj
-            .get(field)
-            .and_then(Value::as_str)
-            .is_some_and(|value| value == tag)
-    })
-}
-
-fn parse_block_number_quantity(number: &str, tag: &str) -> Result<u64, ErrorObjectOwned> {
-    let hex = number.strip_prefix("0x").ok_or_else(|| {
-        ErrorObjectOwned::owned(
-            -32000,
-            format!("Invalid {} block number format from upstream", tag),
-            None::<()>,
-        )
-    })?;
-    u64::from_str_radix(hex, 16).map_err(|_| {
-        ErrorObjectOwned::owned(
-            -32000,
-            format!("Invalid {} block number value from upstream", tag),
-            None::<()>,
-        )
-    })
-}
-
-async fn resolve_block_tag_height(
-    client: &reqwest::Client,
-    upstream_url: &str,
-    tag: &'static str,
-) -> Result<u64, ErrorObjectOwned> {
-    let result = proxy_to_upstream(
-        upstream_url,
-        client,
-        "eth_getBlockByNumber",
-        serde_json::json!([tag, false]),
-    )
-    .await?;
-
-    let number = result
-        .get("number")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            ErrorObjectOwned::owned(
-                -32000,
-                format!("Missing {} block number from upstream", tag),
-                None::<()>,
-            )
-        })?;
-
-    parse_block_number_quantity(number, tag)
-}
-
-async fn resolve_filter_finality_heights(
-    filter_obj: &Value,
-    client: &reqwest::Client,
-    upstream_url: &str,
-) -> Result<(Option<u64>, Option<u64>), ErrorObjectOwned> {
-    let safe_height = if filter_uses_tag(filter_obj, "safe") {
-        Some(resolve_block_tag_height(client, upstream_url, "safe").await?)
-    } else {
-        None
-    };
-
-    let finalized_height = if filter_uses_tag(filter_obj, "finalized") {
-        Some(resolve_block_tag_height(client, upstream_url, "finalized").await?)
-    } else {
-        None
-    };
-
-    Ok((safe_height, finalized_height))
-}
-
-fn effective_latest_for_filter(
-    cache_latest: u64,
-    safe_height: Option<u64>,
-    finalized_height: Option<u64>,
-) -> u64 {
-    cache_latest
-        .max(safe_height.unwrap_or(0))
-        .max(finalized_height.unwrap_or(0))
-}
-
-async fn parse_log_filter_for_rpc(
-    filter_obj: &Value,
-    cache_latest: u64,
-    client: &reqwest::Client,
-    upstream_url: &str,
-) -> Result<block_cache::LogFilter, ErrorObjectOwned> {
-    let (safe_height, finalized_height) =
-        resolve_filter_finality_heights(filter_obj, client, upstream_url).await?;
-    let effective_latest = effective_latest_for_filter(cache_latest, safe_height, finalized_height);
-    block_cache::parse_log_filter_object(
-        filter_obj,
-        effective_latest,
-        safe_height,
-        finalized_height,
-    )
-    .map_err(|e| ErrorObjectOwned::owned(-32602, e, None::<()>))
 }
 
 async fn handle_eth_get_logs(
@@ -1145,10 +1046,11 @@ pub async fn run() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::config::AdapterEnvironment;
+    use super::filters::effective_latest_for_filter;
     use super::proxy::upstream_invalid_json_error;
     use super::{
-        effective_latest_for_filter, fail_closed_if_fallback_disabled, handle_eth_get_logs,
-        handle_eth_new_filter, has_nonempty_state_overrides, next_privacy_degraded_fallback_count,
+        fail_closed_if_fallback_disabled, handle_eth_get_logs, handle_eth_new_filter,
+        has_nonempty_state_overrides, next_privacy_degraded_fallback_count,
         parse_log_filter_for_rpc, proxy_to_upstream, validate_privacy_fallback_config, Args,
         DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS,
     };
