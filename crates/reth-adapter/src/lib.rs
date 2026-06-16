@@ -35,8 +35,28 @@ pub trait AccountSource {
     }
 }
 
+/// Errors returned by the reth → Cuckoo Matrix extraction pipeline.
+///
+/// Returned by [`dump_reth_to_matrix`] and [`build_matrix`] instead of the
+/// previous panic-based guards (see task-53 follow-up). This is a **breaking
+/// public API change**: both entry points used to return a 3-tuple directly and
+/// panic on unsupported configurations; they now return [`ExtractionResult`].
+/// All in-tree call sites have been updated.
+///
+/// `#[non_exhaustive]` is intentional: additional variants (DB open, I/O,
+/// cuckoo insertion) are expected, and external match arms must include a `_`
+/// fallback (the in-crate `Display` impl below is still matched exhaustively
+/// and must be extended per new variant).
+///
+/// Derive note: once a variant carries a payload that is not `Copy`/`Clone`/
+/// `PartialEq` (e.g. [`std::io::Error`], which implements none of the four),
+/// **all four** derives (`Clone`, `Copy`, `PartialEq`, `Eq`) must be dropped
+/// from this enum, and the `assert_eq!` assertions in `tests` must switch to
+/// `matches!(err, ExtractionError::TrustlessModeUnimplemented)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExtractionError {
+    /// Trustless (verified) extraction mode is not yet implemented.
     TrustlessModeUnimplemented,
 }
 
@@ -50,6 +70,7 @@ impl std::fmt::Display for ExtractionError {
 
 impl std::error::Error for ExtractionError {}
 
+/// Convenience alias for extraction results returned by this crate.
 pub type ExtractionResult<T> = Result<T, ExtractionError>;
 
 #[cfg(test)]
@@ -458,6 +479,11 @@ pub fn serialize_account(
     payload
 }
 
+/// Extract a Cuckoo Matrix + manifest + code indexer directly from a Reth DB.
+///
+/// Returns [`ExtractionError::TrustlessModeUnimplemented`] when `trustless`
+/// is set. **Breaking change (task-53):** previously returned a bare tuple and
+/// panicked on unsupported configs; now returns [`ExtractionResult`].
 #[cfg(feature = "reth")]
 pub fn dump_reth_to_matrix(
     db_path: &str,
@@ -701,6 +727,10 @@ pub enum RowScheme {
 }
 
 /// Build the Cuckoo Matrix and Manifest from an account source.
+///
+/// Returns [`ExtractionError::TrustlessModeUnimplemented`] when `trustless`
+/// is set. **Breaking change (task-53):** previously returned a bare tuple and
+/// panicked on unsupported configs; now returns [`ExtractionResult`].
 pub fn build_matrix(
     source: &mut dyn AccountSource,
     num_rows: usize,
