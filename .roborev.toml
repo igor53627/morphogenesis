@@ -1,0 +1,21 @@
+# Shared PSE roborev defaults (copy or symlink into repo root as .roborev.toml).
+# See ~/pse/roborev/README.md for 3×3 / 2×3 manual matrices and model rules.
+#
+# Scoping rules (important):
+#   - Top-level `agent` + `model` apply ONLY to the post-commit hook
+#     (single-agent review). `model = "gpt-5.5"` is codex-only and MUST stay
+#     here at top level — never set it as a global review_model in
+#     ~/.roborev/config.toml, where it would leak into gemini/claude-code jobs.
+#   - `roborev ci review` reads the `[ci]` table ONLY and ignores top-level
+#     `model`, so the `[ci]` agents below run with each agent's configured
+#     default model (gemini uses its own provider default). Do NOT add a
+#     top-level model expecting it to scope CI jobs.
+
+agent = "codex"
+model = "gpt-5.5"
+
+[ci]
+# Vendor diversity for PR CI (2-agent floor). Expand manually with pse-review-3x3.sh.
+# These agents ignore the top-level `model` above and use their provider defaults.
+agents = ["codex", "gemini"]
+review_types = ["security", "design"]
