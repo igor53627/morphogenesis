@@ -5,6 +5,7 @@ mod evm;
 mod filters;
 mod pir_db;
 mod proxy;
+mod state;
 mod telemetry;
 
 use anyhow::Result;
@@ -18,7 +19,7 @@ use jsonrpsee::types::ErrorObjectOwned;
 use morphogen_client::network::PirClient;
 use serde_json::Value;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -27,80 +28,10 @@ use tower::ServiceBuilder;
 use tracing::{error, info, warn, Instrument};
 
 use proxy::proxy_to_upstream;
-
-struct AdapterState {
-    args: Args,
-    http_client: reqwest::Client,
-    pir_client: Arc<PirClient>,
-    code_resolver: Arc<CodeResolver>,
-    block_cache: Arc<RwLock<BlockCache>>,
-    privacy_degraded_fallback_total: AtomicU64,
-}
-
-const PASSTHROUGH_METHODS: &[&str] = &[
-    "eth_blockNumber",
-    "eth_chainId",
-    "eth_gasPrice",
-    // NOTE: eth_sendRawTransaction is relayed to a privacy-preserving endpoint
-    // (Flashbots Protect by default) — see RELAY_METHODS below.
-    "net_version",
-    "web3_clientVersion",
-    // Wallet Essentials (History & Status)
-    // NOTE: eth_getTransactionByHash and eth_getTransactionReceipt are now
-    // served from local block cache (private) with upstream fallback
-    // NOTE: eth_estimateGas is now private via local EVM execution
-    // NOTE: eth_createAccessList is now private via local EVM execution
-    "eth_getBlockByNumber",
-    "eth_getBlockByHash",
-    "eth_feeHistory",
-    "eth_maxPriorityFeePerGas",
-    // NOTE: eth_getLogs is now served from local block cache (private) for recent blocks
-    // Account queries (read-only, safe to passthrough)
-    "eth_accounts",
-    // NOTE: Filter APIs are now served locally from the block cache.
-    // NOTE: Dropped methods (eth_getProof, eth_sign, eth_signTransaction) return
-    // explicit errors — see DROPPED_METHODS below.
-];
-
-/// Methods explicitly rejected with a clear error message.
-/// These are not proxied to upstream because they either leak private state
-/// (defeating PIR) or pose security risks (remote signing).
-const DROPPED_METHODS: &[(&str, &str)] = &[
-    ("eth_getProof", "eth_getProof is disabled: it leaks account/storage interest to the RPC provider, defeating private state queries"),
-    ("eth_sign", "eth_sign is disabled: signing should be done client-side by the wallet"),
-    ("eth_signTransaction", "eth_signTransaction is disabled: signing should be done client-side by the wallet"),
-];
-
-/// Methods relayed to a privacy-preserving endpoint instead of the regular upstream.
-/// eth_sendRawTransaction goes to Flashbots Protect to avoid public mempool exposure.
-const RELAY_METHODS: &[&str] = &["eth_sendRawTransaction"];
-
-fn next_privacy_degraded_fallback_count(counter: &AtomicU64) -> u64 {
-    counter.fetch_add(1, Ordering::Relaxed) + 1
-}
-
-fn record_privacy_degrading_fallback(state: &AdapterState, method: &str, reason: &str) {
-    let total = next_privacy_degraded_fallback_count(&state.privacy_degraded_fallback_total);
-    warn!(
-        rpc.method = %method,
-        privacy.degraded = true,
-        privacy.fallback_reason = %reason,
-        privacy.degraded_fallback_total = total,
-        "Proxying private method to upstream (privacy degraded)"
-    );
-}
-
-fn fail_closed_if_fallback_disabled(
-    fallback_to_upstream: bool,
-    code: i32,
-    message: &'static str,
-) -> Result<(), ErrorObjectOwned> {
-    if fallback_to_upstream {
-        Ok(())
-    } else {
-        Err(ErrorObjectOwned::owned(code, message, None::<()>))
-    }
-}
+use state::{
+    fail_closed_if_fallback_disabled, record_privacy_degrading_fallback, AdapterState,
+    DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS,
+};
 
 fn has_nonempty_state_overrides(raw_params: &[Value]) -> Result<bool, ErrorObjectOwned> {
     let Some(overrides) = raw_params.get(2) else {
@@ -1048,11 +979,12 @@ mod tests {
     use super::config::AdapterEnvironment;
     use super::filters::effective_latest_for_filter;
     use super::proxy::upstream_invalid_json_error;
+    use super::state::next_privacy_degraded_fallback_count;
     use super::{
         fail_closed_if_fallback_disabled, handle_eth_get_logs, handle_eth_new_filter,
-        has_nonempty_state_overrides, next_privacy_degraded_fallback_count,
-        parse_log_filter_for_rpc, proxy_to_upstream, validate_privacy_fallback_config, Args,
-        DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS,
+        has_nonempty_state_overrides, parse_log_filter_for_rpc, proxy_to_upstream,
+        validate_privacy_fallback_config, Args, DROPPED_METHODS, PASSTHROUGH_METHODS,
+        RELAY_METHODS,
     };
     use clap::Parser;
     use serde_json::{json, Value};
