@@ -2,6 +2,7 @@ mod block_cache;
 mod code_resolver;
 mod evm;
 mod pir_db;
+mod proxy;
 mod telemetry;
 
 use anyhow::{bail, Result};
@@ -21,6 +22,8 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tower::ServiceBuilder;
 use tracing::{error, info, warn, Instrument};
+
+use proxy::proxy_to_upstream;
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 enum AdapterEnvironment {
@@ -1276,103 +1279,14 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn proxy_to_upstream(
-    url: &str,
-    client: &reqwest::Client,
-    method: &str,
-    params: Value,
-) -> Result<Value, ErrorObjectOwned> {
-    let sanitized_url = telemetry::sanitize_url_for_telemetry(url);
-    let span = tracing::info_span!(
-        "rpc.upstream",
-        otel.kind = "client",
-        otel.name = method,
-        rpc.system = "ethereum-jsonrpc",
-        rpc.method = %method,
-        upstream.url = %sanitized_url
-    );
-    async move {
-        info!("Proxying {} to upstream", method);
-
-        let request = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params
-        });
-
-        let response = client.post(url).json(&request).send().await.map_err(|e| {
-            if e.is_timeout() {
-                ErrorObjectOwned::owned(
-                    -32000,
-                    format!("Upstream timeout for {}", method),
-                    None::<()>,
-                )
-            } else if e.is_connect() {
-                ErrorObjectOwned::owned(
-                    -32000,
-                    format!("Upstream connection failed for {}", method),
-                    None::<()>,
-                )
-            } else {
-                upstream_request_failed_error(method)
-            }
-        })?;
-
-        let json: Value = response
-            .json()
-            .await
-            .map_err(|_| upstream_invalid_json_error(method))?;
-
-        if let Some(error) = json.get("error") {
-            let error_code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32;
-            let error_message = error
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error");
-            warn!(
-                rpc.method = %method,
-                error.code = error_code,
-                error.message = %error_message,
-                "Upstream returned JSON-RPC error"
-            );
-            return Err(ErrorObjectOwned::owned(
-                error_code,
-                error_message.to_string(),
-                error.get("data").cloned(),
-            ));
-        }
-
-        Ok(json.get("result").cloned().unwrap_or(Value::Null))
-    }
-    .instrument(span)
-    .await
-}
-
-fn upstream_request_failed_error(method: &str) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(
-        -32000,
-        format!("Upstream request failed for {}", method),
-        None::<()>,
-    )
-}
-
-fn upstream_invalid_json_error(method: &str) -> ErrorObjectOwned {
-    ErrorObjectOwned::owned(
-        -32000,
-        format!("Invalid JSON response for {}", method),
-        None::<()>,
-    )
-}
-
 #[cfg(test)]
 mod tests {
+    use super::proxy::upstream_invalid_json_error;
     use super::{
         effective_latest_for_filter, fail_closed_if_fallback_disabled, handle_eth_get_logs,
         handle_eth_new_filter, has_nonempty_state_overrides, next_privacy_degraded_fallback_count,
-        parse_log_filter_for_rpc, proxy_to_upstream, upstream_invalid_json_error,
-        validate_privacy_fallback_config, AdapterEnvironment, Args, DROPPED_METHODS,
-        PASSTHROUGH_METHODS, RELAY_METHODS,
+        parse_log_filter_for_rpc, proxy_to_upstream, validate_privacy_fallback_config,
+        AdapterEnvironment, Args, DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS,
     };
     use clap::Parser;
     use serde_json::{json, Value};
