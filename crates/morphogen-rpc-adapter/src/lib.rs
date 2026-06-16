@@ -1,20 +1,21 @@
 mod block_cache;
 mod code_resolver;
+mod config;
 mod evm;
 mod pir_db;
 mod proxy;
 mod telemetry;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use block_cache::BlockCache;
 use clap::Parser;
 use code_resolver::CodeResolver;
+use config::{validate_privacy_fallback_config, Args};
 use jsonrpsee::server::{RpcModule, Server};
 use jsonrpsee::types::ErrorObjectOwned;
 use morphogen_client::network::PirClient;
 use serde_json::Value;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,133 +25,6 @@ use tower::ServiceBuilder;
 use tracing::{error, info, warn, Instrument};
 
 use proxy::proxy_to_upstream;
-
-#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
-enum AdapterEnvironment {
-    Dev,
-    Test,
-    Prod,
-}
-
-#[derive(Parser, Debug, Clone)]
-#[command(author, version, about = "Morphogenesis RPC Adapter")]
-struct Args {
-    /// Port to listen on
-    #[arg(short, long, default_value_t = 8545)]
-    port: u16,
-
-    /// Upstream Ethereum RPC URL
-    #[arg(
-        short,
-        long,
-        env = "UPSTREAM_RPC_URL",
-        default_value = "https://ethereum-rpc.publicnode.com"
-    )]
-    upstream: String,
-
-    /// PIR Server A URL
-    #[arg(long, default_value = "http://localhost:3000")]
-    pir_server_a: String,
-
-    /// PIR Server B URL
-    #[arg(long, default_value = "http://localhost:3001")]
-    pir_server_b: String,
-
-    /// Dictionary URL for CodeID resolution
-    #[arg(
-        long,
-        env = "DICT_URL",
-        default_value = "http://localhost:8080/mainnet_compact.dict"
-    )]
-    dict_url: String,
-
-    /// CAS Base URL for bytecode fetching
-    #[arg(long, env = "CAS_URL", default_value = "http://localhost:8080/cas")]
-    cas_url: String,
-
-    /// Print effective URL config and exit (internal diagnostics/test hook)
-    #[arg(long, hide = true, default_value_t = false)]
-    print_effective_config: bool,
-
-    /// Required allowlist root for local file:// dictionary/CAS URLs
-    #[arg(long)]
-    file_url_root: Option<PathBuf>,
-
-    /// Metadata refresh interval in seconds
-    #[arg(long, default_value_t = 12)]
-    refresh_interval: u64,
-
-    /// Upstream request timeout in seconds
-    #[arg(long, default_value_t = 15)]
-    upstream_timeout: u64,
-
-    /// Fall back to upstream RPC when PIR servers are unavailable
-    #[arg(long, default_value_t = false)]
-    fallback_to_upstream: bool,
-
-    /// Deployment environment profile
-    #[arg(long, value_enum, default_value_t = AdapterEnvironment::Prod)]
-    environment: AdapterEnvironment,
-
-    /// Explicit acknowledgement required to allow privacy-degrading fallback in prod
-    #[arg(long, default_value_t = false)]
-    allow_privacy_degraded_fallback: bool,
-
-    /// Transaction relay URL for eth_sendRawTransaction.
-    /// Defaults to Flashbots Protect so txs bypass the public mempool.
-    #[arg(
-        long,
-        default_value = "https://rpc.flashbots.net/?hint=hash&originId=morphogenesis"
-    )]
-    tx_relay: String,
-
-    /// Enable OpenTelemetry trace export (Datadog Agent OTLP gRPC compatible)
-    #[arg(long, default_value_t = false)]
-    otel_traces: bool,
-
-    /// OTLP collector endpoint (Datadog Agent default: http://127.0.0.1:4317)
-    #[arg(long, default_value = "http://127.0.0.1:4317")]
-    otel_endpoint: String,
-
-    /// Service name reported to APM
-    #[arg(long, default_value = "morphogen-rpc-adapter")]
-    otel_service_name: String,
-
-    /// Deployment environment tag for traces
-    #[arg(long, default_value = "e2e")]
-    otel_env: String,
-
-    /// Service version tag for traces
-    #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
-    otel_version: String,
-}
-
-#[cfg(test)]
-impl Args {
-    fn default_for_tests() -> Self {
-        Self {
-            port: 8545,
-            upstream: "https://ethereum-rpc.publicnode.com".to_string(),
-            pir_server_a: "http://localhost:3000".to_string(),
-            pir_server_b: "http://localhost:3001".to_string(),
-            dict_url: "http://localhost:8080/mainnet_compact.dict".to_string(),
-            cas_url: "http://localhost:8080/cas".to_string(),
-            print_effective_config: false,
-            file_url_root: None,
-            refresh_interval: 12,
-            upstream_timeout: 15,
-            fallback_to_upstream: false,
-            environment: AdapterEnvironment::Prod,
-            allow_privacy_degraded_fallback: false,
-            tx_relay: "https://rpc.flashbots.net/?hint=hash&originId=morphogenesis".to_string(),
-            otel_traces: false,
-            otel_endpoint: "http://127.0.0.1:4317".to_string(),
-            otel_service_name: "morphogen-rpc-adapter".to_string(),
-            otel_env: "e2e".to_string(),
-            otel_version: env!("CARGO_PKG_VERSION").to_string(),
-        }
-    }
-}
 
 struct AdapterState {
     args: Args,
@@ -198,17 +72,6 @@ const DROPPED_METHODS: &[(&str, &str)] = &[
 /// Methods relayed to a privacy-preserving endpoint instead of the regular upstream.
 /// eth_sendRawTransaction goes to Flashbots Protect to avoid public mempool exposure.
 const RELAY_METHODS: &[&str] = &["eth_sendRawTransaction"];
-
-fn validate_privacy_fallback_config(args: &Args) -> Result<()> {
-    if args.fallback_to_upstream
-        && args.environment == AdapterEnvironment::Prod
-        && !args.allow_privacy_degraded_fallback
-    {
-        bail!("--fallback-to-upstream in prod requires --allow-privacy-degraded-fallback");
-    }
-
-    Ok(())
-}
 
 fn next_privacy_degraded_fallback_count(counter: &AtomicU64) -> u64 {
     counter.fetch_add(1, Ordering::Relaxed) + 1
@@ -1281,12 +1144,13 @@ pub async fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::config::AdapterEnvironment;
     use super::proxy::upstream_invalid_json_error;
     use super::{
         effective_latest_for_filter, fail_closed_if_fallback_disabled, handle_eth_get_logs,
         handle_eth_new_filter, has_nonempty_state_overrides, next_privacy_degraded_fallback_count,
-        parse_log_filter_for_rpc, proxy_to_upstream, validate_privacy_fallback_config,
-        AdapterEnvironment, Args, DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS,
+        parse_log_filter_for_rpc, proxy_to_upstream, validate_privacy_fallback_config, Args,
+        DROPPED_METHODS, PASSTHROUGH_METHODS, RELAY_METHODS,
     };
     use clap::Parser;
     use serde_json::{json, Value};
