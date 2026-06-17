@@ -234,84 +234,10 @@ pub struct AdminSnapshotRequest {
     pub state_root: Option<[u8; 32]>,
 }
 
-mod hex_bytes {
-    use serde::{self, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&format!("0x{}", hex::encode(bytes)))
-    }
-
-    pub fn deserialize_option<'de, D>(deserializer: D) -> Result<Option<[u8; 32]>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let opt = Option::<String>::deserialize(deserializer)?;
-        match opt {
-            Some(s) => {
-                let hex_str = s.strip_prefix("0x").unwrap_or(&s);
-                let bytes = hex::decode(hex_str).map_err(serde::de::Error::custom)?;
-                if bytes.len() != 32 {
-                    return Err(serde::de::Error::custom(format!(
-                        "expected 32 bytes, got {}",
-                        bytes.len()
-                    )));
-                }
-                let mut out = [0u8; 32];
-                out.copy_from_slice(&bytes);
-                Ok(Some(out))
-            }
-            None => Ok(None),
-        }
-    }
-}
-
-mod hex_bytes_vec {
-    use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S>(bytes: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let encoded: Vec<String> = bytes
-            .iter()
-            .map(|b| format!("0x{}", hex::encode(b)))
-            .collect();
-        encoded.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let items: Vec<String> = Vec::deserialize(deserializer)?;
-        let mut out = Vec::with_capacity(items.len());
-        for item in items {
-            let hex_str = item.strip_prefix("0x").unwrap_or(&item);
-            let bytes = hex::decode(hex_str).map_err(serde::de::Error::custom)?;
-            out.push(bytes);
-        }
-        Ok(out)
-    }
-}
-
-mod hex_bytes_array {
-    use serde::{self, Serializer};
-
-    pub fn serialize<S>(keys: &[[u8; 16]; 2], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        use serde::ser::SerializeSeq;
-        let mut seq = serializer.serialize_seq(Some(2))?;
-        for key in keys {
-            seq.serialize_element(&format!("0x{}", hex::encode(key)))?;
-        }
-        seq.end()
-    }
-}
+// Hex serde helpers extracted to `network::serde_hex` (private to the network
+// module) in TASK-54.8. Private — not part of the crate's public API.
+#[cfg(feature = "network")]
+use super::serde_hex::{hex_bytes, hex_bytes_array, hex_bytes_vec};
 
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let snapshot = state.global.load();

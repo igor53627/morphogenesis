@@ -8,6 +8,8 @@
 #[cfg(feature = "network")]
 pub mod api;
 #[cfg(feature = "network")]
+mod serde_hex;
+#[cfg(feature = "network")]
 pub mod telemetry;
 
 #[cfg(feature = "network")]
