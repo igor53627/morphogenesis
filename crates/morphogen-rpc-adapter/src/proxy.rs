@@ -14,6 +14,24 @@ use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::Value;
 use tracing::{info, warn, Instrument};
 
+/// Render a `reqwest::Error` for internal logging WITHOUT leaking
+/// credentials. `reqwest::Error`'s `Debug` impl often includes the full
+/// request URL; if the upstream URL carries embedded basic-auth or API-key
+/// query params, that would land in logs. We redact by string-replacing the
+/// raw `url` with its `sanitized_url` form (credentials/query stripped by
+/// `telemetry::sanitize_url_for_telemetry`).
+///
+/// `sanitized_url` is passed in (rather than recomputed) so the same redacted
+/// form used in the tracing span is reused here.
+fn redact_reqwest_error(e: &reqwest::Error, url: &str, sanitized_url: &str) -> String {
+    let raw = format!("{:?}", e);
+    if url.is_empty() || sanitized_url == url {
+        raw
+    } else {
+        raw.replace(url, sanitized_url)
+    }
+}
+
 /// Forward a JSON-RPC `method`/`params` call to the upstream `url` using the
 /// shared `client`, returning the upstream `result` on success.
 ///
@@ -46,6 +64,15 @@ pub(crate) async fn proxy_to_upstream(
         });
 
         let response = client.post(url).json(&request).send().await.map_err(|e| {
+            // Internal observability: the underlying transport error is logged
+            // here before mapping to the redacted, client-facing error below.
+            // The client never sees `e`. The error string is URL-redacted to
+            // avoid leaking credentials embedded in the upstream URL.
+            warn!(
+                error = %redact_reqwest_error(&e, url, &sanitized_url),
+                rpc.method = %method,
+                "Upstream HTTP request failed"
+            );
             if e.is_timeout() {
                 ErrorObjectOwned::owned(
                     -32000,
@@ -63,10 +90,29 @@ pub(crate) async fn proxy_to_upstream(
             }
         })?;
 
-        let json: Value = response
-            .json()
-            .await
-            .map_err(|_| upstream_invalid_json_error(method))?;
+        // Capture the HTTP status before `response.json()` consumes the body.
+        // If JSON parsing fails on a non-2xx response (e.g. an HTML 502/503/429
+        // page from a gateway), surface the HTTP status — it carries more
+        // diagnostic signal than a generic 'Invalid JSON response'. The body
+        // itself is never echoed (redaction invariant).
+        let status = response.status();
+        let json: Value = response.json().await.map_err(|e| {
+            warn!(
+                error = %redact_reqwest_error(&e, url, &sanitized_url),
+                %status,
+                rpc.method = %method,
+                "Failed to parse upstream JSON response"
+            );
+            if !status.is_success() {
+                ErrorObjectOwned::owned(
+                    -32000,
+                    format!("Upstream returned HTTP {} for {}", status, method),
+                    None::<()>,
+                )
+            } else {
+                upstream_invalid_json_error(method)
+            }
+        })?;
 
         if let Some(error) = json.get("error") {
             let error_code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000) as i32;
