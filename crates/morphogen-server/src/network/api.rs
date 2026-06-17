@@ -1,10 +1,9 @@
 //! HTTP and WebSocket API implementation.
 
-/// Optimal DPF chunk size for eval_and_accumulate_chunked.
-/// Larger chunks amortize tree-traversal overhead. 65536 = 64K elements.
-/// At 16 bytes per DPF output, this uses 1MB of buffer per evaluation.
-/// Benchmarks show this is ~1.4x faster than chunk_size=4096.
-pub const OPTIMAL_DPF_CHUNK_SIZE: usize = 65536;
+// Wire-format DTOs (request/response shapes) extracted to
+// `network::dto` (pub) in TASK-54.15. Re-exported here so the existing
+// `network::api::<DTO>` path keeps resolving at all external call sites.
+pub use super::dto::*;
 
 use axum::{
     extract::{
@@ -25,19 +24,15 @@ use crate::epoch::EpochManager;
 #[cfg(feature = "verifiable-pir")]
 use morphogen_core::sumcheck::SumCheckProof;
 use morphogen_core::GlobalState;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 
-#[derive(Clone, Serialize)]
-pub struct EpochMetadata {
-    pub epoch_id: u64,
-    pub num_rows: usize,
-    pub seeds: [u64; 3],
-    pub block_number: u64,
-    #[serde(with = "hex_bytes")]
-    pub state_root: [u8; 32],
-}
+/// Optimal DPF chunk size for eval_and_accumulate_chunked.
+/// Larger chunks amortize tree-traversal overhead. 65536 = 64K elements.
+/// At 16 bytes per DPF output, this uses 1MB of buffer per evaluation.
+/// Benchmarks show this is ~1.4x faster than chunk_size=4096.
+pub const OPTIMAL_DPF_CHUNK_SIZE: usize = 65536;
 
 #[derive(Clone)]
 pub struct PagePirConfig {
@@ -73,150 +68,14 @@ pub struct AppState {
         Option<Arc<std::sync::Mutex<Option<morphogen_gpu_dpf::storage::GpuPageMatrix>>>>,
 }
 
-#[derive(Serialize)]
-pub struct HealthResponse {
-    pub status: String,
-    pub epoch_id: u64,
-    pub block_number: u64,
-}
-
-#[derive(Deserialize)]
-pub struct StorageProofRequest {
-    #[serde(default, deserialize_with = "hex_bytes::deserialize_option")]
-    pub state_root: Option<[u8; 32]>,
-}
-
-#[derive(Serialize)]
-pub struct PagePirResponse {
-    pub domain_bits: usize,
-    pub rows_per_page: usize,
-    pub num_pages: usize,
-    #[serde(with = "hex_bytes_array")]
-    pub prg_keys: [[u8; 16]; 2],
-}
-
-#[derive(Serialize)]
-pub struct EpochMetadataResponse {
-    pub epoch_id: u64,
-    pub num_rows: usize,
-    pub seeds: [u64; 3],
-    pub block_number: u64,
-    #[serde(with = "hex_bytes")]
-    pub state_root: [u8; 32],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub page_pir: Option<PagePirResponse>,
-}
-
-#[derive(Deserialize)]
-pub struct QueryRequest {
-    #[serde(with = "hex_bytes_vec")]
-    pub keys: Vec<Vec<u8>>,
-}
-
-#[derive(Serialize)]
-pub struct QueryResponse {
-    pub epoch_id: u64,
-    #[serde(with = "hex_bytes_vec")]
-    pub payloads: Vec<Vec<u8>>,
-}
-
-/// Maximum number of queries in a single batch request.
-pub const MAX_BATCH_SIZE: usize = 32;
 #[cfg(any(feature = "cuda", test))]
 // GPU batching policy/parse/configured helpers extracted to
 // `network::gpu_batch` (private) in TASK-54.9.
 #[cfg(any(feature = "cuda", test))]
 use super::gpu_batch::*;
 
-#[derive(Deserialize)]
-pub struct BatchQueryRequest {
-    pub queries: Vec<QueryRequest>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchQueryResponse {
-    pub epoch_id: u64,
-    pub results: Vec<BatchQueryResult>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchQueryResult {
-    #[serde(with = "hex_bytes_vec")]
-    pub payloads: Vec<Vec<u8>>,
-}
-
-/// Page-level PIR query response.
-///
-/// Returns full pages (4KB each) that the client XORs with the other server's response.
-#[derive(Serialize)]
-#[cfg(feature = "verifiable-pir")]
-pub struct PageQueryResponse {
-    pub epoch_id: u64,
-    /// 3 page payloads (4KB each for standard page size)
-    #[serde(with = "hex_bytes_vec")]
-    pub pages: Vec<Vec<u8>>,
-    /// Verifiable PIR Sum-Check Proof (Round 0)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proof: Option<SumCheckProof>,
-}
-
-#[cfg(not(feature = "verifiable-pir"))]
-#[derive(Serialize)]
-pub struct PageQueryResponse {
-    pub epoch_id: u64,
-    /// 3 page payloads (4KB each for standard page size)
-    #[serde(with = "hex_bytes_vec")]
-    pub pages: Vec<Vec<u8>>,
-}
-
-#[derive(Deserialize)]
-pub struct PageQueryRequest {
-    #[serde(with = "hex_bytes_vec")]
-    pub keys: Vec<Vec<u8>>,
-}
-
-#[derive(Deserialize)]
-pub struct GpuPageQueryRequest {
-    #[serde(with = "hex_bytes_vec")]
-    pub keys: Vec<Vec<u8>>,
-}
-
-#[derive(Deserialize)]
-pub struct BatchGpuPageQueryRequest {
-    pub queries: Vec<GpuPageQueryRequest>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchGpuPageQueryResponse {
-    pub epoch_id: u64,
-    pub results: Vec<BatchGpuPageQueryResult>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct BatchGpuPageQueryResult {
-    #[serde(with = "hex_bytes_vec")]
-    pub pages: Vec<Vec<u8>>,
-    #[cfg(feature = "verifiable-pir")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub proof: Option<SumCheckProof>,
-}
-
-#[derive(Deserialize)]
-pub struct AdminSnapshotRequest {
-    #[serde(alias = "url")]
-    pub r2_url: String,
-    #[serde(default)]
-    pub seeds: Option<[u64; 3]>,
-    #[serde(default)]
-    pub block_number: Option<u64>,
-    #[serde(default, deserialize_with = "hex_bytes::deserialize_option")]
-    pub state_root: Option<[u8; 32]>,
-}
-
-// Hex serde helpers extracted to `network::serde_hex` (private to the network
-// module) in TASK-54.8. Private — not part of the crate's public API.
-#[cfg(feature = "network")]
-use super::serde_hex::{hex_bytes, hex_bytes_array, hex_bytes_vec};
+// Hex serde helpers (`hex_bytes`, `hex_bytes_vec`, `hex_bytes_array`) now live
+// next to the DTOs in `network::dto` (TASK-54.15); not needed in api.rs.
 
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
     let snapshot = state.global.load();

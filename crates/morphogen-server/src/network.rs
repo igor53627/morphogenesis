@@ -10,6 +10,8 @@ mod admin_auth;
 #[cfg(feature = "network")]
 pub mod api;
 #[cfg(feature = "network")]
+pub mod dto;
+#[cfg(feature = "network")]
 mod gpu_batch;
 #[cfg(feature = "network")]
 mod gpu_metrics;
