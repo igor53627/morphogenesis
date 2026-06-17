@@ -138,12 +138,17 @@ pub(crate) async fn fetch_receipts_fallback_bounded(
 }
 
 /// Make a JSON-RPC call and return the result field.
+///
+/// Error strings never echo the raw upstream URL; reqwest::Error Debug output
+/// is URL-redacted via `telemetry::sanitize_url_for_telemetry` to prevent
+/// credential leakage from embedded basic-auth or query-param API keys.
 pub(crate) async fn rpc_call(
     client: &reqwest::Client,
     url: &str,
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
+    let sanitized_url = crate::telemetry::sanitize_url_for_telemetry(url);
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -151,21 +156,19 @@ pub(crate) async fn rpc_call(
         "params": params
     });
 
-    let resp = client
-        .post(url)
-        .json(&request)
-        .send()
-        .await
-        .map_err(|e| format!("{} request failed: {}", method, e))?;
+    let resp = client.post(url).json(&request).send().await.map_err(|e| {
+        let raw = format!("{:?}", e).replace(url, &sanitized_url);
+        format!("{} request failed: {}", method, raw)
+    })?;
 
     if !resp.status().is_success() {
         return Err(format!("{} HTTP {}", method, resp.status()));
     }
 
-    let json: Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("{} parse failed: {}", method, e))?;
+    let json: Value = resp.json().await.map_err(|e| {
+        let raw = format!("{:?}", e).replace(url, &sanitized_url);
+        format!("{} parse failed: {}", method, raw)
+    })?;
 
     if let Some(err) = json.get("error") {
         let msg = err

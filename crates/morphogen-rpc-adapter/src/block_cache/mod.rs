@@ -7,7 +7,7 @@ use std::time::Instant;
 // in TASK-54.18. Re-exported here so `block_cache::LogFilter` /
 // `block_cache::parse_log_filter_object` / `block_cache::log_matches_filter`
 // keep resolving at all call sites.
-#[cfg(test)]
+#[cfg_attr(not(test), allow(unused_imports))]
 pub use crate::log_filter::TopicFilter;
 pub use crate::log_filter::{log_matches_filter, parse_log_filter_object, LogFilter};
 // Receipt-fetch helpers (rpc_call, fetch_receipts, bounded fan-out)
