@@ -7,6 +7,7 @@ mod log_filter;
 mod methods;
 mod pir_db;
 mod proxy;
+mod receipt_fetch;
 mod state;
 mod telemetry;
 
