@@ -6,6 +6,8 @@
 //! - Epoch metadata streaming
 
 #[cfg(feature = "network")]
+mod admin_auth;
+#[cfg(feature = "network")]
 pub mod api;
 #[cfg(feature = "network")]
 mod gpu_batch;
