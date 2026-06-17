@@ -3,10 +3,10 @@ id: TASK-54
 title: >-
   Split overgrown files: rpc-adapter main.rs, server network/api.rs,
   block_cache.rs
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-06-16 21:25'
-updated_date: '2026-06-17 23:30'
+updated_date: '2026-06-17 23:55'
 labels:
   - refactor
   - maintainability
@@ -83,5 +83,20 @@ Constraints:
   - 54.6 (PR #27): methods module (handlers + register_*)
   - 54.7 (PR #28): tests.rs (inline mod tests → src/tests.rs)
 Final structure: lib.rs 699, tests.rs 985, methods.rs 330, config.rs 159, filters.rs 133, state.rs 115, proxy.rs 115, main.rs 13. Net: main.rs 2361→13, lib.rs 2361→699. 166 tests green throughout; clippy/fmt clean; roborev 2x2 passed on every PR (codex+claude-code × security+design, all no-issues/Pass). Privacy invariants (TASK-37 fail-closed, URL redaction, dropped/relay method tables, CLI/env compatibility) preserved across all 7 PRs.
-Remaining scope (separate future work): AC #3 morphogen-server/src/network/api.rs (3966 LOC) and AC #4 block_cache.rs (2065 LOC) — different files/crates, can follow the same mechanical module-extraction pattern.
+
+2026-06-17 AC#3 + AC#4 COMPLETE (54.8–54.21, 14 more PRs):
+  - AC#3 morphogen-server network/api.rs: 54.8 serde_hex, 54.9 gpu_batch, 54.10 gpu_metrics, 54.11 admin_auth, 54.12 gpu_scan, 54.13 scan_helpers, 54.14 snapshot_config, 54.15 dto (pub), 54.16 ws_query, 54.17 split api.rs→api/mod.rs+tests.rs. api.rs 3966→api/mod.rs 908 (prod) + tests.rs 2021.
+  - AC#4 rpc-adapter block_cache.rs: 54.18 log_filter, 54.19 receipt_fetch, 54.20 block_poller, 54.21 split block_cache.rs→block_cache/mod.rs+tests.rs. block_cache.rs 2065→mod.rs 460 (prod) + tests.rs 1057.
+TASK-54 closed: 21 PRs total (#22–#46), all merged. ~80 roborev jobs (all closed), 0 open reviews at close. 170/249 tests stable green throughout. Side outputs: agents-md repo published (igor53627/agents-md), morphogenesis AGENTS.md adopted it (hybrid with BEGIN/END SHARED markers). Remaining: tightly-coupled core in each mod.rs (AppState-bound handlers / BlockCache impl) — not extractable without restructuring, deferred.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+All four practical acceptance criteria met across 21 PRs (#22–#46):
+- AC #1 (rpc-adapter main.rs): 2361→13 LOC (54.1–54.7)
+- AC #2 (tests relocated): folded into 54.7, 54.17, 54.21
+- AC #3 (server network/api.rs): 3966→api/mod.rs 908 prod LOC (54.8–54.17)
+- AC #4 (rpc-adapter block_cache.rs): 2065→block_cache/mod.rs 460 prod LOC (54.18–54.21)
+Net production-code reduction across the three target files: main.rs −99%, api.rs −77%, block_cache.rs −78%. 32 new modules with clear boundaries. Review-loop discipline (roborev 2×2 + gemini bot-review + close + compact) held across the entire series; 0 open roborev reviews at close.
+<!-- SECTION:FINAL_SUMMARY:END -->
