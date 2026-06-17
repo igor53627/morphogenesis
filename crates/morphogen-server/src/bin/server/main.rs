@@ -60,7 +60,6 @@ type StubGpuScanner = Option<Arc<()>>;
 type StubGpuMatrix = Option<Arc<std::sync::Mutex<Option<()>>>>;
 type ShutdownFuture = Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 
-#[derive(Debug, Clone)]
 #[cfg(feature = "cuda")]
 fn init_gpu_resources(
     runtime: &RuntimeConfig,
