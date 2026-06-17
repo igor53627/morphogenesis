@@ -1,10 +1,10 @@
 ---
 id: TASK-55
 title: Split morphogen-server/src/bin/server.rs (1882 LOC) into config/matrix_loader/gpu_init modules
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-06-17 23:55'
-updated_date: '2026-06-17 23:55'
+updated_date: '2026-06-18 00:30'
 labels:
   - refactor
   - maintainability
@@ -79,4 +79,34 @@ in the workspace and has clear extraction boundaries (config layering /
 matrix loading / GPU init) that don't require restructuring the server
 itself. No inline tests → safety net is `tests/network_api.rs` +
 `scripts/test_rpc_e2e.sh`.
+
+2026-06-18: TASK-55 DONE. 4 PRs merged (#48–#50 + hotfix #51):
+  - 55.1 (PR #48): split bin/server.rs into bin/server/ module directory;
+    tests → tests.rs (614 LOC). 1882→1262.
+  - 55.2 (PR #49): extract config_helpers.rs (184 LOC, 12 parse fns).
+    1262→1098.
+  - 55.3 (PR #50): extract config.rs (542 LOC: StartupError, CliArgs,
+    FileConfig, EnvConfig, PagePirRuntimeConfig, RuntimeConfig + impls +
+    validate/build). 1098→574.
+  - Hotfix (PR #51): remove stray #[derive(Debug, Clone)] left on
+    init_gpu_resources by the Python extraction script — caught by
+    greptile-apps[bot] (P1), invisible to CI because the item is
+    cfg(cuda)-gated. Also fixed: gemini findings on earlier PRs
+    (TopicFilter API consistency PR #52, rpc_call credential leak PRs
+    #52+#53).
+Final structure: main.rs 574, config.rs 542, tests.rs 614, config_helpers.rs 184.
+Net: bin/server.rs 1882→main.rs 574 (−70%). 33 runtime_config_tests + 249
+workspace tests green throughout. AC #1, #2, #3 met; AC #4 (matrix_loader)
+and gpu_init/shutdown extraction deferred — remaining code in main.rs is
+small (574 LOC) and tightly coupled to run() orchestration.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+bin/server.rs 1882→main.rs 574 LOC (−70%) across 3 sub-task PRs + 1 hotfix.
+Config layer (StartupError/CliArgs/FileConfig/EnvConfig/RuntimeConfig + impls)
+and 12 env-var parse helpers extracted into dedicated modules. 33 runtime
+config tests relocated to tests.rs. Binary surface unchanged (−−help verified).
+Greptile P1 regression (stray derive under cfg(cuda)) caught and fixed.
+<!-- SECTION:FINAL_SUMMARY:END -->
