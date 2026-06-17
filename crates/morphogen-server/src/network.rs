@@ -20,6 +20,8 @@ mod scan_helpers;
 #[cfg(feature = "network")]
 mod serde_hex;
 #[cfg(feature = "network")]
+mod snapshot_config;
+#[cfg(feature = "network")]
 pub mod telemetry;
 
 #[cfg(feature = "network")]
