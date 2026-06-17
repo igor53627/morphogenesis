@@ -127,27 +127,10 @@ pub struct QueryResponse {
 /// Maximum number of queries in a single batch request.
 pub const MAX_BATCH_SIZE: usize = 32;
 #[cfg(any(feature = "cuda", test))]
-const GPU_MICRO_BATCH_SIZE: usize = 2;
-#[cfg(feature = "cuda")]
-const GPU_STREAM_COUNT_ENV: &str = "MORPHOGEN_GPU_STREAMS";
-#[cfg(feature = "cuda")]
-const GPU_BATCH_POLICY_ENV: &str = "MORPHOGEN_GPU_BATCH_POLICY";
-#[cfg(feature = "cuda")]
-const GPU_BATCH_ADAPTIVE_THRESHOLD_ENV: &str = "MORPHOGEN_GPU_BATCH_ADAPTIVE_THRESHOLD";
-#[cfg(feature = "cuda")]
-const GPU_CUDA_GRAPH_ENV: &str = "MORPHOGEN_GPU_CUDA_GRAPH";
-#[cfg(feature = "cuda")]
-const GPU_BATCH_TILE_SIZE_ENV: &str = "MORPHOGEN_GPU_BATCH_TILE_SIZE";
+// GPU batching policy/parse/configured helpers extracted to
+// `network::gpu_batch` (private) in TASK-54.9.
 #[cfg(any(feature = "cuda", test))]
-const DEFAULT_GPU_STREAM_COUNT: usize = 1;
-#[cfg(any(feature = "cuda", test))]
-const MAX_GPU_STREAM_COUNT: usize = 8;
-#[cfg(any(feature = "cuda", test))]
-const DEFAULT_GPU_BATCH_ADAPTIVE_THRESHOLD: usize = 4;
-#[cfg(any(feature = "cuda", test))]
-const DEFAULT_GPU_BATCH_TILE_SIZE: usize = 16;
-#[cfg(any(feature = "cuda", test))]
-const MAX_GPU_BATCH_TILE_SIZE: usize = 16;
+use super::gpu_batch::*;
 
 #[derive(Deserialize)]
 pub struct BatchQueryRequest {
@@ -681,125 +664,6 @@ fn parse_gpu_query_keys(
 }
 
 #[cfg(any(feature = "cuda", test))]
-fn gpu_micro_batch_ranges(total_queries: usize) -> Vec<(usize, usize)> {
-    if total_queries == 0 {
-        return Vec::new();
-    }
-    let mut ranges = Vec::with_capacity(total_queries.div_ceil(GPU_MICRO_BATCH_SIZE));
-    let mut start = 0usize;
-    while start < total_queries {
-        let end = (start + GPU_MICRO_BATCH_SIZE).min(total_queries);
-        ranges.push((start, end));
-        start = end;
-    }
-    ranges
-}
-
-#[cfg(any(feature = "cuda", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GpuBatchPolicy {
-    Adaptive,
-    Throughput,
-    Latency,
-}
-
-#[cfg(any(feature = "cuda", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GpuBatchPolicyConfig {
-    policy: GpuBatchPolicy,
-    adaptive_threshold: usize,
-}
-
-#[cfg(any(feature = "cuda", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GpuBatchDispatch {
-    MultiStream { stream_count: usize },
-    FullBatch,
-    MicroBatch2,
-}
-
-#[cfg(any(feature = "cuda", test))]
-impl GpuBatchDispatch {
-    #[cfg(any(feature = "metrics", test))]
-    fn mode_label(self) -> &'static str {
-        match self {
-            GpuBatchDispatch::MultiStream { .. } => "multistream",
-            GpuBatchDispatch::FullBatch => "full_batch",
-            GpuBatchDispatch::MicroBatch2 => "micro_batch2",
-        }
-    }
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn parse_gpu_batch_policy(raw: Option<&str>) -> GpuBatchPolicy {
-    match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-        Some("throughput") => GpuBatchPolicy::Throughput,
-        Some("latency") => GpuBatchPolicy::Latency,
-        _ => GpuBatchPolicy::Adaptive,
-    }
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn parse_gpu_batch_adaptive_threshold(raw: Option<&str>) -> usize {
-    raw.and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_GPU_BATCH_ADAPTIVE_THRESHOLD)
-        .clamp(1, MAX_BATCH_SIZE)
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn parse_gpu_batch_tile_size(raw: Option<&str>) -> usize {
-    raw.and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_GPU_BATCH_TILE_SIZE)
-        .clamp(1, MAX_GPU_BATCH_TILE_SIZE)
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn choose_gpu_batch_dispatch(
-    total_queries: usize,
-    stream_count: usize,
-    cfg: GpuBatchPolicyConfig,
-) -> GpuBatchDispatch {
-    if stream_count > 1 {
-        return GpuBatchDispatch::MultiStream { stream_count };
-    }
-
-    match cfg.policy {
-        GpuBatchPolicy::Throughput => GpuBatchDispatch::MicroBatch2,
-        GpuBatchPolicy::Latency => GpuBatchDispatch::FullBatch,
-        GpuBatchPolicy::Adaptive => {
-            if total_queries <= cfg.adaptive_threshold {
-                GpuBatchDispatch::FullBatch
-            } else {
-                GpuBatchDispatch::MicroBatch2
-            }
-        }
-    }
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn parse_gpu_stream_count(raw: Option<&str>) -> usize {
-    raw.and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_GPU_STREAM_COUNT)
-        .clamp(DEFAULT_GPU_STREAM_COUNT, MAX_GPU_STREAM_COUNT)
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn parse_gpu_cuda_graph_enabled(raw: Option<&str>) -> bool {
-    matches!(
-        raw.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    )
-}
-
-#[cfg(any(feature = "cuda", test))]
-fn ensure_gpu_result_count(expected: usize, actual: usize) -> Result<(), StatusCode> {
-    if actual == expected {
-        return Ok(());
-    }
-    Err(StatusCode::INTERNAL_SERVER_ERROR)
-}
-
-#[cfg(any(feature = "cuda", test))]
 fn with_gpu_matrix_ref<T, R, F>(
     matrix_mutex: &std::sync::Mutex<Option<T>>,
     scan: F,
@@ -947,34 +811,6 @@ struct TestGpuBatchHooks {
 thread_local! {
     static TEST_GPU_BATCH_HOOKS: std::cell::RefCell<Option<TestGpuBatchHooks>> =
         const { std::cell::RefCell::new(None) };
-}
-
-#[cfg(feature = "cuda")]
-fn configured_gpu_stream_count() -> usize {
-    let raw = std::env::var(GPU_STREAM_COUNT_ENV).ok();
-    parse_gpu_stream_count(raw.as_deref())
-}
-
-#[cfg(feature = "cuda")]
-fn configured_gpu_batch_policy() -> GpuBatchPolicyConfig {
-    let policy_raw = std::env::var(GPU_BATCH_POLICY_ENV).ok();
-    let threshold_raw = std::env::var(GPU_BATCH_ADAPTIVE_THRESHOLD_ENV).ok();
-    GpuBatchPolicyConfig {
-        policy: parse_gpu_batch_policy(policy_raw.as_deref()),
-        adaptive_threshold: parse_gpu_batch_adaptive_threshold(threshold_raw.as_deref()),
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn configured_gpu_cuda_graph_enabled() -> bool {
-    let raw = std::env::var(GPU_CUDA_GRAPH_ENV).ok();
-    parse_gpu_cuda_graph_enabled(raw.as_deref())
-}
-
-#[cfg(feature = "cuda")]
-fn configured_gpu_batch_tile_size() -> usize {
-    let raw = std::env::var(GPU_BATCH_TILE_SIZE_ENV).ok();
-    parse_gpu_batch_tile_size(raw.as_deref())
 }
 
 fn collect_gpu_page_refs(matrix: &morphogen_storage::ChunkedMatrix) -> Vec<&[u8]> {
