@@ -1,0 +1,2021 @@
+use super::*;
+use axum::http::HeaderValue;
+use morphogen_core::{DeltaBuffer, EpochSnapshot};
+use morphogen_storage::ChunkedMatrix;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+fn test_state() -> Arc<AppState> {
+    let row_size_bytes = 256;
+    let num_rows = 4;
+    let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 512));
+    let snapshot = EpochSnapshot {
+        epoch_id: 42,
+        matrix,
+    };
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+
+    let initial = EpochMetadata {
+        epoch_id: 42,
+        num_rows: 100_000,
+        seeds: [0x1234, 0x5678, 0x9ABC],
+        block_number: 12345678,
+        state_root: [0xAB; 32],
+    };
+    let (tx, rx) = watch::channel(initial);
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+    );
+    Arc::new(AppState {
+        global,
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(Mutex::new(())),
+        admin_snapshot_token: Some("test-admin-token".to_string()),
+        admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: Vec::new(),
+        admin_mtls_trust_proxy_headers: false,
+        admin_snapshot_allow_local_paths: true,
+        admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+        admin_snapshot_max_bytes: 16 * 1024 * 1024,
+        row_size_bytes,
+        num_rows: 100_000,
+        seeds: [0x1234, 0x5678, 0x9ABC],
+        block_number: 12345678,
+        state_root: [0xAB; 32],
+        epoch_rx: rx,
+        page_config: None,
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
+    })
+}
+
+#[test]
+fn app_state_has_pending_buffer() {
+    let state = test_state();
+    assert!(state.global.load_pending().is_empty().unwrap());
+    assert_eq!(state.row_size_bytes, 256);
+}
+
+#[test]
+fn health_response_serializes_correctly() {
+    let response = HealthResponse {
+        status: "ok".to_string(),
+        epoch_id: 42,
+        block_number: 12345,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"status\":\"ok\""));
+    assert!(json.contains("\"epoch_id\":42"));
+}
+
+#[test]
+fn epoch_metadata_serializes_with_hex_root() {
+    let response = EpochMetadataResponse {
+        epoch_id: 1,
+        num_rows: 1000,
+        seeds: [1, 2, 3],
+        block_number: 100,
+        state_root: [0xFF; 32],
+        page_pir: None,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"state_root\":\"0x"));
+    assert!(json.contains("ffffffff"));
+    assert!(!json.contains("page_pir")); // skip_serializing_if works
+}
+
+#[test]
+fn epoch_metadata_serializes_page_pir_when_present() {
+    let response = EpochMetadataResponse {
+        epoch_id: 1,
+        num_rows: 1000,
+        seeds: [1, 2, 3],
+        block_number: 100,
+        state_root: [0xFF; 32],
+        page_pir: Some(PagePirResponse {
+            domain_bits: 10,
+            rows_per_page: 16,
+            num_pages: 1024,
+            prg_keys: [[0xAA; 16], [0xBB; 16]],
+        }),
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"page_pir\""));
+    assert!(json.contains("\"domain_bits\":10"));
+    assert!(json.contains("\"num_pages\":1024"));
+    assert!(json.contains("\"prg_keys\""));
+    assert!(json.contains("0xaaaa"));
+}
+
+#[test]
+#[cfg(not(feature = "verifiable-pir"))]
+fn page_query_response_omits_proof_field_without_feature() {
+    let response = PageQueryResponse {
+        epoch_id: 1,
+        pages: vec![vec![0u8; 8], vec![0u8; 8], vec![0u8; 8]],
+        #[cfg(feature = "verifiable-pir")]
+        proof: None,
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(!json.contains("\"proof\""));
+}
+
+#[test]
+fn query_request_deserializes_hex_keys() {
+    let json = r#"{"keys":["0xaabb","0xccdd","0xeeff"]}"#;
+    let request: QueryRequest = serde_json::from_str(json).unwrap();
+    assert_eq!(request.keys.len(), 3);
+    assert_eq!(request.keys[0], vec![0xAA, 0xBB]);
+}
+
+#[test]
+fn query_response_serializes_hex_payloads() {
+    let response = QueryResponse {
+        epoch_id: 1,
+        payloads: vec![vec![0xDE, 0xAD], vec![0xBE, 0xEF], vec![0xCA, 0xFE]],
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"0xdead\""));
+    assert!(json.contains("\"0xbeef\""));
+    assert!(json.contains("\"0xcafe\""));
+}
+
+#[test]
+fn app_state_is_clone_and_send() {
+    fn assert_clone_send<T: Clone + Send>() {}
+    assert_clone_send::<AppState>();
+}
+
+#[test]
+fn payload_array_into_vec_moves_without_copying() {
+    let payloads = [vec![0xAA, 0xBB], vec![0xCC], vec![0xDD, 0xEE, 0xFF]];
+    let ptr0 = payloads[0].as_ptr() as usize;
+    let ptr1 = payloads[1].as_ptr() as usize;
+    let ptr2 = payloads[2].as_ptr() as usize;
+
+    let moved = payload_array_into_vec(payloads);
+    assert_eq!(moved.len(), 3);
+    assert_eq!(moved[0].as_ptr() as usize, ptr0);
+    assert_eq!(moved[1].as_ptr() as usize, ptr1);
+    assert_eq!(moved[2].as_ptr() as usize, ptr2);
+}
+
+#[test]
+fn admin_token_eq_constant_time_compares_values_and_lengths() {
+    assert!(admin_token_eq_constant_time(
+        "test-admin-token",
+        "test-admin-token"
+    ));
+    assert!(!admin_token_eq_constant_time(
+        "test-admin-token",
+        "test-admin-token-x"
+    ));
+    assert!(!admin_token_eq_constant_time(
+        "test-admin-token",
+        "wrong-token"
+    ));
+}
+
+#[test]
+fn is_allowed_snapshot_host_exact_and_subdomain_match() {
+    // Regression for TASK-54.11 (RoboRev codex security finding): the
+    // extraction accidentally narrowed the match to exact-only, losing
+    // the subdomain rule. Allowlist `example.com` must also authorize
+    // `foo.example.com` (the trailing-dot prefix is what permits it).
+    let allowed = vec!["example.com".to_string()];
+    assert!(is_allowed_snapshot_host("example.com", &allowed));
+    assert!(is_allowed_snapshot_host("foo.example.com", &allowed));
+    assert!(is_allowed_snapshot_host("EXAMPLE.com", &allowed));
+    // Not a subdomain: `notexample.com` does not end in `.example.com`.
+    assert!(!is_allowed_snapshot_host("notexample.com", &allowed));
+    assert!(!is_allowed_snapshot_host("example.org", &allowed));
+}
+
+#[test]
+fn query_handler_requires_25_byte_keys() {
+    // AES_DPF_KEY_SIZE = 25 bytes
+    // Keys shorter than 25 bytes should be rejected
+    use morphogen_dpf::AES_DPF_KEY_SIZE;
+    assert_eq!(AES_DPF_KEY_SIZE, 25);
+}
+
+#[test]
+fn parse_gpu_query_keys_rejects_domain_bits_above_kernel_limit() {
+    use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+    use morphogen_gpu_dpf::kernel::MAX_DOMAIN_BITS;
+
+    let params = ChaChaParams::new(MAX_DOMAIN_BITS + 1).expect("valid params");
+    let (k0, _) = generate_chacha_dpf_keys(&params, 0).expect("key generation should succeed");
+    let key_bytes = k0.to_bytes().to_vec();
+    let request = GpuPageQueryRequest {
+        keys: vec![key_bytes.clone(), key_bytes.clone(), key_bytes],
+    };
+
+    assert!(matches!(
+        parse_gpu_query_keys(&request),
+        Err(StatusCode::BAD_REQUEST)
+    ));
+}
+
+#[test]
+fn parse_gpu_query_keys_accepts_kernel_max_domain_bits() {
+    use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+    use morphogen_gpu_dpf::kernel::MAX_DOMAIN_BITS;
+
+    let params = ChaChaParams::new(MAX_DOMAIN_BITS).expect("valid params");
+    let (k0, _) = generate_chacha_dpf_keys(&params, 0).expect("key generation should succeed");
+    let key_bytes = k0.to_bytes().to_vec();
+    let request = GpuPageQueryRequest {
+        keys: vec![key_bytes.clone(), key_bytes.clone(), key_bytes],
+    };
+
+    assert!(parse_gpu_query_keys(&request).is_ok());
+}
+
+#[test]
+fn batch_request_deserializes() {
+    let json = r#"{"queries":[{"keys":["0xaabb","0xccdd","0xeeff"]}]}"#;
+    let request: BatchQueryRequest = serde_json::from_str(json).unwrap();
+    assert_eq!(request.queries.len(), 1);
+    assert_eq!(request.queries[0].keys.len(), 3);
+}
+
+#[test]
+fn batch_response_serializes_correctly() {
+    let response = BatchQueryResponse {
+        epoch_id: 42,
+        results: vec![
+            BatchQueryResult {
+                payloads: vec![vec![0xDE, 0xAD], vec![0xBE, 0xEF], vec![0xCA, 0xFE]],
+            },
+            BatchQueryResult {
+                payloads: vec![vec![0x11], vec![0x22], vec![0x33]],
+            },
+        ],
+    };
+    let json = serde_json::to_string(&response).unwrap();
+    assert!(json.contains("\"epoch_id\":42"));
+    assert!(json.contains("\"results\""));
+    assert!(json.contains("\"0xdead\""));
+    assert!(json.contains("\"0x11\""));
+}
+
+#[tokio::test]
+async fn batch_query_empty_returns_bad_request() {
+    let state = test_state();
+    let request = BatchQueryRequest { queries: vec![] };
+    let result = batch_query_handler(State(state), Json(request)).await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn query_handler_retry_backoff_does_not_starve_runtime_timers() {
+    use morphogen_dpf::AesDpfKey;
+    use std::time::Duration;
+
+    let state = test_state();
+    let current_epoch = state.global.load().epoch_id;
+    state
+        .global
+        .store_pending(Arc::new(DeltaBuffer::new_with_epoch(
+            state.row_size_bytes,
+            current_epoch.saturating_add(1),
+        )));
+
+    let mut rng = rand::thread_rng();
+    let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+    let key = k0.to_bytes().to_vec();
+    let request = QueryRequest {
+        keys: vec![key.clone(), key.clone(), key],
+    };
+
+    let timer = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    });
+    let handler = tokio::spawn(query_handler(State(state), Json(request)));
+
+    tokio::time::timeout(Duration::from_millis(500), timer)
+        .await
+        .expect("timer task should complete without runtime starvation")
+        .expect("timer task join should succeed");
+
+    let handler_result = tokio::time::timeout(Duration::from_secs(3), handler)
+        .await
+        .expect("query handler should complete")
+        .expect("query handler task should join");
+    match handler_result {
+        Ok(_) => panic!("mismatched pending epoch should fail after retries"),
+        Err(status) => assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn batch_query_handler_retry_backoff_does_not_starve_runtime_timers() {
+    use morphogen_dpf::AesDpfKey;
+    use std::time::Duration;
+
+    let state = test_state();
+    let current_epoch = state.global.load().epoch_id;
+    state
+        .global
+        .store_pending(Arc::new(DeltaBuffer::new_with_epoch(
+            state.row_size_bytes,
+            current_epoch.saturating_add(1),
+        )));
+
+    let mut rng = rand::thread_rng();
+    let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+    let key = k0.to_bytes().to_vec();
+    let request = BatchQueryRequest {
+        queries: vec![QueryRequest {
+            keys: vec![key.clone(), key.clone(), key],
+        }],
+    };
+
+    let timer = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    });
+    let handler = tokio::spawn(batch_query_handler(State(state), Json(request)));
+
+    tokio::time::timeout(Duration::from_millis(500), timer)
+        .await
+        .expect("timer task should complete without runtime starvation")
+        .expect("timer task join should succeed");
+
+    let handler_result = tokio::time::timeout(Duration::from_secs(3), handler)
+        .await
+        .expect("batch query handler should complete")
+        .expect("batch query handler task should join");
+    match handler_result {
+        Ok(_) => panic!("mismatched pending epoch should fail after retries"),
+        Err(status) => assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn page_query_handler_spawn_blocking_does_not_starve_runtime_timers() {
+    use morphogen_dpf::page::{
+        generate_page_dpf_keys, PageDpfParams, PAGE_SIZE_BYTES, ROWS_PER_PAGE,
+    };
+    use std::time::Duration;
+
+    let row_size_bytes = 256;
+    let num_rows = ROWS_PER_PAGE * 2;
+    let matrix = Arc::new(ChunkedMatrix::new(
+        row_size_bytes * num_rows,
+        PAGE_SIZE_BYTES,
+    ));
+    let global = Arc::new(GlobalState::new(
+        Arc::new(EpochSnapshot {
+            epoch_id: 42,
+            matrix: Arc::clone(&matrix),
+        }),
+        Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 42)),
+    ));
+    let initial = EpochMetadata {
+        epoch_id: 42,
+        num_rows,
+        seeds: [0x1234, 0x5678, 0x9ABC],
+        block_number: 12345678,
+        state_root: [0xAB; 32],
+    };
+    let (tx, rx) = watch::channel(initial);
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+    );
+
+    let params = PageDpfParams::new(2).expect("page dpf params should be valid");
+    let state = Arc::new(AppState {
+        global: Arc::clone(&global),
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(Mutex::new(())),
+        admin_snapshot_token: Some("test-admin-token".to_string()),
+        admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: Vec::new(),
+        admin_mtls_trust_proxy_headers: false,
+        admin_snapshot_allow_local_paths: true,
+        admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+        admin_snapshot_max_bytes: 16 * 1024 * 1024,
+        row_size_bytes,
+        num_rows,
+        seeds: [0x1234, 0x5678, 0x9ABC],
+        block_number: 12345678,
+        state_root: [0xAB; 32],
+        epoch_rx: rx,
+        page_config: Some(PagePirConfig {
+            domain_bits: params.domain_bits,
+            rows_per_page: ROWS_PER_PAGE,
+            prg_keys: params.prg_keys,
+        }),
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
+    });
+
+    let (k0, _) = generate_page_dpf_keys(&params, 0).expect("key generation should succeed");
+    let key = k0.to_bytes().to_vec();
+    let request = PageQueryRequest {
+        keys: vec![key.clone(), key.clone(), key],
+    };
+
+    let churn_global = Arc::clone(&global);
+    let churn_matrix = Arc::clone(&matrix);
+    let churn_task = tokio::spawn(async move {
+        for i in 0..2_000u64 {
+            churn_global.store(Arc::new(EpochSnapshot {
+                epoch_id: 42 + (i & 1),
+                matrix: Arc::clone(&churn_matrix),
+            }));
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let timer = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    });
+    let handler = tokio::spawn(page_query_handler(State(state), Json(request)));
+
+    tokio::time::timeout(Duration::from_millis(500), timer)
+        .await
+        .expect("timer task should complete without runtime starvation")
+        .expect("timer task join should succeed");
+
+    let handler_result = tokio::time::timeout(Duration::from_secs(3), handler)
+        .await
+        .expect("page query handler should complete")
+        .expect("page query handler task should join");
+    match handler_result {
+        Ok(response) => assert_eq!(response.0.pages.len(), 3),
+        Err(status) => assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE),
+    }
+
+    churn_task
+        .await
+        .expect("epoch churn task should complete cleanly");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ws_single_query_retry_backoff_does_not_starve_runtime_timers() {
+    use morphogen_dpf::AesDpfKey;
+    use std::time::Duration;
+
+    let state = test_state();
+    let current_epoch = state.global.load().epoch_id;
+    state
+        .global
+        .store_pending(Arc::new(DeltaBuffer::new_with_epoch(
+            state.row_size_bytes,
+            current_epoch.saturating_add(1),
+        )));
+
+    let mut rng = rand::thread_rng();
+    let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+    let key = k0.to_bytes().to_vec();
+    let request = QueryRequest {
+        keys: vec![key.clone(), key.clone(), key],
+    };
+
+    let timer = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    });
+    let handler_state = Arc::clone(&state);
+    let handler =
+        tokio::spawn(async move { handle_ws_single_query(&handler_state, request).await });
+
+    tokio::time::timeout(Duration::from_millis(500), timer)
+        .await
+        .expect("timer task should complete without runtime starvation")
+        .expect("timer task join should succeed");
+
+    let response = tokio::time::timeout(Duration::from_secs(3), handler)
+        .await
+        .expect("ws single query handler should complete")
+        .expect("ws single query handler task should join");
+    let body: serde_json::Value =
+        serde_json::from_str(&response).expect("response should be valid JSON");
+    assert_eq!(body["code"], "too_many_retries");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ws_batch_query_retry_backoff_does_not_starve_runtime_timers() {
+    use morphogen_dpf::AesDpfKey;
+    use std::time::Duration;
+
+    let state = test_state();
+    let current_epoch = state.global.load().epoch_id;
+    state
+        .global
+        .store_pending(Arc::new(DeltaBuffer::new_with_epoch(
+            state.row_size_bytes,
+            current_epoch.saturating_add(1),
+        )));
+
+    let mut rng = rand::thread_rng();
+    let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+    let key = k0.to_bytes().to_vec();
+    let request = BatchQueryRequest {
+        queries: vec![QueryRequest {
+            keys: vec![key.clone(), key.clone(), key],
+        }],
+    };
+
+    let timer = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    });
+    let handler_state = Arc::clone(&state);
+    let handler = tokio::spawn(async move { handle_ws_batch_query(&handler_state, request).await });
+
+    tokio::time::timeout(Duration::from_millis(500), timer)
+        .await
+        .expect("timer task should complete without runtime starvation")
+        .expect("timer task join should succeed");
+
+    let response = tokio::time::timeout(Duration::from_secs(3), handler)
+        .await
+        .expect("ws batch query handler should complete")
+        .expect("ws batch query handler task should join");
+    let body: serde_json::Value =
+        serde_json::from_str(&response).expect("response should be valid JSON");
+    assert_eq!(body["code"], "too_many_retries");
+}
+
+#[tokio::test]
+async fn admin_snapshot_rejects_empty_url() {
+    let state = test_state();
+    let request = AdminSnapshotRequest {
+        r2_url: "   ".to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+    let headers = admin_snapshot_headers();
+
+    let result = admin_snapshot_handler(State(state.clone()), headers, Json(request)).await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_snapshot_rejects_missing_token() {
+    let state = test_state();
+    let request = AdminSnapshotRequest {
+        r2_url: "/tmp/snapshot.bin".to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+
+    let result =
+        admin_snapshot_handler(State(state.clone()), HeaderMap::new(), Json(request)).await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_snapshot_rejects_when_no_auth_methods_configured() {
+    let mut config = (*test_state()).clone();
+    config.admin_snapshot_token = None;
+    config.admin_mtls_allowed_subjects = Vec::new();
+    let state = Arc::new(config);
+    let request = AdminSnapshotRequest {
+        r2_url: "/tmp/snapshot.bin".to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+
+    let result =
+        admin_snapshot_handler(State(state), admin_snapshot_bearer_headers(), Json(request)).await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_snapshot_accepts_bearer_token_header() {
+    let row_size_bytes = 4usize;
+    let num_rows = 2usize;
+    let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+    let snapshot = EpochSnapshot {
+        epoch_id: 1,
+        matrix,
+    };
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+    let (tx, rx) = watch::channel(EpochMetadata {
+        epoch_id: 1,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+    });
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+    );
+    let state = Arc::new(AppState {
+        global: global.clone(),
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(Mutex::new(())),
+        admin_snapshot_token: Some("test-admin-token".to_string()),
+        admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: Vec::new(),
+        admin_mtls_trust_proxy_headers: false,
+        admin_snapshot_allow_local_paths: true,
+        admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+        admin_snapshot_max_bytes: 16 * 1024 * 1024,
+        row_size_bytes,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+        epoch_rx: rx,
+        page_config: None,
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
+    });
+
+    let path = unique_temp_path("admin_snapshot_bearer.bin");
+    fs::write(&path, vec![0xABu8; row_size_bytes * num_rows]).expect("write snapshot fixture");
+
+    let request = AdminSnapshotRequest {
+        r2_url: path.to_string_lossy().to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+    let result =
+        admin_snapshot_handler(State(state), admin_snapshot_bearer_headers(), Json(request)).await;
+    let _ = fs::remove_file(&path);
+
+    assert!(result.is_ok(), "bearer auth should be accepted");
+    assert_eq!(result.unwrap(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_snapshot_accepts_lowercase_bearer_scheme() {
+    let row_size_bytes = 4usize;
+    let num_rows = 2usize;
+    let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+    let snapshot = EpochSnapshot {
+        epoch_id: 1,
+        matrix,
+    };
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+    let (tx, rx) = watch::channel(EpochMetadata {
+        epoch_id: 1,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+    });
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+    );
+    let state = Arc::new(AppState {
+        global: global.clone(),
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(Mutex::new(())),
+        admin_snapshot_token: Some("test-admin-token".to_string()),
+        admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: Vec::new(),
+        admin_mtls_trust_proxy_headers: false,
+        admin_snapshot_allow_local_paths: true,
+        admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+        admin_snapshot_max_bytes: 16 * 1024 * 1024,
+        row_size_bytes,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+        epoch_rx: rx,
+        page_config: None,
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
+    });
+
+    let path = unique_temp_path("admin_snapshot_bearer_lowercase.bin");
+    fs::write(&path, vec![0xABu8; row_size_bytes * num_rows]).expect("write snapshot fixture");
+
+    let request = AdminSnapshotRequest {
+        r2_url: path.to_string_lossy().to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_static("bearer test-admin-token"),
+    );
+    let result = admin_snapshot_handler(State(state), headers, Json(request)).await;
+    let _ = fs::remove_file(&path);
+
+    assert!(result.is_ok(), "lowercase bearer auth should be accepted");
+    assert_eq!(result.unwrap(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_snapshot_accepts_legacy_token_when_bearer_is_wrong() {
+    let row_size_bytes = 4usize;
+    let num_rows = 2usize;
+    let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+    let snapshot = EpochSnapshot {
+        epoch_id: 1,
+        matrix,
+    };
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+    let (tx, rx) = watch::channel(EpochMetadata {
+        epoch_id: 1,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+    });
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+    );
+    let state = Arc::new(AppState {
+        global: global.clone(),
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(Mutex::new(())),
+        admin_snapshot_token: Some("test-admin-token".to_string()),
+        admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: Vec::new(),
+        admin_mtls_trust_proxy_headers: false,
+        admin_snapshot_allow_local_paths: true,
+        admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+        admin_snapshot_max_bytes: 16 * 1024 * 1024,
+        row_size_bytes,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+        epoch_rx: rx,
+        page_config: None,
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
+    });
+
+    let path = unique_temp_path("admin_snapshot_mixed_auth_headers.bin");
+    fs::write(&path, vec![0xABu8; row_size_bytes * num_rows]).expect("write snapshot fixture");
+
+    let request = AdminSnapshotRequest {
+        r2_url: path.to_string_lossy().to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer wrong-token"),
+    );
+    headers.insert(
+        ADMIN_SNAPSHOT_TOKEN_HEADER,
+        HeaderValue::from_static("test-admin-token"),
+    );
+    let result = admin_snapshot_handler(State(state), headers, Json(request)).await;
+    let _ = fs::remove_file(&path);
+
+    assert!(
+        result.is_ok(),
+        "legacy token should still authorize when bearer token is wrong"
+    );
+    assert_eq!(result.unwrap(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_snapshot_accepts_mtls_subject_header() {
+    let row_size_bytes = 4usize;
+    let num_rows = 2usize;
+    let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+    let snapshot = EpochSnapshot {
+        epoch_id: 1,
+        matrix,
+    };
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+    let (tx, rx) = watch::channel(EpochMetadata {
+        epoch_id: 1,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+    });
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+    );
+    let state = Arc::new(AppState {
+        global: global.clone(),
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(Mutex::new(())),
+        admin_snapshot_token: None,
+        admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: vec!["spiffe://morphogenesis/control-plane".to_string()],
+        admin_mtls_trust_proxy_headers: true,
+        admin_snapshot_allow_local_paths: true,
+        admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+        admin_snapshot_max_bytes: 16 * 1024 * 1024,
+        row_size_bytes,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+        epoch_rx: rx,
+        page_config: None,
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
+    });
+
+    let path = unique_temp_path("admin_snapshot_mtls.bin");
+    fs::write(&path, vec![0xAAu8; row_size_bytes * num_rows]).expect("write snapshot fixture");
+
+    let request = AdminSnapshotRequest {
+        r2_url: path.to_string_lossy().to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+    let result =
+        admin_snapshot_handler(State(state), admin_snapshot_mtls_headers(), Json(request)).await;
+    let _ = fs::remove_file(&path);
+
+    assert!(result.is_ok(), "mTLS subject should be accepted");
+    assert_eq!(result.unwrap(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_snapshot_accepts_custom_mtls_subject_header() {
+    let row_size_bytes = 4usize;
+    let num_rows = 2usize;
+    let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+    let snapshot = EpochSnapshot {
+        epoch_id: 1,
+        matrix,
+    };
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+    let (tx, rx) = watch::channel(EpochMetadata {
+        epoch_id: 1,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+    });
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+    );
+    let state = Arc::new(AppState {
+        global: global.clone(),
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(Mutex::new(())),
+        admin_snapshot_token: None,
+        admin_mtls_subject_header: HeaderName::from_static("x-client-subject"),
+        admin_mtls_allowed_subjects: vec!["spiffe://morphogenesis/control-plane".to_string()],
+        admin_mtls_trust_proxy_headers: true,
+        admin_snapshot_allow_local_paths: true,
+        admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+        admin_snapshot_max_bytes: 16 * 1024 * 1024,
+        row_size_bytes,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+        epoch_rx: rx,
+        page_config: None,
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
+    });
+
+    let path = unique_temp_path("admin_snapshot_custom_mtls_header.bin");
+    fs::write(&path, vec![0xAAu8; row_size_bytes * num_rows]).expect("write snapshot fixture");
+
+    let request = AdminSnapshotRequest {
+        r2_url: path.to_string_lossy().to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-client-subject",
+        HeaderValue::from_static("spiffe://morphogenesis/control-plane"),
+    );
+    let result = admin_snapshot_handler(State(state), headers, Json(request)).await;
+    let _ = fs::remove_file(&path);
+
+    assert!(result.is_ok(), "custom mTLS header should be accepted");
+    assert_eq!(result.unwrap(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn admin_snapshot_rejects_mtls_subject_when_trust_proxy_headers_disabled() {
+    let row_size_bytes = 4usize;
+    let num_rows = 2usize;
+    let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+    let snapshot = EpochSnapshot {
+        epoch_id: 1,
+        matrix,
+    };
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+    let (tx, rx) = watch::channel(EpochMetadata {
+        epoch_id: 1,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+    });
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+    );
+    let state = Arc::new(AppState {
+        global: global.clone(),
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(Mutex::new(())),
+        admin_snapshot_token: None,
+        admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: vec!["spiffe://morphogenesis/control-plane".to_string()],
+        admin_mtls_trust_proxy_headers: false,
+        admin_snapshot_allow_local_paths: true,
+        admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+        admin_snapshot_max_bytes: 16 * 1024 * 1024,
+        row_size_bytes,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+        epoch_rx: rx,
+        page_config: None,
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
+    });
+
+    let request = AdminSnapshotRequest {
+        r2_url: "/tmp/snapshot.bin".to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-mtls-subject",
+        HeaderValue::from_static("spiffe://morphogenesis/control-plane"),
+    );
+    let result = admin_snapshot_handler(State(state), headers, Json(request)).await;
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_snapshot_rejects_mtls_subject_not_allowlisted() {
+    let row_size_bytes = 4usize;
+    let num_rows = 2usize;
+    let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * num_rows, 8));
+    let snapshot = EpochSnapshot {
+        epoch_id: 1,
+        matrix,
+    };
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 1));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+    let (tx, rx) = watch::channel(EpochMetadata {
+        epoch_id: 1,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+    });
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+    );
+    let state = Arc::new(AppState {
+        global: global.clone(),
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(Mutex::new(())),
+        admin_snapshot_token: None,
+        admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: vec!["spiffe://morphogenesis/control-plane".to_string()],
+        admin_mtls_trust_proxy_headers: true,
+        admin_snapshot_allow_local_paths: true,
+        admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+        admin_snapshot_max_bytes: 16 * 1024 * 1024,
+        row_size_bytes,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+        epoch_rx: rx,
+        page_config: None,
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
+    });
+
+    let request = AdminSnapshotRequest {
+        r2_url: "/tmp/snapshot.bin".to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-mtls-subject",
+        HeaderValue::from_static("spiffe://morphogenesis/untrusted"),
+    );
+    let result = admin_snapshot_handler(State(state), headers, Json(request)).await;
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn admin_snapshot_rejects_local_path_when_disabled() {
+    let mut config = (*test_state()).clone();
+    config.admin_snapshot_allow_local_paths = false;
+    let state = Arc::new(config);
+    let request = AdminSnapshotRequest {
+        r2_url: "/tmp/snapshot.bin".to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+
+    let result =
+        admin_snapshot_handler(State(state), admin_snapshot_headers(), Json(request)).await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_snapshot_rejects_http_host_not_allowlisted() {
+    let request = AdminSnapshotRequest {
+        r2_url: "https://not-allowed.invalid/snapshot.bin".to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+
+    let result =
+        admin_snapshot_handler(State(test_state()), admin_snapshot_headers(), Json(request)).await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn admin_snapshot_ingests_local_matrix_and_rotates_epoch() {
+    let row_size_bytes = 4usize;
+    let num_rows = 8usize;
+    let matrix_size = row_size_bytes * num_rows;
+
+    let matrix = Arc::new(ChunkedMatrix::new(matrix_size, 8));
+    let snapshot = EpochSnapshot {
+        epoch_id: 7,
+        matrix,
+    };
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 7));
+    pending
+        .push(0, vec![0xAA, 0xBB, 0xCC, 0xDD])
+        .expect("seed pending delta");
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+
+    let initial = EpochMetadata {
+        epoch_id: 7,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 10,
+        state_root: [0x11; 32],
+    };
+    let (tx, rx) = watch::channel(initial);
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+    );
+    let state = Arc::new(AppState {
+        global: global.clone(),
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(Mutex::new(())),
+        admin_snapshot_token: Some("test-admin-token".to_string()),
+        admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: Vec::new(),
+        admin_mtls_trust_proxy_headers: false,
+        admin_snapshot_allow_local_paths: true,
+        admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+        admin_snapshot_max_bytes: 16 * 1024 * 1024,
+        row_size_bytes,
+        num_rows,
+        seeds: [1, 2, 3],
+        block_number: 10,
+        state_root: [0x11; 32],
+        epoch_rx: rx,
+        page_config: None,
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
+    });
+
+    let path = unique_temp_path("admin_snapshot.bin");
+    let expected = vec![0x5Au8; matrix_size];
+    fs::write(&path, &expected).expect("write snapshot fixture");
+
+    let request = AdminSnapshotRequest {
+        r2_url: path.to_string_lossy().to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+    let result = admin_snapshot_handler(
+        State(state.clone()),
+        admin_snapshot_headers(),
+        Json(request),
+    )
+    .await;
+
+    let _ = fs::remove_file(&path);
+
+    assert!(
+        result.is_ok(),
+        "snapshot ingestion should succeed: {result:?}"
+    );
+    assert_eq!(result.unwrap(), StatusCode::OK);
+    assert_eq!(state.global.load().epoch_id, 8);
+    let metadata = state.epoch_rx.borrow().clone();
+    assert_eq!(metadata.epoch_id, 8);
+    assert_eq!(metadata.num_rows, num_rows);
+    assert!(
+        state
+            .global
+            .load_pending()
+            .is_empty()
+            .expect("pending buffer readable"),
+        "rotation should clear pending deltas"
+    );
+}
+
+#[tokio::test]
+async fn admin_snapshot_rejects_misaligned_matrix_size() {
+    let state = test_state();
+    let epoch_before = state.global.load().epoch_id;
+    let pending_before = state
+        .global
+        .load_pending()
+        .snapshot()
+        .expect("pending snapshot");
+    let path = unique_temp_path("admin_snapshot_misaligned.bin");
+    fs::write(&path, [0u8; 3]).expect("write misaligned snapshot fixture");
+
+    let request = AdminSnapshotRequest {
+        r2_url: path.to_string_lossy().to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+
+    let result = admin_snapshot_handler(
+        State(state.clone()),
+        admin_snapshot_headers(),
+        Json(request),
+    )
+    .await;
+    let _ = fs::remove_file(&path);
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    assert_eq!(state.global.load().epoch_id, epoch_before);
+    assert_eq!(
+        state
+            .global
+            .load_pending()
+            .snapshot()
+            .expect("pending snapshot"),
+        pending_before
+    );
+}
+
+#[tokio::test]
+async fn admin_snapshot_rejects_page_pir_incompatible_row_capacity() {
+    let row_size_bytes = 256usize;
+    let initial_rows = 8usize;
+    let matrix = Arc::new(ChunkedMatrix::new(row_size_bytes * initial_rows, 4096));
+    let snapshot = EpochSnapshot {
+        epoch_id: 5,
+        matrix,
+    };
+    let pending = Arc::new(DeltaBuffer::new_with_epoch(row_size_bytes, 5));
+    let global = Arc::new(GlobalState::new(Arc::new(snapshot), pending));
+    let (tx, rx) = watch::channel(EpochMetadata {
+        epoch_id: 5,
+        num_rows: initial_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+    });
+    let epoch_manager = Arc::new(
+        EpochManager::new(global.clone(), row_size_bytes).expect("epoch manager should init"),
+    );
+    let state = Arc::new(AppState {
+        global: global.clone(),
+        epoch_manager,
+        epoch_tx: tx,
+        snapshot_rotation_lock: Arc::new(Mutex::new(())),
+        admin_snapshot_token: Some("test-admin-token".to_string()),
+        admin_mtls_subject_header: HeaderName::from_static("x-mtls-subject"),
+        admin_mtls_allowed_subjects: Vec::new(),
+        admin_mtls_trust_proxy_headers: false,
+        admin_snapshot_allow_local_paths: true,
+        admin_snapshot_allowed_hosts: vec!["example.com".to_string()],
+        admin_snapshot_max_bytes: 16 * 1024 * 1024,
+        row_size_bytes,
+        num_rows: initial_rows,
+        seeds: [1, 2, 3],
+        block_number: 1,
+        state_root: [0; 32],
+        epoch_rx: rx,
+        page_config: Some(PagePirConfig {
+            domain_bits: 2,   // 4 pages
+            rows_per_page: 2, // max_rows = 8
+            prg_keys: [[0x11; 16], [0x22; 16]],
+        }),
+        #[cfg(feature = "cuda")]
+        gpu_scanner: None,
+        #[cfg(feature = "cuda")]
+        gpu_matrix: None,
+    });
+
+    let epoch_before = state.global.load().epoch_id;
+    let path = unique_temp_path("admin_snapshot_page_capacity.bin");
+    // 4096 bytes -> 16 rows at 256 bytes/row, exceeding max_rows=8.
+    fs::write(&path, vec![0xCDu8; 4096]).expect("write snapshot fixture");
+
+    let request = AdminSnapshotRequest {
+        r2_url: path.to_string_lossy().to_string(),
+        seeds: None,
+        block_number: None,
+        state_root: None,
+    };
+    let result = admin_snapshot_handler(
+        State(state.clone()),
+        admin_snapshot_headers(),
+        Json(request),
+    )
+    .await;
+    let _ = fs::remove_file(&path);
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+    assert_eq!(state.global.load().epoch_id, epoch_before);
+}
+
+#[tokio::test]
+async fn fetch_snapshot_bytes_rejects_http_redirects() {
+    use std::future::IntoFuture;
+
+    let app = Router::new().route(
+        "/redirect",
+        get(|| async {
+            axum::http::Response::builder()
+                .status(StatusCode::FOUND)
+                .header(
+                    axum::http::header::LOCATION,
+                    "https://example.com/snapshot.bin",
+                )
+                .body(axum::body::Body::empty())
+                .expect("build redirect response")
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(axum::serve(listener, app).into_future());
+
+    let url = reqwest::Url::parse(&format!("http://{addr}/redirect")).expect("url");
+    let result = fetch_snapshot_bytes(SnapshotSource::Http(url), 1024).await;
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn fetch_snapshot_bytes_rejects_oversize_chunked_http_body() {
+    use futures_util::stream;
+    use std::convert::Infallible;
+    use std::future::IntoFuture;
+
+    let app = Router::new().route(
+        "/stream",
+        get(|| async {
+            let chunks = vec![
+                Ok::<axum::body::Bytes, Infallible>(axum::body::Bytes::from(vec![0u8; 8])),
+                Ok::<axum::body::Bytes, Infallible>(axum::body::Bytes::from(vec![0u8; 8])),
+            ];
+            axum::body::Body::from_stream(stream::iter(chunks))
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind listener");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(axum::serve(listener, app).into_future());
+
+    let url = reqwest::Url::parse(&format!("http://{addr}/stream")).expect("url");
+    let result = fetch_snapshot_bytes(SnapshotSource::Http(url), 10).await;
+
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn batch_query_too_large_returns_bad_request() {
+    let state = test_state();
+    let queries: Vec<QueryRequest> = (0..MAX_BATCH_SIZE + 1)
+        .map(|_| QueryRequest {
+            keys: vec![vec![0u8; 25], vec![0u8; 25], vec![0u8; 25]],
+        })
+        .collect();
+    let request = BatchQueryRequest { queries };
+    let result = batch_query_handler(State(state), Json(request)).await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn batch_query_wrong_key_count_returns_bad_request() {
+    let state = test_state();
+    let request = BatchQueryRequest {
+        queries: vec![QueryRequest {
+            keys: vec![vec![0u8; 25], vec![0u8; 25]], // only 2 keys
+        }],
+    };
+    let result = batch_query_handler(State(state), Json(request)).await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::BAD_REQUEST);
+}
+
+fn unique_temp_path(name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{}_{}", nanos, name))
+}
+
+fn admin_snapshot_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ADMIN_SNAPSHOT_TOKEN_HEADER,
+        HeaderValue::from_static("test-admin-token"),
+    );
+    headers
+}
+
+fn admin_snapshot_bearer_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer test-admin-token"),
+    );
+    headers
+}
+
+fn admin_snapshot_mtls_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-mtls-subject",
+        HeaderValue::from_static("spiffe://morphogenesis/control-plane"),
+    );
+    headers
+}
+
+#[tokio::test]
+async fn batch_query_of_one_returns_single_result() {
+    use morphogen_dpf::AesDpfKey;
+
+    let state = test_state();
+    let mut rng = rand::thread_rng();
+    let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+    let (k1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+    let (k2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+
+    let request = BatchQueryRequest {
+        queries: vec![QueryRequest {
+            keys: vec![
+                k0.to_bytes().to_vec(),
+                k1.to_bytes().to_vec(),
+                k2.to_bytes().to_vec(),
+            ],
+        }],
+    };
+    let result = batch_query_handler(State(state), Json(request)).await;
+    assert!(result.is_ok());
+    let response = result.unwrap().0;
+    assert_eq!(response.results.len(), 1);
+    assert_eq!(response.results[0].payloads.len(), 3);
+}
+
+#[tokio::test]
+async fn batch_query_of_three_returns_three_results() {
+    use morphogen_dpf::AesDpfKey;
+
+    let state = test_state();
+    let mut rng = rand::thread_rng();
+
+    let mut queries = Vec::new();
+    for target in [0, 1, 2] {
+        let (k0, _) = AesDpfKey::generate_pair(&mut rng, target);
+        let (k1, _) = AesDpfKey::generate_pair(&mut rng, target + 1);
+        let (k2, _) = AesDpfKey::generate_pair(&mut rng, target + 2);
+        queries.push(QueryRequest {
+            keys: vec![
+                k0.to_bytes().to_vec(),
+                k1.to_bytes().to_vec(),
+                k2.to_bytes().to_vec(),
+            ],
+        });
+    }
+
+    let request = BatchQueryRequest { queries };
+    let result = batch_query_handler(State(state), Json(request)).await;
+    assert!(result.is_ok());
+    let response = result.unwrap().0;
+    assert_eq!(response.results.len(), 3);
+    assert_eq!(response.epoch_id, 42);
+    for r in &response.results {
+        assert_eq!(r.payloads.len(), 3);
+    }
+}
+
+#[test]
+fn batch_snapshot_scan_applies_pending_delta_for_all_queries() {
+    use morphogen_dpf::AesDpfKey;
+
+    let state = test_state();
+    state
+        .global
+        .load_pending()
+        .push(0, vec![0xAB; state.row_size_bytes])
+        .expect("delta insert should succeed");
+
+    let mut rng = rand::thread_rng();
+    let mut all_keys: Vec<[AesDpfKey; 3]> = Vec::new();
+    for target in [0, 1, 2, 3] {
+        let (k0, _) = AesDpfKey::generate_pair(&mut rng, target);
+        let (k1, _) = AesDpfKey::generate_pair(&mut rng, target + 1);
+        let (k2, _) = AesDpfKey::generate_pair(&mut rng, target + 2);
+        all_keys.push([k0, k1, k2]);
+    }
+
+    let snapshot = state.global.load();
+    let (pending_epoch, entries) = state
+        .global
+        .load_pending()
+        .snapshot_with_epoch()
+        .expect("snapshot should succeed");
+    assert_eq!(pending_epoch, snapshot.epoch_id);
+
+    let batch_results = scan_batch_results_from_snapshot(
+        snapshot.matrix.as_ref(),
+        &all_keys,
+        &entries,
+        state.row_size_bytes,
+    )
+    .expect("batch path should succeed");
+
+    let mut expected_payloads = Vec::with_capacity(all_keys.len());
+    for keys in &all_keys {
+        let mut payloads =
+            crate::scan::scan_main_matrix(snapshot.matrix.as_ref(), keys, state.row_size_bytes);
+        apply_delta_entries_to_payloads(&mut payloads, keys, &entries)
+            .expect("delta application should succeed");
+        expected_payloads.push(payloads.to_vec());
+    }
+
+    let actual_payloads: Vec<Vec<Vec<u8>>> =
+        batch_results.into_iter().map(|r| r.payloads).collect();
+    assert_eq!(actual_payloads, expected_payloads);
+}
+
+#[tokio::test]
+async fn batch_query_consistency_fallback_returns_service_unavailable_on_persistent_mismatch() {
+    use morphogen_dpf::AesDpfKey;
+
+    let state = test_state();
+    state
+        .global
+        .load_pending()
+        .drain_for_epoch(43)
+        .expect("force pending epoch mismatch");
+
+    let mut rng = rand::thread_rng();
+    let (k0, _) = AesDpfKey::generate_pair(&mut rng, 0);
+    let (k1, _) = AesDpfKey::generate_pair(&mut rng, 1);
+    let (k2, _) = AesDpfKey::generate_pair(&mut rng, 2);
+    let request = BatchQueryRequest {
+        queries: vec![QueryRequest {
+            keys: vec![
+                k0.to_bytes().to_vec(),
+                k1.to_bytes().to_vec(),
+                k2.to_bytes().to_vec(),
+            ],
+        }],
+    };
+
+    let result = batch_query_handler(State(state), Json(request)).await;
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[test]
+fn gpu_micro_batch_ranges_caps_each_batch_to_two() {
+    assert_eq!(gpu_micro_batch_ranges(1), vec![(0, 1)]);
+    assert_eq!(gpu_micro_batch_ranges(2), vec![(0, 2)]);
+    assert_eq!(gpu_micro_batch_ranges(3), vec![(0, 2), (2, 3)]);
+    assert_eq!(gpu_micro_batch_ranges(4), vec![(0, 2), (2, 4)]);
+    assert_eq!(gpu_micro_batch_ranges(5), vec![(0, 2), (2, 4), (4, 5)]);
+}
+
+#[test]
+fn gpu_micro_batch_ranges_preserves_order_and_full_coverage() {
+    let ranges = gpu_micro_batch_ranges(7);
+    let mut covered = Vec::new();
+    for (start, end) in ranges {
+        assert!(end > start);
+        assert!(end - start <= 2);
+        covered.extend(start..end);
+    }
+    assert_eq!(covered, (0..7).collect::<Vec<_>>());
+}
+
+#[test]
+fn parse_gpu_stream_count_supports_required_values() {
+    assert_eq!(parse_gpu_stream_count(Some("1")), 1);
+    assert_eq!(parse_gpu_stream_count(Some("2")), 2);
+    assert_eq!(parse_gpu_stream_count(Some("4")), 4);
+    assert_eq!(parse_gpu_stream_count(Some("8")), 8);
+}
+
+#[test]
+fn parse_gpu_stream_count_defaults_and_clamps() {
+    assert_eq!(parse_gpu_stream_count(None), 1);
+    assert_eq!(parse_gpu_stream_count(Some("0")), 1);
+    assert_eq!(parse_gpu_stream_count(Some("999")), 8);
+    assert_eq!(parse_gpu_stream_count(Some("bad")), 1);
+}
+
+#[test]
+fn parse_gpu_cuda_graph_enabled_defaults_and_supports_expected_values() {
+    assert!(!parse_gpu_cuda_graph_enabled(None));
+    assert!(!parse_gpu_cuda_graph_enabled(Some("0")));
+    assert!(!parse_gpu_cuda_graph_enabled(Some("false")));
+    assert!(parse_gpu_cuda_graph_enabled(Some("1")));
+    assert!(parse_gpu_cuda_graph_enabled(Some("true")));
+    assert!(parse_gpu_cuda_graph_enabled(Some("yes")));
+    assert!(parse_gpu_cuda_graph_enabled(Some("on")));
+    assert!(!parse_gpu_cuda_graph_enabled(Some("bad")));
+}
+
+#[test]
+fn parse_gpu_batch_policy_defaults_and_supports_expected_values() {
+    assert_eq!(parse_gpu_batch_policy(None), GpuBatchPolicy::Adaptive);
+    assert_eq!(
+        parse_gpu_batch_policy(Some("adaptive")),
+        GpuBatchPolicy::Adaptive
+    );
+    assert_eq!(
+        parse_gpu_batch_policy(Some("throughput")),
+        GpuBatchPolicy::Throughput
+    );
+    assert_eq!(
+        parse_gpu_batch_policy(Some("latency")),
+        GpuBatchPolicy::Latency
+    );
+    assert_eq!(
+        parse_gpu_batch_policy(Some("bad")),
+        GpuBatchPolicy::Adaptive
+    );
+}
+
+#[test]
+fn parse_gpu_batch_adaptive_threshold_defaults_and_clamps() {
+    assert_eq!(parse_gpu_batch_adaptive_threshold(None), 4);
+    assert_eq!(parse_gpu_batch_adaptive_threshold(Some("0")), 1);
+    assert_eq!(
+        parse_gpu_batch_adaptive_threshold(Some("999")),
+        MAX_BATCH_SIZE
+    );
+    assert_eq!(parse_gpu_batch_adaptive_threshold(Some("bad")), 4);
+}
+
+#[test]
+fn parse_gpu_batch_tile_size_defaults_and_clamps() {
+    assert_eq!(parse_gpu_batch_tile_size(None), 16);
+    assert_eq!(parse_gpu_batch_tile_size(Some("0")), 1);
+    assert_eq!(parse_gpu_batch_tile_size(Some("4")), 4);
+    assert_eq!(parse_gpu_batch_tile_size(Some("999")), 16);
+    assert_eq!(parse_gpu_batch_tile_size(Some("bad")), 16);
+}
+
+#[test]
+fn choose_gpu_batch_dispatch_prefers_multistream_when_enabled() {
+    let cfg = GpuBatchPolicyConfig {
+        policy: GpuBatchPolicy::Latency,
+        adaptive_threshold: 8,
+    };
+    let dispatch = choose_gpu_batch_dispatch(3, 4, cfg);
+    assert_eq!(dispatch, GpuBatchDispatch::MultiStream { stream_count: 4 });
+}
+
+#[test]
+fn choose_gpu_batch_dispatch_uses_adaptive_threshold() {
+    let cfg = GpuBatchPolicyConfig {
+        policy: GpuBatchPolicy::Adaptive,
+        adaptive_threshold: 4,
+    };
+    assert_eq!(
+        choose_gpu_batch_dispatch(3, 1, cfg),
+        GpuBatchDispatch::FullBatch
+    );
+    assert_eq!(
+        choose_gpu_batch_dispatch(5, 1, cfg),
+        GpuBatchDispatch::MicroBatch2
+    );
+}
+
+#[test]
+fn gpu_batch_dispatch_mode_label_matches_variants() {
+    assert_eq!(
+        GpuBatchDispatch::MultiStream { stream_count: 2 }.mode_label(),
+        "multistream"
+    );
+    assert_eq!(GpuBatchDispatch::FullBatch.mode_label(), "full_batch");
+    assert_eq!(GpuBatchDispatch::MicroBatch2.mode_label(), "micro_batch2");
+}
+
+#[test]
+fn ensure_gpu_result_count_accepts_matching_lengths() {
+    assert!(ensure_gpu_result_count(4, 4).is_ok());
+}
+
+#[test]
+fn ensure_gpu_result_count_rejects_mismatched_lengths() {
+    assert_eq!(
+        ensure_gpu_result_count(4, 3),
+        Err(StatusCode::INTERNAL_SERVER_ERROR)
+    );
+}
+
+#[test]
+fn gpu_timing_totals_scale_with_query_count() {
+    let timing = morphogen_gpu_dpf::kernel::KernelTiming {
+        h2d_ns: 7,
+        kernel_ns: 11,
+        d2h_ns: 13,
+        total_ns: 31,
+        ..Default::default()
+    };
+
+    let totals = gpu_timing_totals_for_request(&timing, 4);
+    assert_eq!(totals.h2d_ns, 28);
+    assert_eq!(totals.kernel_ns, 44);
+    assert_eq!(totals.d2h_ns, 52);
+}
+
+#[test]
+fn gpu_timing_totals_treat_zero_queries_as_one() {
+    let timing = morphogen_gpu_dpf::kernel::KernelTiming {
+        h2d_ns: 5,
+        kernel_ns: 6,
+        d2h_ns: 7,
+        total_ns: 18,
+        ..Default::default()
+    };
+
+    let totals = gpu_timing_totals_for_request(&timing, 0);
+    assert_eq!(totals.h2d_ns, 5);
+    assert_eq!(totals.kernel_ns, 6);
+    assert_eq!(totals.d2h_ns, 7);
+}
+
+#[test]
+fn with_gpu_matrix_ref_holds_lock_for_scan_then_releases_it() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    let matrix_mutex = Arc::new(Mutex::new(Some(41usize)));
+    let saw_lock_held = Arc::new(AtomicBool::new(false));
+    let matrix_for_scan = Arc::clone(&matrix_mutex);
+    let saw_lock_held_for_scan = Arc::clone(&saw_lock_held);
+
+    let result = with_gpu_matrix_ref(matrix_mutex.as_ref(), move |value| {
+        assert_eq!(*value, 41);
+        assert!(matrix_for_scan.try_lock().is_err());
+        saw_lock_held_for_scan.store(true, Ordering::Relaxed);
+        Ok::<usize, StatusCode>(value + 1)
+    });
+
+    assert_eq!(result, Ok(Some(42)));
+    assert!(saw_lock_held.load(Ordering::Relaxed));
+    assert!(matrix_mutex.try_lock().is_ok());
+}
+
+fn test_gpu_keys(count: usize) -> Vec<[morphogen_gpu_dpf::dpf::ChaChaKey; 3]> {
+    use morphogen_gpu_dpf::dpf::{generate_chacha_dpf_keys, ChaChaParams};
+
+    let params = ChaChaParams::new(8).expect("valid params");
+    let mut keys = Vec::with_capacity(count);
+    for i in 0..count {
+        let (k0, _) = generate_chacha_dpf_keys(&params, i).expect("key generation should work");
+        keys.push([k0.clone(), k0.clone(), k0]);
+    }
+    keys
+}
+
+fn test_pir_result() -> morphogen_gpu_dpf::kernel::PirResult {
+    morphogen_gpu_dpf::kernel::PirResult {
+        page0: Vec::new(),
+        page1: Vec::new(),
+        page2: Vec::new(),
+        verif0: Vec::new(),
+        verif1: Vec::new(),
+        verif2: Vec::new(),
+        timing: morphogen_gpu_dpf::kernel::KernelTiming::default(),
+    }
+}
+
+fn test_pir_result_with_marker(marker: u8) -> morphogen_gpu_dpf::kernel::PirResult {
+    morphogen_gpu_dpf::kernel::PirResult {
+        page0: vec![marker],
+        page1: vec![marker.wrapping_add(1)],
+        page2: vec![marker.wrapping_add(2)],
+        verif0: Vec::new(),
+        verif1: Vec::new(),
+        verif2: Vec::new(),
+        timing: morphogen_gpu_dpf::kernel::KernelTiming::default(),
+    }
+}
+
+fn test_gpu_batch_request(count: usize) -> BatchGpuPageQueryRequest {
+    let all_keys = test_gpu_keys(count);
+    let queries = all_keys
+        .iter()
+        .map(|keys| GpuPageQueryRequest {
+            keys: vec![
+                keys[0].to_bytes().to_vec(),
+                keys[1].to_bytes().to_vec(),
+                keys[2].to_bytes().to_vec(),
+            ],
+        })
+        .collect();
+    BatchGpuPageQueryRequest { queries }
+}
+
+struct TestGpuHookResetGuard;
+
+impl Drop for TestGpuHookResetGuard {
+    fn drop(&mut self) {
+        TEST_GPU_BATCH_HOOKS.with(|slot| {
+            slot.replace(None);
+        });
+    }
+}
+
+async fn with_test_gpu_batch_hooks<F, Fut, R>(hooks: TestGpuBatchHooks, f: F) -> R
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = R>,
+{
+    TEST_GPU_BATCH_HOOKS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none(), "nested test hooks are not supported");
+        *slot = Some(hooks);
+    });
+    let _guard = TestGpuHookResetGuard;
+    f().await
+}
+
+#[test]
+fn run_gpu_scan_branches_with_multistream_rejects_mismatched_lengths() {
+    let all_keys = test_gpu_keys(2);
+    let result = run_gpu_scan_branches_with(
+        &all_keys,
+        GpuBatchDispatch::MultiStream { stream_count: 4 },
+        |_keys, _stream_count| Ok(vec![test_pir_result()]),
+        |_keys| unreachable!("full batch path should not run"),
+        |_key_batch| unreachable!("micro-batch path should not run"),
+    );
+
+    assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+}
+
+#[test]
+fn run_gpu_scan_branches_with_multistream_collects_full_result_set() {
+    let all_keys = test_gpu_keys(3);
+    let result = run_gpu_scan_branches_with(
+        &all_keys,
+        GpuBatchDispatch::MultiStream { stream_count: 4 },
+        |keys, _stream_count| Ok(vec![test_pir_result(); keys.len()]),
+        |_keys| unreachable!("full batch path should not run"),
+        |_key_batch| unreachable!("micro-batch path should not run"),
+    )
+    .expect("multistream path should preserve result count");
+
+    assert_eq!(result.len(), all_keys.len());
+}
+
+#[test]
+fn run_gpu_scan_branches_with_micro_batch_rejects_mismatched_chunk_lengths() {
+    let all_keys = test_gpu_keys(3);
+    let result = run_gpu_scan_branches_with(
+        &all_keys,
+        GpuBatchDispatch::MicroBatch2,
+        |_keys, _stream_count| unreachable!("multistream path should not run"),
+        |_keys| unreachable!("full batch path should not run"),
+        |_key_batch| Ok(vec![test_pir_result()]),
+    );
+
+    assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+}
+
+#[test]
+fn run_gpu_scan_branches_with_micro_batch_collects_full_result_set() {
+    let all_keys = test_gpu_keys(3);
+    let result = run_gpu_scan_branches_with(
+        &all_keys,
+        GpuBatchDispatch::MicroBatch2,
+        |_keys, _stream_count| unreachable!("multistream path should not run"),
+        |_keys| unreachable!("full batch path should not run"),
+        |key_batch| Ok(vec![test_pir_result(); key_batch.len()]),
+    )
+    .expect("micro-batch path should preserve result count");
+
+    assert_eq!(result.len(), all_keys.len());
+}
+
+#[test]
+fn run_gpu_scan_branches_with_full_batch_collects_full_result_set() {
+    let all_keys = test_gpu_keys(5);
+    let result = run_gpu_scan_branches_with(
+        &all_keys,
+        GpuBatchDispatch::FullBatch,
+        |_keys, _stream_count| unreachable!("multistream path should not run"),
+        |keys| Ok(vec![test_pir_result(); keys.len()]),
+        |_key_batch| unreachable!("micro-batch path should not run"),
+    )
+    .expect("full-batch path should preserve result count");
+
+    assert_eq!(result.len(), all_keys.len());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn page_query_gpu_batch_handler_returns_internal_error_on_multistream_mismatch() {
+    let state = test_state();
+    let request = test_gpu_batch_request(2);
+    let hooks = TestGpuBatchHooks {
+        dispatch: GpuBatchDispatch::MultiStream { stream_count: 4 },
+        multistream_scan: std::sync::Arc::new(|_keys, _stream_count| Ok(vec![test_pir_result()])),
+        full_batch_scan: std::sync::Arc::new(|_keys| {
+            unreachable!("full batch path should not run")
+        }),
+        micro_batch_scan: std::sync::Arc::new(|_key_batch| {
+            unreachable!("micro-batch path should not run")
+        }),
+    };
+
+    let result = with_test_gpu_batch_hooks(hooks, move || {
+        page_query_gpu_batch_handler(State(state), Json(request))
+    })
+    .await;
+
+    assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn page_query_gpu_batch_handler_returns_internal_error_on_micro_batch_mismatch() {
+    let state = test_state();
+    let request = test_gpu_batch_request(3);
+    let hooks = TestGpuBatchHooks {
+        dispatch: GpuBatchDispatch::MicroBatch2,
+        multistream_scan: std::sync::Arc::new(|_keys, _stream_count| {
+            unreachable!("multistream path should not run")
+        }),
+        full_batch_scan: std::sync::Arc::new(|_keys| {
+            unreachable!("full batch path should not run")
+        }),
+        micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(vec![test_pir_result()])),
+    };
+
+    let result = with_test_gpu_batch_hooks(hooks, move || {
+        page_query_gpu_batch_handler(State(state), Json(request))
+    })
+    .await;
+
+    assert!(matches!(result, Err(StatusCode::INTERNAL_SERVER_ERROR)));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn page_query_gpu_batch_handler_maps_test_hook_results_in_order() {
+    let state = test_state();
+    let request = test_gpu_batch_request(2);
+    let hooks = TestGpuBatchHooks {
+        dispatch: GpuBatchDispatch::MultiStream { stream_count: 4 },
+        multistream_scan: std::sync::Arc::new(|keys, _stream_count| {
+            Ok(keys
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| test_pir_result_with_marker((idx as u8) * 10))
+                .collect())
+        }),
+        full_batch_scan: std::sync::Arc::new(|_keys| {
+            unreachable!("full batch path should not run")
+        }),
+        micro_batch_scan: std::sync::Arc::new(|_key_batch| {
+            unreachable!("micro-batch path should not run")
+        }),
+    };
+
+    let response = with_test_gpu_batch_hooks(hooks, move || {
+        page_query_gpu_batch_handler(State(state), Json(request))
+    })
+    .await
+    .expect("test hook success path should return response")
+    .0;
+
+    assert_eq!(response.results.len(), 2);
+    assert_eq!(response.results[0].pages[0], vec![0u8]);
+    assert_eq!(response.results[0].pages[1], vec![1u8]);
+    assert_eq!(response.results[0].pages[2], vec![2u8]);
+    assert_eq!(response.results[1].pages[0], vec![10u8]);
+    assert_eq!(response.results[1].pages[1], vec![11u8]);
+    assert_eq!(response.results[1].pages[2], vec![12u8]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn with_test_gpu_batch_hooks_clears_state_after_panic() {
+    let hooks = TestGpuBatchHooks {
+        dispatch: GpuBatchDispatch::MultiStream { stream_count: 4 },
+        multistream_scan: std::sync::Arc::new(|_keys, _stream_count| Ok(Vec::new())),
+        full_batch_scan: std::sync::Arc::new(|_keys| Ok(Vec::new())),
+        micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(Vec::new())),
+    };
+
+    let join = tokio::spawn(with_test_gpu_batch_hooks(hooks, || async {
+        panic!("intentional panic for hook cleanup test");
+    }))
+    .await;
+    assert!(join.is_err());
+    assert!(TEST_GPU_BATCH_HOOKS.with(|slot| slot.borrow().is_none()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn with_test_gpu_batch_hooks_nested_call_panics_without_leaking_state() {
+    let hooks = TestGpuBatchHooks {
+        dispatch: GpuBatchDispatch::MultiStream { stream_count: 4 },
+        multistream_scan: std::sync::Arc::new(|_keys, _stream_count| Ok(Vec::new())),
+        full_batch_scan: std::sync::Arc::new(|_keys| Ok(Vec::new())),
+        micro_batch_scan: std::sync::Arc::new(|_key_batch| Ok(Vec::new())),
+    };
+
+    let join = tokio::spawn(with_test_gpu_batch_hooks(hooks.clone(), move || {
+        let nested_hooks = hooks.clone();
+        async move {
+            let _ = with_test_gpu_batch_hooks(nested_hooks, || async { Ok::<(), StatusCode>(()) })
+                .await;
+        }
+    }))
+    .await;
+
+    assert!(join.is_err());
+    assert!(TEST_GPU_BATCH_HOOKS.with(|slot| slot.borrow().is_none()));
+}
