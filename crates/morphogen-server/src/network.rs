@@ -16,6 +16,8 @@ mod gpu_metrics;
 #[cfg(feature = "network")]
 mod gpu_scan;
 #[cfg(feature = "network")]
+mod scan_helpers;
+#[cfg(feature = "network")]
 mod serde_hex;
 #[cfg(feature = "network")]
 pub mod telemetry;
