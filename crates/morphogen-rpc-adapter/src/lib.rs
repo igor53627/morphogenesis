@@ -3,6 +3,7 @@ mod code_resolver;
 mod config;
 mod evm;
 mod filters;
+mod log_filter;
 mod methods;
 mod pir_db;
 mod proxy;
