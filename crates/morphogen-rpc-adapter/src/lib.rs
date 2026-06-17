@@ -1,4 +1,5 @@
 mod block_cache;
+mod block_poller;
 mod code_resolver;
 mod config;
 mod evm;
