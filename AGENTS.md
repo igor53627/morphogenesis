@@ -1,5 +1,18 @@
 # Morphogenesis Agent Guidelines
 
+> **Shared workflow**: this repo extends the project-agnostic
+> [**global agents-md template**](https://github.com/igor53627/agents-md)
+> (TDD · `backlog` · `jj` · roborev PR review loop · close/compact discipline).
+> The shared sections below are a copy of `~/pse/agents-md/AGENTS.md`
+> (Option 2 from the template README) so this file stays self-contained
+> for pi / contributors who don't have the template locally.
+> When the template changes, re-apply via `diff`.
+
+Morphogenesis is a 2-server DPF-based PIR system for Ethereum state.
+See `README.md` for the full architecture overview.
+
+<!-- BEGIN SHARED (from https://github.com/igor53627/agents-md ) -->
+
 ## Development Workflow
 
 ### TDD (Test-Driven Development)
@@ -83,6 +96,8 @@ Hard-won lessons:
   had been silently accumulating. Always close per-PR and compact when
   open count > 10.
 
+<!-- END SHARED -->
+
 ## Build & Test Commands
 
 ```bash
@@ -102,3 +117,20 @@ cargo clippy --package morphogen-server --features network
 - `crates/reth-adapter/` - ETL tool for converting Reth DB to Cuckoo Matrix
 - `backlog/tasks/` - Active task tracking (managed via `backlog` CLI)
 - `docs/KANBAN.md` - Historical task notes (archival)
+
+### Project invariants (reviewers MUST preserve)
+
+- **Privacy fail-closed (TASK-37)**: in `morphogen-rpc-adapter`, every upstream
+  fallback for a private method must gate through
+  `state::fail_closed_if_fallback_disabled`. In prod, `--fallback-to-upstream`
+  requires `--allow-privacy-degraded-fallback` (enforced by
+  `config::validate_privacy_fallback_config`).
+- **URL redaction**: upstream URLs may carry credentials in userinfo/query.
+  Log them only via `telemetry::sanitize_url_for_telemetry`. `reqwest::Error`
+  debug output must be redacted (see `proxy::redact_reqwest_error`) before
+  logging.
+- **Dropped methods** (`eth_getProof` / `eth_sign` / `eth_signTransaction`):
+  rejected at the adapter; never proxied to upstream.
+- **Relay routing**: `eth_sendRawTransaction` → Flashbots Protect (or
+  configured `--tx-relay`), never the public mempool.
+- **Server bind**: the RPC adapter binds to `127.0.0.1` only by default.
