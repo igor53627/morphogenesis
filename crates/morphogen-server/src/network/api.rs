@@ -249,53 +249,12 @@ pub async fn epoch_handler(State(state): State<Arc<AppState>>) -> Json<EpochMeta
     })
 }
 
-enum SnapshotSource {
-    Http(reqwest::Url),
-    Local(PathBuf),
-}
-
-const ADMIN_SNAPSHOT_TOKEN_HEADER: &str = "x-admin-token";
-const AUTHORIZATION_BEARER_SCHEME: &str = "bearer";
-
-fn bearer_token_from_headers(headers: &HeaderMap) -> Option<&str> {
-    let raw = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())?
-        .trim();
-    let mut parts = raw.split_whitespace();
-    let scheme = parts.next()?;
-    let token = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    if scheme.eq_ignore_ascii_case(AUTHORIZATION_BEARER_SCHEME) && !token.is_empty() {
-        return Some(token);
-    }
-    None
-}
-
-fn legacy_admin_token_from_headers(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(ADMIN_SNAPSHOT_TOKEN_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-}
+// Admin-snapshot auth primitives (header parsing, constant-time compare,
+// snapshot source) extracted to `network::admin_auth` (private) in TASK-54.11.
+#[cfg(feature = "network")]
+use super::admin_auth::*;
 
 // Compares secrets without early exit on mismatch.
-fn admin_token_eq_constant_time(expected: &str, provided: &str) -> bool {
-    let expected = expected.as_bytes();
-    let provided = provided.as_bytes();
-    let max_len = expected.len().max(provided.len());
-    let mut diff = expected.len() ^ provided.len();
-    for idx in 0..max_len {
-        let a = expected.get(idx).copied().unwrap_or(0);
-        let b = provided.get(idx).copied().unwrap_or(0);
-        diff |= usize::from(a ^ b);
-    }
-    diff == 0
-}
-
 fn authorize_admin_snapshot(state: &AppState, headers: &HeaderMap) -> Result<(), StatusCode> {
     let token_configured = state.admin_snapshot_token.is_some();
     let mtls_configured =
@@ -332,16 +291,6 @@ fn authorize_admin_snapshot(state: &AppState, headers: &HeaderMap) -> Result<(),
     }
 
     Err(StatusCode::UNAUTHORIZED)
-}
-
-fn is_allowed_snapshot_host(host: &str, allowed_hosts: &[String]) -> bool {
-    let host = host.to_ascii_lowercase();
-    allowed_hosts.iter().any(|allowed| {
-        host == *allowed
-            || host
-                .strip_suffix(allowed)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
 }
 
 fn parse_snapshot_source(
@@ -1845,6 +1794,21 @@ mod tests {
             "test-admin-token",
             "wrong-token"
         ));
+    }
+
+    #[test]
+    fn is_allowed_snapshot_host_exact_and_subdomain_match() {
+        // Regression for TASK-54.11 (RoboRev codex security finding): the
+        // extraction accidentally narrowed the match to exact-only, losing
+        // the subdomain rule. Allowlist `example.com` must also authorize
+        // `foo.example.com` (the trailing-dot prefix is what permits it).
+        let allowed = vec!["example.com".to_string()];
+        assert!(is_allowed_snapshot_host("example.com", &allowed));
+        assert!(is_allowed_snapshot_host("foo.example.com", &allowed));
+        assert!(is_allowed_snapshot_host("EXAMPLE.com", &allowed));
+        // Not a subdomain: `notexample.com` does not end in `.example.com`.
+        assert!(!is_allowed_snapshot_host("notexample.com", &allowed));
+        assert!(!is_allowed_snapshot_host("example.org", &allowed));
     }
 
     #[test]
