@@ -61,13 +61,13 @@ This file has 0 inline tests, so the safety net is the existing
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 `bin/server.rs` reduced to `main()` wiring + thin orchestration (<600 LOC)
-- [ ] #2 `config.rs` extracted (CliArgs/FileConfig/EnvConfig/RuntimeConfig/StartupError + pick3 + validate/build)
-- [ ] #3 `matrix_loader.rs` extracted (load_matrix_from_file + build_matrix + load_file_config)
-- [ ] #4 `gpu_init.rs` extracted (init_gpu_resources)
-- [ ] #5 Per-split: `cargo test -p morphogen-server --features network` green; binary `--help` output unchanged; CLI flags and env vars unchanged; no new `pub` API unless documented
-- [ ] #6 `cargo clippy --all-targets -- -D warnings` clean on touched code
-- [ ] #7 roborev 2x2 (codex + claude-code × security + design) passes on each PR-sized change
+- [x] #1 `bin/server.rs` reduced to `main()` wiring + thin orchestration (<600 LOC) — main.rs is 574 LOC (55.1–55.3)
+- [x] #2 `config.rs` extracted (CliArgs/FileConfig/EnvConfig/RuntimeConfig/StartupError + pick3 + validate/build) — 55.3, PR #50
+- [ ] #3 `matrix_loader.rs` extracted (load_matrix_from_file + build_matrix + load_file_config) — **DEFERRED**: ~100 LOC, tightly coupled to `run()` orchestration; diminishing returns at main.rs 574 LOC. Split into follow-up TASK-56 if main.rs grows again.
+- [ ] #4 `gpu_init.rs` extracted (init_gpu_resources) — **DEFERRED**: ~35 LOC, single `#[cfg(cuda)]` fn; not worth a separate module at this size. Split into follow-up TASK-56 if main.rs grows again.
+- [x] #5 Per-split: `cargo test -p morphogen-server --features network` green; binary `--help` output unchanged; CLI flags and env vars unchanged; no new `pub` API unless documented
+- [x] #6 `cargo clippy --all-targets -- -D warnings` clean on touched code
+- [x] #7 roborev 2x2 (codex + claude-code × security + design) passes on each PR-sized change
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -95,18 +95,18 @@ itself. No inline tests → safety net is `tests/network_api.rs` +
     (TopicFilter API consistency PR #52, rpc_call credential leak PRs
     #52+#53).
 Final structure: main.rs 574, config.rs 542, tests.rs 614, config_helpers.rs 184.
-Net: bin/server.rs 1882→main.rs 574 (−70%). 33 runtime_config_tests + 249
-workspace tests green throughout. AC #1, #2, #3 met; AC #4 (matrix_loader)
-and gpu_init/shutdown extraction deferred — remaining code in main.rs is
+Net: bin/server.rs 1882→main.rs 574 (-70%). 33 runtime_config_tests + 249
+workspace tests green throughout. AC #1, #2, #5, #6, #7 met; AC #3 (matrix_loader)
+and #4 (gpu_init) deferred — remaining code in main.rs is
 small (574 LOC) and tightly coupled to run() orchestration.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
 
 <!-- SECTION:FINAL_SUMMARY:BEGIN -->
-bin/server.rs 1882→main.rs 574 LOC (−70%) across 3 sub-task PRs + 1 hotfix.
+bin/server.rs 1882→main.rs 574 LOC (-70%) across 3 sub-task PRs + 1 hotfix.
 Config layer (StartupError/CliArgs/FileConfig/EnvConfig/RuntimeConfig + impls)
 and 12 env-var parse helpers extracted into dedicated modules. 33 runtime
-config tests relocated to tests.rs. Binary surface unchanged (−−help verified).
+config tests relocated to tests.rs. Binary surface unchanged (--help verified).
 Greptile P1 regression (stray derive under cfg(cuda)) caught and fixed.
 <!-- SECTION:FINAL_SUMMARY:END -->
