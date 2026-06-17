@@ -515,72 +515,9 @@ pub async fn admin_snapshot_handler(
     Ok(StatusCode::OK)
 }
 
-fn scan_error_to_status(e: crate::scan::ScanError) -> StatusCode {
-    use crate::scan::ScanError;
-    match e {
-        ScanError::TooManyRetries { .. } => StatusCode::SERVICE_UNAVAILABLE,
-        ScanError::LockPoisoned
-        | ScanError::MatrixNotAligned { .. }
-        | ScanError::ChunkNotAligned { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
-fn payload_array_into_vec(payloads: [Vec<u8>; 3]) -> Vec<Vec<u8>> {
-    Vec::from(payloads)
-}
-
-fn apply_delta_entries_to_payloads<K: morphogen_dpf::DpfKey>(
-    payloads: &mut [Vec<u8>; 3],
-    keys: &[K; 3],
-    entries: &[morphogen_core::DeltaEntry],
-) -> Result<(), StatusCode> {
-    for entry in entries {
-        for (k, key) in keys.iter().enumerate() {
-            if key.eval_bit(entry.row_idx) {
-                if entry.diff.len() != payloads[k].len() {
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
-                }
-                for (d, s) in payloads[k].iter_mut().zip(entry.diff.iter()) {
-                    *d ^= s;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn scan_batch_results_from_snapshot<K: morphogen_dpf::DpfKey>(
-    matrix: &morphogen_storage::ChunkedMatrix,
-    all_keys: &[[K; 3]],
-    entries: &[morphogen_core::DeltaEntry],
-    row_size_bytes: usize,
-) -> Result<Vec<BatchQueryResult>, StatusCode> {
-    #[cfg(feature = "fused-batch-scan")]
-    {
-        let payload_sets = crate::scan::scan_main_matrix_multi(matrix, all_keys, row_size_bytes);
-        let mut results = Vec::with_capacity(all_keys.len());
-        for (keys, mut payloads) in all_keys.iter().zip(payload_sets.into_iter()) {
-            apply_delta_entries_to_payloads(&mut payloads, keys, entries)?;
-            results.push(BatchQueryResult {
-                payloads: payload_array_into_vec(payloads),
-            });
-        }
-        return Ok(results);
-    }
-
-    #[cfg(not(feature = "fused-batch-scan"))]
-    {
-        let mut results = Vec::with_capacity(all_keys.len());
-        for keys in all_keys {
-            let mut payloads = crate::scan::scan_main_matrix(matrix, keys, row_size_bytes);
-            apply_delta_entries_to_payloads(&mut payloads, keys, entries)?;
-            results.push(BatchQueryResult {
-                payloads: payload_array_into_vec(payloads),
-            });
-        }
-        Ok(results)
-    }
-}
+// Scan-result helpers (error mapping, payload move, delta XOR, batch
+// assembly) extracted to `network::scan_helpers` (private) in TASK-54.13.
+use super::scan_helpers::*;
 
 fn parse_gpu_query_keys(
     request: &GpuPageQueryRequest,
