@@ -6,6 +6,14 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
+// Log filter parsing + matching extracted to `log_filter` (top-level module)
+// in TASK-54.18. Re-exported here so `block_cache::LogFilter` /
+// `block_cache::parse_log_filter_object` / `block_cache::log_matches_filter`
+// keep resolving at all call sites.
+#[cfg(test)]
+pub use crate::log_filter::TopicFilter;
+pub use crate::log_filter::{log_matches_filter, parse_log_filter_object, LogFilter};
+
 /// Filter expiry timeout (5 minutes).
 const FILTER_EXPIRY_SECS: u64 = 300;
 
@@ -444,201 +452,6 @@ pub fn parse_tx_hash(s: &str) -> Option<[u8; 32]> {
 pub fn parse_hex_block_number(s: &str) -> Option<u64> {
     let hex = s.strip_prefix("0x").unwrap_or(s);
     u64::from_str_radix(hex, 16).ok()
-}
-
-/// Filter for matching logs by address and topics (EIP-1474 semantics).
-pub struct LogFilter {
-    pub from_block: u64,
-    pub to_block: u64,
-    /// If Some, only match logs from these addresses (lowercased hex with 0x prefix).
-    pub addresses: Option<Vec<String>>,
-    /// Topic filters by position. Each position is a filter.
-    pub topics: Vec<TopicFilter>,
-}
-
-/// A single topic position filter.
-pub enum TopicFilter {
-    /// null = match any topic at this position.
-    Any,
-    /// Match a single exact topic hash (lowercased hex with 0x prefix).
-    Exact(String),
-    /// Match any one of these topic hashes (lowercased hex with 0x prefix).
-    OneOf(Vec<String>),
-}
-
-/// Parse a JSON filter object into a LogFilter, resolving block tags.
-/// Returns Err with a human-readable message on invalid input.
-pub fn parse_log_filter_object(
-    filter_obj: &Value,
-    latest: u64,
-    safe: Option<u64>,
-    finalized: Option<u64>,
-) -> Result<LogFilter, String> {
-    let from_block = match filter_obj.get("fromBlock").and_then(|v| v.as_str()) {
-        Some("latest") | Some("pending") | None => latest,
-        Some("earliest") => 0,
-        Some("safe") => safe.ok_or_else(|| {
-            "\"safe\" block tag is unavailable; upstream finality marker could not be resolved"
-                .to_string()
-        })?,
-        Some("finalized") => finalized.ok_or_else(|| {
-            "\"finalized\" block tag is unavailable; upstream finality marker could not be resolved"
-                .to_string()
-        })?,
-        Some(hex) => {
-            parse_hex_block_number(hex).ok_or_else(|| format!("invalid fromBlock: {}", hex))?
-        }
-    };
-
-    let to_block = match filter_obj.get("toBlock").and_then(|v| v.as_str()) {
-        Some("latest") | Some("pending") | None => latest,
-        Some("earliest") => 0,
-        Some("safe") => safe.ok_or_else(|| {
-            "\"safe\" block tag is unavailable; upstream finality marker could not be resolved"
-                .to_string()
-        })?,
-        Some("finalized") => finalized.ok_or_else(|| {
-            "\"finalized\" block tag is unavailable; upstream finality marker could not be resolved"
-                .to_string()
-        })?,
-        Some(hex) => {
-            parse_hex_block_number(hex).ok_or_else(|| format!("invalid toBlock: {}", hex))?
-        }
-    };
-
-    if from_block > to_block {
-        return Err(format!(
-            "invalid block range: fromBlock ({}) > toBlock ({})",
-            from_block, to_block
-        ));
-    }
-
-    let addresses = match filter_obj.get("address") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(s)) => Some(vec![s.to_lowercase()]),
-        Some(Value::Array(arr)) => {
-            let mut addrs = Vec::with_capacity(arr.len());
-            for v in arr {
-                match v.as_str() {
-                    Some(s) => addrs.push(s.to_lowercase()),
-                    None => {
-                        return Err(format!(
-                            "invalid address in array: expected string, got {}",
-                            v
-                        ))
-                    }
-                }
-            }
-            Some(addrs) // empty list = match nothing
-        }
-        Some(other) => {
-            return Err(format!(
-                "invalid address field: expected string or array, got {}",
-                other
-            ))
-        }
-    };
-
-    let topics = match filter_obj.get("topics") {
-        None | Some(Value::Null) => vec![],
-        Some(Value::Array(arr)) => {
-            let mut result = Vec::with_capacity(arr.len());
-            for item in arr {
-                match item {
-                    Value::Null => result.push(TopicFilter::Any),
-                    Value::String(s) => result.push(TopicFilter::Exact(s.to_lowercase())),
-                    Value::Array(alts) => {
-                        let mut options = Vec::with_capacity(alts.len());
-                        for v in alts {
-                            match v.as_str() {
-                                Some(s) => options.push(s.to_lowercase()),
-                                None => {
-                                    return Err(format!(
-                                    "invalid topic in alternatives array: expected string, got {}",
-                                    v
-                                ))
-                                }
-                            }
-                        }
-                        if options.is_empty() {
-                            return Err("empty topic alternatives array is not valid".to_string());
-                        }
-                        result.push(TopicFilter::OneOf(options));
-                    }
-                    other => {
-                        return Err(format!(
-                            "invalid topic filter: expected null, string, or array, got {}",
-                            other
-                        ))
-                    }
-                }
-            }
-            result
-        }
-        Some(other) => {
-            return Err(format!(
-                "invalid topics field: expected array, got {}",
-                other
-            ))
-        }
-    };
-
-    Ok(LogFilter {
-        from_block,
-        to_block,
-        addresses,
-        topics,
-    })
-}
-
-/// Check whether a log entry matches the given filter per EIP-1474 semantics.
-pub fn log_matches_filter(log: &Value, filter: &LogFilter) -> bool {
-    // Address filter
-    if let Some(ref addrs) = filter.addresses {
-        let log_addr = log
-            .get("address")
-            .and_then(|a| a.as_str())
-            .unwrap_or("")
-            .to_lowercase();
-        if !addrs.iter().any(|a| a == &log_addr) {
-            return false;
-        }
-    }
-
-    // Topic filters
-    let log_topics = log.get("topics").and_then(|t| t.as_array());
-    for (i, topic_filter) in filter.topics.iter().enumerate() {
-        match topic_filter {
-            TopicFilter::Any => {
-                // Wildcard still implies the position exists per EIP-1474
-                if log_topics.is_none_or(|t| t.get(i).is_none()) {
-                    return false;
-                }
-            }
-            TopicFilter::Exact(expected) => {
-                let actual = log_topics
-                    .and_then(|t| t.get(i))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                if &actual != expected {
-                    return false;
-                }
-            }
-            TopicFilter::OneOf(options) => {
-                let actual = log_topics
-                    .and_then(|t| t.get(i))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                if !options.iter().any(|o| o == &actual) {
-                    return false;
-                }
-            }
-        }
-    }
-
-    true
 }
 
 /// Start the background block cache poller.
