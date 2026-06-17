@@ -141,13 +141,21 @@ impl Args {
     }
 }
 
-/// Enforce the fail-closed privacy-fallback policy (TASK-37).
+/// Enforce the fail-closed privacy-fallback policy (TASK-37) and related
+/// startup config guards.
 ///
 /// In `Prod`, `--fallback-to-upstream` is rejected unless the operator also
 /// passes `--allow-privacy-degraded-fallback`, because falling back to a
 /// regular upstream RPC reveals the queried address to the provider and
 /// degrades the PIR privacy guarantee.
+///
+/// Also rejects `--refresh-interval 0`, which would otherwise produce a
+/// tight `sleep(0)` loop in the metadata refresh task (100% CPU).
 pub(crate) fn validate_privacy_fallback_config(args: &Args) -> Result<()> {
+    if args.refresh_interval == 0 {
+        bail!("--refresh-interval must be greater than 0 to prevent a tight refresh loop");
+    }
+
     if args.fallback_to_upstream
         && args.environment == AdapterEnvironment::Prod
         && !args.allow_privacy_degraded_fallback

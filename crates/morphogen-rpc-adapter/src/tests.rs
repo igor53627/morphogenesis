@@ -414,6 +414,74 @@ fn proxy_to_upstream_invalid_json_error_is_redacted() {
     assert_eq!(err.message(), "Invalid JSON response for eth_getBalance");
 }
 
+/// Spawn a mock upstream that replies with a fixed raw HTTP response (status
+/// line + headers + body) for a single request. Used to exercise proxy_to_upstream
+/// error paths that the JSON-body `spawn_mock_upstream` helper cannot express
+/// (non-2xx statuses, non-JSON bodies).
+async fn spawn_raw_mock_upstream(raw_response: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind raw mock upstream listener");
+    let addr = listener.local_addr().expect("listener addr");
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.expect("accept raw request");
+        let mut buf = [0_u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        socket
+            .write_all(raw_response.as_bytes())
+            .await
+            .expect("write raw response");
+    });
+    format!("http://{}", addr)
+}
+
+#[tokio::test]
+async fn proxy_to_upstream_surfaces_http_status_on_non_2xx_non_json() {
+    // 502 with an HTML body — classic gateway error. The proxy should surface
+    // the HTTP status in the error message instead of the generic 'Invalid
+    // JSON response'. Regression for gemini finding on PR #22 (this test was
+    // requested by claude-code on PR #30).
+    let url = spawn_raw_mock_upstream(
+        "HTTP/1.1 502 Bad Gateway\r\ncontent-type: text/html\r\ncontent-length: 27\r\nconnection: close\r\n\r\n<html>upstream is down</html>",
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let err = proxy_to_upstream(&url, &client, "eth_getBalance", Value::Null)
+        .await
+        .expect_err("non-2xx non-JSON should error");
+    let msg = err.message();
+    assert!(
+        msg.contains("HTTP") && msg.contains("502"),
+        "expected HTTP status in message, got: {msg}"
+    );
+    // Redaction: the body must NOT be echoed. (Status reason phrase like
+    // "Bad Gateway" may appear since it comes from the status line, not body.)
+    assert!(
+        !msg.contains("upstream is down"),
+        "body leaked into message: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn proxy_to_upstream_generic_json_error_on_2xx_non_json() {
+    // 200 OK with a non-JSON body (e.g. plain text). Should fall back to the
+    // generic 'Invalid JSON response for {method}' message — the new branch
+    // only triggers on non-success status.
+    let url = spawn_raw_mock_upstream(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello",
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let err = proxy_to_upstream(&url, &client, "eth_getBalance", Value::Null)
+        .await
+        .expect_err("2xx non-JSON should error");
+    assert_eq!(
+        err.message(),
+        "Invalid JSON response for eth_getBalance",
+        "2xx non-JSON should use the generic message"
+    );
+}
+
 #[test]
 fn privacy_fallback_defaults_to_fail_closed() {
     let args = Args::default_for_tests();
@@ -433,6 +501,25 @@ fn privacy_fallback_prod_requires_explicit_override() {
     assert!(err
         .to_string()
         .contains("--allow-privacy-degraded-fallback"));
+}
+
+#[test]
+fn refresh_interval_zero_rejected_to_prevent_tight_loop() {
+    // Regression for gemini finding on PR #22/#24: refresh_interval=0 would
+    // make the metadata refresh task sleep(0) in a tight loop (100% CPU).
+    let mut args = Args::default_for_tests();
+    args.refresh_interval = 0;
+
+    let err =
+        validate_privacy_fallback_config(&args).expect_err("refresh_interval=0 should be rejected");
+    assert!(err.to_string().contains("--refresh-interval"));
+}
+
+#[test]
+fn refresh_interval_positive_accepted() {
+    let mut args = Args::default_for_tests();
+    args.refresh_interval = 1;
+    validate_privacy_fallback_config(&args).expect("refresh_interval > 0 should pass");
 }
 
 #[test]

@@ -17,7 +17,6 @@
 //! module (register_*/handle_eth_*) which must read state fields to serve
 //! requests. No broad `pub` of internals.
 
-use anyhow::Result;
 use jsonrpsee::types::ErrorObjectOwned;
 use morphogen_client::network::PirClient;
 use std::sync::atomic::{AtomicU64, Ordering};
