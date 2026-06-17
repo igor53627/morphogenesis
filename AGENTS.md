@@ -28,7 +28,14 @@ input, not the whole loop.
 
 1. **Run roborev 2x2** (`codex` + `claude-code` x `security` + `design`) on
    the pushed SHA (sequential enqueue to avoid the daemon race).
-2. **Read the GitHub bot reviews**, not just roborev:
+2. **Wait for the GitHub bot reviews to land** before triaging — they are
+   asynchronous and inline findings can arrive minutes after the push.
+   Poll the PR's reviews/comments (see step 3) until each expected bot
+   (`gemini-code-assist[bot]`, `coderabbitai[bot]`, `Cursor Bugbot`) has
+   either posted or timed out. If a bot never responds, record that
+   explicitly ("timed out / not installed") in the PR body so the absence
+   is deliberate, not accidental.
+3. **Read the GitHub bot reviews**, not just roborev:
    - `gemini-code-assist[bot]` — inline comments (often the most actionable)
    - `coderabbitai[bot]`
    - `Cursor Bugbot`
@@ -39,18 +46,42 @@ input, not the whole loop.
    gh api repos/igor53627/morphogenesis/pulls/<N>/comments  --jq '.[] | {user,path,line,body}'
    gh api repos/igor53627/morphogenesis/issues/<N>/comments --jq '.[].user.login'
    ```
-3. **Triage every inline finding** (action / defer-with-reason / reject-with-reason).
-   Do NOT merge with an unaddressed HIGH/MEDIUM bot finding unless you record
-   an explicit reason in the PR body.
-4. **Reply on the thread** for each actionable inline comment (`POST .../pulls/<N>/comments/<id>/replies`),
-   linking the follow-up PR if the fix lands separately. Replies MUST go on
-   the same PR that owns the comment (comment_id is scoped to its PR).
-5. **If fixes are needed**, open a follow-up PR and re-run steps 1–4 on it.
+4. **Triage every inline finding** (action / defer-with-reason / reject-with-reason).
+   Actionable HIGH/MEDIUM findings MUST be fixed in the CURRENT PR before
+   merge — do NOT merge with an actionable HIGH/MEDIUM finding outstanding.
+   A follow-up PR is acceptable only for (a) historical findings on already-
+   merged code, or (b) findings you explicitly defer with a recorded
+   rationale in both the PR body and the review thread reply.
+5. **Reply on the thread** for each actionable inline comment
+   (`POST .../pulls/<N>/comments/<id>/replies`), linking the follow-up PR if
+   the fix lands separately. Replies MUST go on the same PR that owns the
+   comment (comment_id is scoped to its PR).
+6. **Close the roborev job** once findings are addressed or explicitly
+   deferred: `roborev close <job_id>` (alias `address`). Open reviews are
+   not a backlog — they are state that must be resolved per-PR.
+7. **Compact regularly.** After merging a series of PRs (or any time
+   `roborev list --open --all-branches --limit 200` shows > 10 open
+   reviews), run:
+   ```bash
+   roborev compact --all-branches --wait --limit 50 --timeout 15m
+   ```
+   This consolidates duplicates, drops false positives / already-fixed
+   findings, and auto-closes the originals. The resulting consolidated job
+   must itself be triaged (step 4) and closed (step 6). Do this across ALL
+   branches (`--all-branches`) — reviews live on whatever feature branch
+   the PR used, not just `main`.
+8. **If fixes are needed**, open a follow-up PR and re-run steps 1–7 on it.
 
-Hard-won lesson (2026-06-17, TASK-54.1–54.7): running only roborev and
-ignoring gemini-code-assist inline reviews let a real HIGH-severity bug
-(`--refresh-interval 0` tight loop) ship through 7 PRs. Bot-review handling
-is part of the merge gate.
+Hard-won lessons:
+- 2026-06-17, TASK-54.1–54.7: running only roborev and ignoring
+  gemini-code-assist inline reviews let a real HIGH-severity bug
+  (`--refresh-interval 0` tight loop) ship through 7 PRs. Bot-review handling
+  is part of the merge gate.
+- 2026-06-17, TASK-54.8–54.10: left 64 roborev reviews open across the
+  series because step 6/7 were missing from the loop. `roborev compact
+  --all-branches` cut them to 15 and surfaced 7 verified findings that
+  had been silently accumulating. Always close per-PR and compact when
+  open count > 10.
 
 ## Build & Test Commands
 
