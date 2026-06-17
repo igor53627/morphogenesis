@@ -25,6 +25,8 @@ mod serde_hex;
 mod snapshot_config;
 #[cfg(feature = "network")]
 pub mod telemetry;
+#[cfg(feature = "network")]
+mod ws_query;
 
 #[cfg(feature = "network")]
 pub use api::*;
