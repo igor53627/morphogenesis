@@ -7,7 +7,7 @@
 
 use morphogen_server::Environment;
 
-use super::StartupError;
+use super::config::StartupError;
 
 pub(super) fn pick3<T>(cli: Option<T>, env: Option<T>, file: Option<T>) -> Option<T> {
     cli.or(env).or(file)
