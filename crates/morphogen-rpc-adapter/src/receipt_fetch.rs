@@ -139,16 +139,17 @@ pub(crate) async fn fetch_receipts_fallback_bounded(
 
 /// Make a JSON-RPC call and return the result field.
 ///
-/// Error strings never echo the raw upstream URL; reqwest::Error Debug output
-/// is URL-redacted via `telemetry::sanitize_url_for_telemetry` to prevent
-/// credential leakage from embedded basic-auth or query-param API keys.
+/// Error strings are **generic** (method + error category only). The raw
+/// `reqwest::Error` is never formatted into the string because its `Debug`
+/// output can include a normalized upstream URL with embedded credentials
+/// (basic-auth, API-key query params) that `.replace()` cannot reliably
+/// strip. See gemini security-high + greptile P1 on PR #52.
 pub(crate) async fn rpc_call(
     client: &reqwest::Client,
     url: &str,
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    let sanitized_url = crate::telemetry::sanitize_url_for_telemetry(url);
     let request = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -157,18 +158,24 @@ pub(crate) async fn rpc_call(
     });
 
     let resp = client.post(url).json(&request).send().await.map_err(|e| {
-        let raw = format!("{:?}", e).replace(url, &sanitized_url);
-        format!("{} request failed: {}", method, raw)
+        let kind = if e.is_timeout() {
+            "timed out"
+        } else if e.is_connect() {
+            "connection failed"
+        } else {
+            "request failed"
+        };
+        format!("{} {}", method, kind)
     })?;
 
     if !resp.status().is_success() {
         return Err(format!("{} HTTP {}", method, resp.status()));
     }
 
-    let json: Value = resp.json().await.map_err(|e| {
-        let raw = format!("{:?}", e).replace(url, &sanitized_url);
-        format!("{} parse failed: {}", method, raw)
-    })?;
+    let json: Value = resp
+        .json()
+        .await
+        .map_err(|_| format!("{} response parse failed", method))?;
 
     if let Some(err) = json.get("error") {
         let msg = err
