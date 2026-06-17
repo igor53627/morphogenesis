@@ -44,7 +44,8 @@ input, not the whole loop.
 2. **Wait for the GitHub bot reviews to land** before triaging — they are
    asynchronous and inline findings can arrive minutes after the push.
    Poll the PR's reviews/comments (see step 3) until each expected bot
-   (`gemini-code-assist[bot]`, `coderabbitai[bot]`, `Cursor Bugbot`) has
+   (`gemini-code-assist[bot]`, `coderabbitai[bot]`, `Cursor Bugbot`,
+   `greptile-apps[bot]`) has
    either posted or timed out. If a bot never responds, record that
    explicitly ("timed out / not installed") in the PR body so the absence
    is deliberate, not accidental.
@@ -52,6 +53,8 @@ input, not the whole loop.
    - `gemini-code-assist[bot]` — inline comments (often the most actionable)
    - `coderabbitai[bot]`
    - `Cursor Bugbot`
+   - `greptile-apps[bot]` — static analysis that catches cfg-gated compile
+     failures the others miss (see lessons below)
    - any other installed reviewer bot
    Inspect with:
    ```bash
@@ -67,12 +70,30 @@ input, not the whole loop.
    rationale in both the PR body and the review thread reply.
 5. **Reply on the thread** for each actionable inline comment
    (`POST .../pulls/<N>/comments/<id>/replies`), linking the follow-up PR if
-   the fix lands separately. Replies MUST go on the same PR that owns the
-   comment (comment_id is scoped to its PR).
-6. **Close the roborev job** once findings are addressed or explicitly
+   the fix lands separately. Replies MUST go on the **same PR that owns
+   the comment** — `comment_id` is scoped to its PR:
+   ```bash
+   gh api -X POST repos/<OWNER>/<REPO>/pulls/<N>/comments/<comment_id>/replies \
+     -f body="Fixed in this PR via ..." --jq '{created: (.created_at != null)}'
+   ```
+6. **Resolve the thread** after replying — GitHub "Resolve conversation"
+   is GraphQL-only (no REST endpoint). Get the thread node_id, then:
+   ```bash
+   gh api graphql -f query='{ repository(owner: "<OWNER>", name: "<REPO>") {
+     pullRequest(number: <N>) { reviewThreads(first: 30) { nodes {
+       id isResolved comments(first: 1) { nodes { databaseId } } } } } } }' \
+     --jq '.data.repository.pullRequest.reviewThreads.nodes[]
+           | select(.isResolved == false)
+           | {thread_id: .id, comment_id: .comments.nodes[0].databaseId}'
+   # Then resolve each:
+   gh api graphql -f query='mutation { resolveReviewThread(input:
+     {threadId: "PRRT_..."}) { thread { isResolved } } }'
+   ```
+   Never leave a thread open after triage — even on merged PRs.
+7. **Close the roborev job** once findings are addressed or explicitly
    deferred: `roborev close <job_id>` (alias `address`). Open reviews are
    not a backlog — they are state that must be resolved per-PR.
-7. **Compact regularly.** After merging a series of PRs (or any time
+8. **Compact regularly.** After merging a series of PRs (or any time
    `roborev list --open --all-branches --limit 200` shows > 10 open
    reviews), run:
    ```bash
@@ -83,7 +104,7 @@ input, not the whole loop.
    must itself be triaged (step 4) and closed (step 6). Do this across ALL
    branches (`--all-branches`) — reviews live on whatever feature branch
    the PR used, not just `main`.
-8. **If fixes are needed**, open a follow-up PR and re-run steps 1–7 on it.
+9. **If fixes are needed**, open a follow-up PR and re-run steps 1–8 on it.
 
 Hard-won lessons:
 - 2026-06-17, TASK-54.1–54.7: running only roborev and ignoring
@@ -95,6 +116,18 @@ Hard-won lessons:
   --all-branches` cut them to 15 and surfaced 7 verified findings that
   had been silently accumulating. Always close per-PR and compact when
   open count > 10.
+- 2026-06-17, TASK-54.11 (morphogenesis): codex security and
+  `gemini-code-assist` independently caught a behavior regression
+  (`is_allowed_snapshot_host` subdomain-matching lost during a refactor).
+  Fixed in the same PR rather than follow-up because of step 4.
+- 2026-06-17, TASK-55.3 (morphogenesis): left a stray `#[derive]` on
+  `init_gpu_resources` during a Python-script extraction. Non-cuda CI
+  stayed green (cfg-gated). `greptile-apps[bot]` — the 5th reviewer bot —
+  caught it via static analysis (P1). Always poll `pulls/<N>/comments`
+  for ALL bot users, not just check for non-empty review summaries.
+- 2026-06-17: across PRs #22–#50, left 23 review threads open after
+  replying — the "Resolve conversation" GraphQL step was missing from
+  the loop. Added as step 6. Never leave a thread open after triage.
 
 <!-- END SHARED -->
 
