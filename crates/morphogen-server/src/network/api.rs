@@ -610,126 +610,17 @@ fn parse_gpu_query_keys(
     }
 }
 
-#[cfg(any(feature = "cuda", test))]
-fn with_gpu_matrix_ref<T, R, F>(
-    matrix_mutex: &std::sync::Mutex<Option<T>>,
-    scan: F,
-) -> Result<Option<R>, StatusCode>
-where
-    F: FnOnce(&T) -> Result<R, StatusCode>,
-{
-    let matrix_guard = matrix_mutex
-        .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    matrix_guard.as_ref().map(scan).transpose()
-}
+// GPU scan-execution helpers (matrix-lock, dispatch fan-out, page
+// collection, test hooks) extracted to `network::gpu_scan` (private)
+// in TASK-54.12. The glob is ungated: cfg-gated items (with_gpu_matrix_ref,
+// run_gpu_scan_branches_with, test hooks) simply aren't imported when their
+// cfg is inactive; collect_gpu_page_refs is always available.
+use super::gpu_scan::*;
 
 // GPU timing/metrics helpers extracted to `network::gpu_metrics`
 // (private) in TASK-54.10.
 #[cfg(any(test, all(feature = "metrics", feature = "cuda")))]
 use super::gpu_metrics::*;
-
-#[cfg(any(feature = "cuda", test))]
-fn run_gpu_scan_branches_with<FMulti, FFull, FMicro>(
-    all_keys: &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
-    dispatch: GpuBatchDispatch,
-    mut scan_multistream: FMulti,
-    mut scan_full_batch: FFull,
-    mut scan_micro_batch: FMicro,
-) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
-where
-    FMulti: FnMut(
-        &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
-        usize,
-    ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>,
-    FFull: FnMut(
-        &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
-    ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>,
-    FMicro: FnMut(
-        &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
-    ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>,
-{
-    let n = all_keys.len();
-    let gpu_results = match dispatch {
-        GpuBatchDispatch::MultiStream { stream_count } => scan_multistream(all_keys, stream_count)?,
-        GpuBatchDispatch::FullBatch => {
-            let results = scan_full_batch(all_keys)?;
-            ensure_gpu_result_count(n, results.len())?;
-            results
-        }
-        GpuBatchDispatch::MicroBatch2 => {
-            let mut gpu_results = Vec::with_capacity(n);
-            for (start, end) in gpu_micro_batch_ranges(n) {
-                let key_batch = &all_keys[start..end];
-                let mut chunk_results = scan_micro_batch(key_batch)?;
-                ensure_gpu_result_count(key_batch.len(), chunk_results.len())?;
-                gpu_results.append(&mut chunk_results);
-            }
-            gpu_results
-        }
-    };
-    ensure_gpu_result_count(n, gpu_results.len())?;
-    Ok(gpu_results)
-}
-
-#[cfg(test)]
-type TestGpuBatchMultistreamScan = std::sync::Arc<
-    dyn Fn(
-            &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
-            usize,
-        ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
-        + Send
-        + Sync,
->;
-
-#[cfg(test)]
-type TestGpuBatchFullScan = std::sync::Arc<
-    dyn Fn(
-            &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
-        ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
-        + Send
-        + Sync,
->;
-
-#[cfg(test)]
-type TestGpuBatchMicroScan = std::sync::Arc<
-    dyn Fn(
-            &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
-        ) -> Result<Vec<morphogen_gpu_dpf::kernel::PirResult>, StatusCode>
-        + Send
-        + Sync,
->;
-
-#[cfg(test)]
-#[derive(Clone)]
-struct TestGpuBatchHooks {
-    dispatch: GpuBatchDispatch,
-    multistream_scan: TestGpuBatchMultistreamScan,
-    full_batch_scan: TestGpuBatchFullScan,
-    micro_batch_scan: TestGpuBatchMicroScan,
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_GPU_BATCH_HOOKS: std::cell::RefCell<Option<TestGpuBatchHooks>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-fn collect_gpu_page_refs(matrix: &morphogen_storage::ChunkedMatrix) -> Vec<&[u8]> {
-    let page_size = morphogen_gpu_dpf::storage::PAGE_SIZE_BYTES;
-    let num_pages = matrix.total_size_bytes() / page_size;
-    let mut pages_refs = Vec::with_capacity(num_pages);
-    for i in 0..num_pages {
-        let start = i * page_size;
-        let (chunk_idx, chunk_offset) = (
-            start / matrix.chunk_size_bytes(),
-            start % matrix.chunk_size_bytes(),
-        );
-        let chunk = matrix.chunk(chunk_idx);
-        pages_refs.push(&chunk.as_slice()[chunk_offset..chunk_offset + page_size]);
-    }
-    pages_refs
-}
 
 fn cpu_eval_gpu_page_batch(
     all_keys: &[[morphogen_gpu_dpf::dpf::ChaChaKey; 3]],
